@@ -1,0 +1,32 @@
+# Credenciales y secretos
+.streamlit/secrets.toml
+.env
+*.env
+
+# Entornos virtuales
+env/
+venv/
+.venv/
+ENV/
+
+# Archivos generados por Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Configuración local del entorno
+pyvenv.cfg
+
+# Cachés
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Archivos de sistema/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
