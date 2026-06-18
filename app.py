@@ -25,7 +25,6 @@ import data_pipeline as dp
 
 st.set_page_config(
     page_title="Panel de Ventas · Gaven",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -55,12 +54,11 @@ st.markdown(
       .stTabs [aria-selected="true"]{
         background:var(--verde); color:#04221a !important;
       }
-      /* Sidebar */
-      section[data-testid="stSidebar"]{
-        background:#070b12; border-right:1px solid var(--border);
-      }
-      section[data-testid="stSidebar"] h2{
-        font-size:1rem; color:var(--verde); margin-bottom:.2rem;
+      /* Sidebar vacía: la ocultamos (los filtros van arriba) */
+      section[data-testid="stSidebar"]{display:none;}
+      /* Barra de filtros (contenedor con borde) */
+      [data-testid="stVerticalBlockBorderWrapper"]{
+        background:var(--sf); border-radius:12px;
       }
       /* Subtítulos */
       h3{color:#cbd5e1; font-weight:600; letter-spacing:-.2px;}
@@ -145,7 +143,7 @@ df = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
 
 
 # ---------------------------------------------------------------------------
-# Panel de filtros (sidebar). Todos los filtros son selectores y aplican a
+# Barra de filtros (arriba). Todos los filtros son selectores y aplican a
 # TODAS las solapas (filtro global), igual que el tablero de referencia.
 # ---------------------------------------------------------------------------
 
@@ -169,16 +167,24 @@ FILTROS = [
     ("Cliente", "nombreCliente"),
 ]
 
-with st.sidebar:
-    st.header("Filtros")
-
-    opcion = st.radio(
-        "Período",
-        ["Este Mes", "Mes Anterior"],
-        index=0,
-        horizontal=True,
+with st.container(border=True):
+    # Fila 1: período + Top N + última actualización
+    f1a, f1b, f1c = st.columns([1.6, 1.2, 1.6])
+    opcion = f1a.radio(
+        "Período", ["Este Mes", "Mes Anterior"], index=0, horizontal=True
+    )
+    top_n = f1b.select_slider(
+        "Top N (rankings)", options=[5, 10, 15, 25, 50], value=10
     )
     desde, hasta = rango_mes(opcion)
+
+    meta = leer_metadata()
+    ultima = meta.get("ultima_actualizacion", "—")
+    f1c.markdown(
+        f"<div style='text-align:right;color:var(--tx2);font-size:.8rem;"
+        f"padding-top:1.9rem'>Última actualización: {ultima}</div>",
+        unsafe_allow_html=True,
+    )
 
     # df del período (base para construir las opciones de los selectores)
     fecha = df["fechaComprobate"]
@@ -188,28 +194,20 @@ with st.sidebar:
         & (fecha.dt.year == 2026)
     ].copy()
 
-    st.divider()
-
+    # Fila 2: un selector por dimensión (solo las que tienen datos)
     seleccion = {}
     if not df_periodo.empty:
-        for etiqueta, col in FILTROS:
-            if col in df_periodo.columns:
-                ops = opciones(df_periodo[col])
-                if ops:
-                    seleccion[col] = st.multiselect(etiqueta, ops, default=[])
-
-    st.divider()
-    top_n = st.select_slider(
-        "Top N (rankings)", options=[5, 10, 15, 25, 50], value=10
-    )
-
-    meta = leer_metadata()
-    ultima = meta.get("ultima_actualizacion", "—")
-    st.caption(f"Última actualización: {ultima}")
-
-
-# --- Encabezado principal --------------------------------------------------
-st.title("Panel de Ventas · Gaven")
+        disponibles = [
+            (et, col) for et, col in FILTROS
+            if col in df_periodo.columns and opciones(df_periodo[col])
+        ]
+        if disponibles:
+            cols = st.columns(len(disponibles))
+            for i, (etiqueta, col) in enumerate(disponibles):
+                seleccion[col] = cols[i].multiselect(
+                    etiqueta, opciones(df_periodo[col]), default=[],
+                    placeholder="Todos",
+                )
 
 n_filtros = sum(1 for v in seleccion.values() if v)
 chip = f"  ·  {n_filtros} filtro(s) activo(s)" if n_filtros else "  ·  sin filtros"
