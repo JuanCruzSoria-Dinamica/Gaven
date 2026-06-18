@@ -23,7 +23,51 @@ import data_pipeline as dp
 # Configuración de la página
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Panel de Ventas · Gaven", layout="wide")
+st.set_page_config(
+    page_title="Panel de Ventas · Gaven",
+    page_icon="📊",
+    layout="wide",
+)
+
+# --- Estilos (paleta del tablero de referencia) ----------------------------
+st.markdown(
+    """
+    <style>
+      :root{
+        --verde:#00b87a; --azul:#2a8ed4; --naranja:#f59e0b;
+        --violeta:#a78bfa; --rojo:#f87171;
+        --sf:#111827; --sf2:#1a2332; --border:#2a3a50; --tx2:#94a3b8;
+      }
+      .block-container{padding-top:2.2rem; max-width:1500px;}
+      h1{font-weight:700; letter-spacing:-.5px;}
+      /* Tarjetas de métricas */
+      [data-testid="stMetric"]{
+        background:var(--sf); border:1px solid var(--border);
+        border-radius:12px; padding:14px 16px;
+      }
+      [data-testid="stMetricLabel"]{color:var(--tx2); font-size:.78rem;}
+      [data-testid="stMetricValue"]{font-weight:700;}
+      /* Tabs */
+      .stTabs [data-baseweb="tab-list"]{gap:4px; border-bottom:1px solid var(--border);}
+      .stTabs [data-baseweb="tab"]{
+        border-radius:8px 8px 0 0; padding:8px 16px; font-weight:500;
+      }
+      .stTabs [aria-selected="true"]{
+        background:var(--verde); color:#04221a !important;
+      }
+      /* Sidebar */
+      section[data-testid="stSidebar"]{
+        background:#070b12; border-right:1px solid var(--border);
+      }
+      section[data-testid="stSidebar"] h2{
+        font-size:1rem; color:var(--verde); margin-bottom:.2rem;
+      }
+      /* Subtítulos */
+      h3{color:#cbd5e1; font-weight:600; letter-spacing:-.2px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 PARQUET_PATH = dp.PARQUET_PATH
 META_PATH = dp.META_PATH
@@ -99,39 +143,91 @@ if not os.path.exists(PARQUET_PATH):
 
 df = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
 
-# Encabezado: selector de período integrado debajo del título (no en la sidebar)
-col_sel, col_info = st.columns([1, 2])
-with col_sel:
+
+# ---------------------------------------------------------------------------
+# Panel de filtros (sidebar). Todos los filtros son selectores y aplican a
+# TODAS las solapas (filtro global), igual que el tablero de referencia.
+# ---------------------------------------------------------------------------
+
+def opciones(serie):
+    """Lista ordenada de valores únicos no vacíos para un multiselect."""
+    vals = (
+        serie.dropna().astype(str).str.strip()
+        .replace({"": None, "0": None}).dropna().unique().tolist()
+    )
+    return sorted(vals)
+
+
+# Cada filtro es una tupla: (etiqueta, columna). Solo se muestran los que
+# realmente tienen datos en el período.
+FILTROS = [
+    ("Canal", "dsCanalMkt"),
+    ("Subcanal", "dsSubcanalMKT"),
+    ("Región", "region"),
+    ("Vendedor", "dsVendedor"),
+    ("Marca / Línea", "proveedor"),
+    ("Cliente", "nombreCliente"),
+]
+
+with st.sidebar:
+    st.header("Filtros")
+
     opcion = st.radio(
         "Período",
         ["Este Mes", "Mes Anterior"],
         index=0,
         horizontal=True,
-        label_visibility="collapsed",
+    )
+    desde, hasta = rango_mes(opcion)
+
+    # df del período (base para construir las opciones de los selectores)
+    fecha = df["fechaComprobate"]
+    df_periodo = df[
+        (fecha >= pd.Timestamp(desde))
+        & (fecha < pd.Timestamp(hasta) + pd.Timedelta(days=1))
+        & (fecha.dt.year == 2026)
+    ].copy()
+
+    st.divider()
+
+    seleccion = {}
+    if not df_periodo.empty:
+        for etiqueta, col in FILTROS:
+            if col in df_periodo.columns:
+                ops = opciones(df_periodo[col])
+                if ops:
+                    seleccion[col] = st.multiselect(etiqueta, ops, default=[])
+
+    st.divider()
+    top_n = st.select_slider(
+        "Top N (rankings)", options=[5, 10, 15, 25, 50], value=10
     )
 
-desde, hasta = rango_mes(opcion)
-
-with col_info:
     meta = leer_metadata()
     ultima = meta.get("ultima_actualizacion", "—")
-    st.caption(
-        f"Período: {desde:%d/%m/%Y} → {hasta:%d/%m/%Y}  ·  "
-        f"Última actualización de datos: {ultima}"
-    )
+    st.caption(f"Última actualización: {ultima}")
 
+
+# --- Encabezado principal --------------------------------------------------
+st.title("Panel de Ventas · Gaven")
+
+n_filtros = sum(1 for v in seleccion.values() if v)
+chip = f"  ·  {n_filtros} filtro(s) activo(s)" if n_filtros else "  ·  sin filtros"
+st.caption(f"Período: {desde:%d/%m/%Y} → {hasta:%d/%m/%Y}{chip}")
 st.divider()
 
-# Filtro por fechas reales (no strings) + solo año 2026
-fecha = df["fechaComprobate"]
-df = df[
-    (fecha >= pd.Timestamp(desde))
-    & (fecha < pd.Timestamp(hasta) + pd.Timedelta(days=1))
-    & (fecha.dt.year == 2026)
-].copy()
+if df_periodo.empty:
+    st.warning("No hay datos para el período seleccionado.")
+    st.stop()
+
+# Aplica los filtros seleccionados (los vacíos no filtran nada)
+df = df_periodo
+for col, valores in seleccion.items():
+    if valores:
+        df = df[df[col].astype(str).str.strip().isin(valores)]
 
 if df.empty:
-    st.warning("No hay datos para el período seleccionado.")
+    st.warning("No hay datos que cumplan con los filtros seleccionados.")
     st.stop()
 
 
@@ -252,10 +348,10 @@ with tab_prod:
         c3.metric("SKUs clase C (resto)", n_c)
 
         st.divider()
-        st.subheader("Ranking de productos con clasificación ABC")
+        st.subheader(f"Ranking de productos con clasificación ABC · Top {top_n}")
         cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
                 "cm", "cm_pct", "precio_kg"]
-        t = prod[cols].rename(columns={
+        t = prod[cols].head(top_n).rename(columns={
             "dsArticulo": "Producto", **COLS_DIM,
         })
         st.dataframe(
@@ -285,7 +381,7 @@ with tab_clientes:
         with col_a:
             st.subheader("Top clientes por facturación")
             st.dataframe(
-                r.sort_values("monetario", ascending=False).head(10)
+                r.sort_values("monetario", ascending=False).head(top_n)
                 [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
                 .rename(columns={
                     "nombreCliente": "Cliente", "segmento": "Segmento",
@@ -298,7 +394,7 @@ with tab_clientes:
         with col_b:
             st.subheader("Top clientes por frecuencia")
             st.dataframe(
-                r.sort_values("frecuencia", ascending=False).head(10)
+                r.sort_values("frecuencia", ascending=False).head(top_n)
                 [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
                 .rename(columns={
                     "nombreCliente": "Cliente", "segmento": "Segmento",
