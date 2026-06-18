@@ -136,62 +136,131 @@ if df.empty:
 
 
 # ---------------------------------------------------------------------------
+# Formatos de tablas reutilizables
+# ---------------------------------------------------------------------------
+
+def fmt_pct(x):
+    try:
+        return f"{x:.1f} %"
+    except (TypeError, ValueError):
+        return x
+
+
+# Columnas "estándar" que devuelve dp.agrupar_dim, con sus nombres lindos
+COLS_DIM = {
+    "kilos": "Kilos", "subtotalNeto": "Facturación", "cm": "Contribución",
+    "cm_pct": "CM %", "precio_kg": "$/kg", "clientes": "Clientes",
+    "share_fc": "Share FC %", "share_kg": "Share Kg %",
+}
+FMT_DIM = {
+    "Kilos": fmt_kg, "Facturación": fmt_money, "Contribución": fmt_money,
+    "CM %": fmt_pct, "$/kg": fmt_money, "Share FC %": fmt_pct, "Share Kg %": fmt_pct,
+}
+
+
+def tabla_dim(g, dim_label, dim_col):
+    """Renderiza un resumen de dp.agrupar_dim como tabla formateada."""
+    cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "cm_pct",
+            "precio_kg", "clientes"]
+    cols = [c for c in cols if c in g.columns]
+    t = g[cols].rename(columns={dim_col: dim_label, **COLS_DIM})
+    st.dataframe(
+        t.style.format(FMT_DIM), use_container_width=True, hide_index=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_general, tab_fs, tab_clientes = st.tabs(["General", "Food Service", "Clientes (RFM)"])
+(tab_resumen, tab_canales, tab_prod, tab_clientes,
+ tab_vend, tab_alertas) = st.tabs(
+    ["Resumen", "Canales", "Productos (SKU)", "Clientes (RFM)",
+     "Vendedores", "Alertas"]
+)
 
 
-# --- TAB GENERAL ----------------------------------------------------------
-with tab_general:
+# --- TAB RESUMEN ----------------------------------------------------------
+with tab_resumen:
     m = dp.metricas_generales(df)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Kilos vendidos", fmt_kg(m["total_kilos"]))
-    c2.metric("Subtotal Neto", fmt_money(m["subtotal_neto"]))
-    c3.metric("Costo Total", fmt_money(m["costo_total"]))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Facturación neta", fmt_money(m["subtotal_neto"]))
+    c2.metric("Kilos vendidos", fmt_kg(m["total_kilos"]))
+    c3.metric("Contribución marginal", fmt_money(m["contribucion_marginal"]))
+    c4.metric("CM %", fmt_pct(m["cm_pct"]))
 
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Contribución Marginal", fmt_money(m["contribucion_marginal"]))
-    c5.metric("CM %", f"{m['cm_pct']:.1f} %")
-    c6.metric("Precio medio / kg", fmt_money(m["precio_medio_kg"]))
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Precio medio / kg", fmt_money(m["precio_medio_kg"]))
+    c6.metric("Clientes únicos", f"{m['n_clientes']:,}".replace(",", "."))
+    c7.metric("Ticket promedio", fmt_money(m["ticket_promedio"]))
+    c8.metric("SKUs vendidos", f"{m['n_skus']:,}".replace(",", "."))
+
+    st.caption(
+        f"{m['n_comprobantes']:,}".replace(",", ".") + " comprobantes  ·  "
+        + fmt_kg(m["kg_por_cliente"]) + " por cliente (promedio)"
+    )
 
     st.divider()
 
     col_a, col_b = st.columns(2)
     with col_a:
+        st.subheader("Facturación por canal")
+        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["subtotalNeto"])
+    with col_b:
         st.subheader("Kilos por región")
         st.bar_chart(dp.kilos_por_region(df).set_index("region")["kilos"])
+
+    st.subheader("Kilos por empresa")
+    st.bar_chart(dp.kilos_por_empresa(df).set_index("dsEmpresa")["kilos"])
+
+
+# --- TAB CANALES ----------------------------------------------------------
+with tab_canales:
+    st.subheader("Detalle por canal")
+    tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.caption("Share de facturación por canal")
+        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["share_fc"])
     with col_b:
-        st.subheader("Kilos por empresa")
-        st.bar_chart(dp.kilos_por_empresa(df).set_index("dsEmpresa")["kilos"])
+        st.caption("CM % por canal")
+        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["cm_pct"])
 
-    st.subheader("Subtotal Neto por comprobante")
-    st.dataframe(
-        dp.subtotal_por_comprobante(df).style.format({"subtotalNeto": fmt_money}),
-        use_container_width=True, hide_index=True,
-    )
+    st.divider()
+    st.subheader("Detalle por subcanal")
+    tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT")
+
+    st.subheader("Detalle por marca / línea (proveedor)")
+    tabla_dim(dp.por_proveedor(df), "Marca / Línea", "proveedor")
 
 
-# --- TAB FOOD SERVICE -----------------------------------------------------
-with tab_fs:
-    fs, mfs = dp.food_service(df)
+# --- TAB PRODUCTOS (SKU) --------------------------------------------------
+with tab_prod:
+    prod = dp.ranking_productos(df)
 
-    if fs.empty:
-        st.info("No hay ventas de Food Service en este período.")
+    if prod.empty:
+        st.info("No hay productos en el período seleccionado.")
     else:
+        n_a = int((prod["ABC"] == "A").sum())
+        n_b = int((prod["ABC"] == "B").sum())
+        n_c = int((prod["ABC"] == "C").sum())
         c1, c2, c3 = st.columns(3)
-        c1.metric("Kilos FS", fmt_kg(mfs["total_kilos"]))
-        c2.metric("Subtotal Neto FS", fmt_money(mfs["subtotal_neto"]))
-        c3.metric("Costo Total FS", fmt_money(mfs["costo_total"]))
-
-        c4, c5 = st.columns(2)
-        c4.metric("CM FS", fmt_money(mfs["contribucion_marginal"]))
-        c5.metric("CM % FS", f"{mfs['cm_pct']:.1f} %")
+        c1.metric("SKUs clase A (80% FC)", n_a)
+        c2.metric("SKUs clase B (80-95%)", n_b)
+        c3.metric("SKUs clase C (resto)", n_c)
 
         st.divider()
-        st.subheader("Kilos de Food Service por región")
-        st.bar_chart(dp.kilos_por_region(fs).set_index("region")["kilos"])
+        st.subheader("Ranking de productos con clasificación ABC")
+        cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
+                "cm", "cm_pct", "precio_kg"]
+        t = prod[cols].rename(columns={
+            "dsArticulo": "Producto", **COLS_DIM,
+        })
+        st.dataframe(
+            t.style.format(FMT_DIM), use_container_width=True, hide_index=True,
+        )
 
 
 # --- TAB CLIENTES (RFM) ---------------------------------------------------
@@ -201,18 +270,64 @@ with tab_clientes:
     if r.empty:
         st.info("No hay datos suficientes para el RFM.")
     else:
-        st.subheader("Clientes que más compran (en $)")
+        st.subheader("Segmentos de clientes (RFM)")
+        seg = dp.resumen_segmentos(r)
         st.dataframe(
-            r.sort_values("monetario", ascending=False).head(10)
-            [["nombreCliente", "monetario", "frecuencia", "recencia"]]
-            .style.format({"monetario": fmt_money}),
+            seg.rename(columns={
+                "segmento": "Segmento", "clientes": "Clientes",
+                "facturacion": "Facturación",
+            }).style.format({"Facturación": fmt_money}),
             use_container_width=True, hide_index=True,
         )
 
-        st.subheader("Clientes que más veces compraron")
-        st.dataframe(
-            r.sort_values("frecuencia", ascending=False).head(10)
-            [["nombreCliente", "frecuencia", "monetario", "recencia"]]
-            .style.format({"monetario": fmt_money}),
-            use_container_width=True, hide_index=True,
-        )
+        st.divider()
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("Top clientes por facturación")
+            st.dataframe(
+                r.sort_values("monetario", ascending=False).head(10)
+                [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
+                .rename(columns={
+                    "nombreCliente": "Cliente", "segmento": "Segmento",
+                    "monetario": "Facturación", "frecuencia": "Frecuencia",
+                    "recencia": "Recencia (días)",
+                })
+                .style.format({"Facturación": fmt_money}),
+                use_container_width=True, hide_index=True,
+            )
+        with col_b:
+            st.subheader("Top clientes por frecuencia")
+            st.dataframe(
+                r.sort_values("frecuencia", ascending=False).head(10)
+                [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
+                .rename(columns={
+                    "nombreCliente": "Cliente", "segmento": "Segmento",
+                    "frecuencia": "Frecuencia", "monetario": "Facturación",
+                    "recencia": "Recencia (días)",
+                })
+                .style.format({"Facturación": fmt_money}),
+                use_container_width=True, hide_index=True,
+            )
+
+
+# --- TAB VENDEDORES -------------------------------------------------------
+with tab_vend:
+    st.subheader("Detalle por vendedor")
+    tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor")
+
+    st.caption("Facturación por vendedor")
+    st.bar_chart(dp.por_vendedor(df).set_index("dsVendedor")["subtotalNeto"])
+
+
+# --- TAB ALERTAS ----------------------------------------------------------
+with tab_alertas:
+    st.subheader("Alertas e insights automáticos")
+    avisos = dp.alertas(df)
+    if not avisos:
+        st.success("Sin alertas para el período seleccionado.")
+    else:
+        for a in avisos:
+            if a["nivel"] == "riesgo":
+                st.error(a["texto"])
+            else:
+                st.info(a["texto"])

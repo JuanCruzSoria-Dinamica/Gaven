@@ -192,6 +192,16 @@ def preparar(df_ventas):
 # 3) Métricas (usadas por la app para mostrar; son cálculos livianos)
 # ---------------------------------------------------------------------------
 
+def comprobante_id(df_ventas):
+    """Identificador único de comprobante (empresa + tipo doc + nº doc).
+    Sirve para contar comprobantes y calcular el ticket promedio."""
+    return (
+        df_ventas["dsEmpresa"].astype(str) + "|"
+        + df_ventas["dsDocumento"].astype(str) + "|"
+        + df_ventas["nrodoc"].astype(str)
+    )
+
+
 def metricas_generales(df_ventas):
     subtotal_neto = df_ventas["subtotalNeto"].sum()
     costo_total = df_ventas["costo_unitario"].sum()
@@ -201,6 +211,12 @@ def metricas_generales(df_ventas):
     cm_pct = (contribucion_marginal / subtotal_neto * 100) if subtotal_neto else 0
     precio_medio_kg = (subtotal_neto / total_kilos) if total_kilos else 0
 
+    n_clientes = df_ventas["idCliente"].nunique()
+    n_comprobantes = comprobante_id(df_ventas).nunique()
+    n_skus = df_ventas["idArticulo"].nunique() if "idArticulo" in df_ventas else 0
+    ticket_promedio = (subtotal_neto / n_comprobantes) if n_comprobantes else 0
+    kg_por_cliente = (total_kilos / n_clientes) if n_clientes else 0
+
     return {
         "total_kilos": total_kilos,
         "subtotal_neto": subtotal_neto,
@@ -208,7 +224,71 @@ def metricas_generales(df_ventas):
         "contribucion_marginal": contribucion_marginal,
         "cm_pct": cm_pct,
         "precio_medio_kg": precio_medio_kg,
+        "n_clientes": n_clientes,
+        "n_comprobantes": n_comprobantes,
+        "n_skus": n_skus,
+        "ticket_promedio": ticket_promedio,
+        "kg_por_cliente": kg_por_cliente,
     }
+
+
+def agrupar_dim(df_ventas, col):
+    """Resumen por una dimensión cualquiera (canal, subcanal, vendedor,
+    proveedor, artículo, etc.): kilos, facturación, costo, contribución,
+    CM %, precio/kg, nº de clientes y share % sobre la facturación total."""
+    g = (
+        df_ventas.groupby(col)
+        .agg(
+            kilos=("kilos", "sum"),
+            subtotalNeto=("subtotalNeto", "sum"),
+            costo=("costo_unitario", "sum"),
+            clientes=("idCliente", "nunique"),
+        )
+        .reset_index()
+    )
+    g["cm"] = g["subtotalNeto"] - g["costo"]
+    g["cm_pct"] = np.where(g["subtotalNeto"] != 0, g["cm"] / g["subtotalNeto"] * 100, 0)
+    g["precio_kg"] = np.where(g["kilos"] != 0, g["subtotalNeto"] / g["kilos"], 0)
+    total_fc = g["subtotalNeto"].sum()
+    total_kg = g["kilos"].sum()
+    g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
+    g["share_kg"] = np.where(total_kg != 0, g["kilos"] / total_kg * 100, 0)
+    return g.sort_values("subtotalNeto", ascending=False).reset_index(drop=True)
+
+
+def por_canal(df_ventas):
+    return agrupar_dim(df_ventas, "dsCanalMkt")
+
+
+def por_subcanal(df_ventas):
+    return agrupar_dim(df_ventas, "dsSubcanalMKT")
+
+
+def por_vendedor(df_ventas):
+    return agrupar_dim(df_ventas, "dsVendedor")
+
+
+def por_proveedor(df_ventas):
+    """Equivalente a 'Marca / Línea' del tablero de referencia."""
+    return agrupar_dim(df_ventas, "proveedor")
+
+
+def ranking_productos(df_ventas):
+    """Ranking de SKUs con clasificación ABC (Pareto sobre facturación):
+    A = hasta el 80 % acumulado, B = 80-95 %, C = el resto."""
+    g = agrupar_dim(df_ventas, "dsArticulo")
+    total = g["subtotalNeto"].sum()
+    g["pct_acum"] = (g["subtotalNeto"].cumsum() / total * 100) if total else 0
+
+    def clase(p):
+        if p <= 80:
+            return "A"
+        if p <= 95:
+            return "B"
+        return "C"
+
+    g["ABC"] = g["pct_acum"].apply(clase)
+    return g
 
 
 def kilos_por_region(df_ventas):
@@ -261,7 +341,95 @@ def rfm(df_ventas):
         monetario=("subtotalNeto", "sum"),
     ).reset_index()
     r["recencia"] = (fecha_analisis - r["ultima_compra"]).dt.days
+
+    # --- Scores 1-4 y segmentación RFM ---------------------------------
+    def _score(serie, invertir=False):
+        # rank(method="first") evita errores de bins duplicados en qcut
+        try:
+            etiquetas = [4, 3, 2, 1] if invertir else [1, 2, 3, 4]
+            return pd.qcut(serie.rank(method="first"), 4, labels=etiquetas).astype(int)
+        except (ValueError, IndexError):
+            return pd.Series(1, index=serie.index)
+
+    r["r_score"] = _score(r["recencia"], invertir=True)   # menos recencia = mejor
+    r["f_score"] = _score(r["frecuencia"])
+    r["m_score"] = _score(r["monetario"])
+
+    def _segmento(row):
+        if row.r_score >= 3 and row.f_score >= 3 and row.m_score >= 3:
+            return "Campeones"
+        if row.r_score >= 3 and row.f_score >= 2:
+            return "Leales"
+        if row.r_score >= 3:
+            return "Nuevos / Prometedores"
+        if row.f_score >= 3 or row.m_score >= 3:
+            return "En riesgo"
+        return "Hibernando / Perdidos"
+
+    r["segmento"] = r.apply(_segmento, axis=1)
     return r
+
+
+def resumen_segmentos(df_rfm):
+    """Cuenta de clientes y facturación por segmento RFM."""
+    if df_rfm.empty:
+        return df_rfm
+    g = (
+        df_rfm.groupby("segmento")
+        .agg(clientes=("idCliente", "count"), facturacion=("monetario", "sum"))
+        .reset_index()
+        .sort_values("facturacion", ascending=False)
+    )
+    return g
+
+
+def alertas(df_ventas):
+    """Alertas e insights automáticos (lista de dicts: nivel + texto)."""
+    avisos = []
+
+    # 1) Productos con margen bruto negativo
+    prod = ranking_productos(df_ventas)
+    neg = prod[prod["cm"] < 0].sort_values("cm")
+    if len(neg):
+        tops = ", ".join(neg["dsArticulo"].head(3).astype(str))
+        avisos.append({
+            "nivel": "riesgo",
+            "texto": f"{len(neg)} producto(s) con margen bruto NEGATIVO. "
+                     f"Mayor pérdida: {tops}.",
+        })
+
+    # 2) Concentración de facturación en el top 10 de clientes
+    r = rfm(df_ventas)
+    if not r.empty:
+        total = r["monetario"].sum()
+        top10 = r.sort_values("monetario", ascending=False).head(10)["monetario"].sum()
+        pct = (top10 / total * 100) if total else 0
+        nivel = "riesgo" if pct >= 50 else "info"
+        avisos.append({
+            "nivel": nivel,
+            "texto": f"El top 10 de clientes concentra el {pct:.0f}% de la facturación.",
+        })
+
+    # 3) Canal de menor margen
+    can = por_canal(df_ventas)
+    if not can.empty:
+        peor = can.sort_values("cm_pct").iloc[0]
+        avisos.append({
+            "nivel": "info" if peor["cm_pct"] >= 0 else "riesgo",
+            "texto": f"Canal de menor margen: {peor['dsCanalMkt']} "
+                     f"(CM {peor['cm_pct']:.1f}%).",
+        })
+
+    # 4) Concentración de SKUs (Pareto)
+    n_a = int((prod["ABC"] == "A").sum())
+    n_tot = len(prod)
+    if n_tot:
+        avisos.append({
+            "nivel": "info",
+            "texto": f"{n_a} de {n_tot} SKUs (clase A) generan el 80% de la facturación.",
+        })
+
+    return avisos
 
 
 # ---------------------------------------------------------------------------
