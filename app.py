@@ -11,6 +11,7 @@ Correr local:   streamlit run app.py
 
 import os
 import json
+import calendar
 import datetime as dt
 
 import pandas as pd
@@ -294,6 +295,26 @@ with tab_resumen:
         f"{m['n_comprobantes']:,}".replace(",", ".") + " comprobantes  ·  "
         + fmt_kg(m["kg_por_cliente"]) + " por cliente (promedio)"
     )
+
+    # --- Tendencia: proyección de cierre de mes a ritmo actual --------------
+    # Solo aplica a "Este Mes" (el mes anterior ya está completo, factor = 1).
+    # Fórmula: Venta acumulada / días transcurridos × días totales del mes.
+    if opcion == "Este Mes":
+        hoy = dt.date.today()
+        dias_transcurridos = hoy.day                                   # día de hoy (calendario)
+        dias_del_mes = calendar.monthrange(hoy.year, hoy.month)[1]     # total de días del mes
+        factor = (dias_del_mes / dias_transcurridos) if dias_transcurridos else 1
+
+        st.divider()
+        st.subheader("Tendencia a fin de mes (proyección)")
+        st.caption(
+            f"Proyección a ritmo actual · {dias_transcurridos} de {dias_del_mes} "
+            f"días transcurridos (factor ×{factor:.2f})."
+        )
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Facturación proyectada", fmt_money(m["subtotal_neto"] * factor))
+        t2.metric("Kilos proyectados", fmt_kg(m["total_kilos"] * factor))
+        t3.metric("Contribución proyectada", fmt_money(m["contribucion_marginal"] * factor))
 
     st.divider()
 
