@@ -15,6 +15,7 @@ import datetime as dt
 
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
 import data_pipeline as dp
 
@@ -98,6 +99,14 @@ def fmt_kg(x):
 @st.cache_data(show_spinner="Leyendo datos...")
 def cargar_datos_local(_mtime):
     return pd.read_parquet(PARQUET_PATH)
+
+
+@st.cache_data(show_spinner="Leyendo serie histórica...")
+def cargar_serie(_mtime):
+    """Lee la serie mensual agregada (data/serie_mensual.parquet).
+    La clave de caché es el mtime: si el pipeline reescribe la serie, se
+    invalida sola (mismo patrón que cargar_datos_local)."""
+    return pd.read_parquet(dp.SERIE_PATH)
 
 
 def leer_metadata():
@@ -267,9 +276,9 @@ def tabla_dim(g, dim_label, dim_col):
 # Tabs
 # ---------------------------------------------------------------------------
 
-(tab_resumen, tab_canales, tab_prod, tab_clientes,
+(tab_resumen, tab_evol, tab_canales, tab_prod, tab_clientes,
  tab_vend, tab_alertas) = st.tabs(
-    ["Resumen", "Canales", "Productos (SKU)", "Clientes (RFM)",
+    ["Resumen", "Evolución", "Canales", "Productos (SKU)", "Clientes (RFM)",
      "Vendedores", "Alertas"]
 )
 
@@ -307,6 +316,101 @@ with tab_resumen:
 
     st.subheader("Kilos por empresa")
     st.bar_chart(dp.kilos_por_empresa(df).set_index("dsEmpresa")["kilos"])
+
+
+# --- TAB EVOLUCIÓN --------------------------------------------------------
+# Usa la serie mensual histórica (data/serie_mensual.parquet), INDEPENDIENTE
+# del filtro de período: muestra todos los meses 2025–2026 para comparar.
+with tab_evol:
+    st.subheader("Evolución mensual por canal")
+
+    if not os.path.exists(dp.SERIE_PATH):
+        st.warning(
+            "Todavía no existe la serie histórica.\n\n"
+            "Generala UNA vez con el backfill:\n\n"
+            "```\npython backfill_serie.py\n```\n\n"
+            "Después el pipeline normal la mantiene actualizada sola."
+        )
+    else:
+        serie = cargar_serie(os.path.getmtime(dp.SERIE_PATH))
+
+        if serie.empty:
+            st.info("La serie histórica está vacía.")
+        else:
+            METRICAS_EVOL = {
+                "Facturación neta": ("subtotalNeto", fmt_money),
+                "Kilos": ("kilos", fmt_kg),
+                "Contribución marginal (MB $)": ("cm", fmt_money),
+                "CM % (margen)": ("cm_pct", fmt_pct),
+                "Precio medio $/kg": ("precio_kg", fmt_money),
+            }
+
+            c1, c2 = st.columns([1.6, 1])
+            nombre_metrica = c1.selectbox(
+                "Métrica", list(METRICAS_EVOL.keys()), index=0
+            )
+            nivel = c2.radio(
+                "Abrir por", ["Canal", "Subcanal"], horizontal=True
+            )
+            dim = "dsCanalMkt" if nivel == "Canal" else "dsSubcanalMKT"
+
+            # Respeta los filtros globales de canal/subcanal si están activos.
+            s = serie.copy()
+            if seleccion.get("dsCanalMkt"):
+                s = s[s["dsCanalMkt"].astype(str).str.strip()
+                      .isin(seleccion["dsCanalMkt"])]
+            if seleccion.get("dsSubcanalMKT"):
+                s = s[s["dsSubcanalMKT"].astype(str).str.strip()
+                      .isin(seleccion["dsSubcanalMKT"])]
+
+            # Re-agrega al nivel elegido (las sumas crudas se re-agregan bien).
+            g = (
+                s.groupby(["anio_mes", dim], dropna=False)
+                .agg(
+                    kilos=("kilos", "sum"),
+                    subtotalNeto=("subtotalNeto", "sum"),
+                    cm=("cm", "sum"),
+                )
+                .reset_index()
+            )
+            # Métricas derivadas (porcentaje y $/kg se calculan acá, no se guardan).
+            den_fc = g["subtotalNeto"].replace(0, pd.NA)
+            den_kg = g["kilos"].replace(0, pd.NA)
+            g["cm_pct"] = (g["cm"] / den_fc * 100).fillna(0)
+            g["precio_kg"] = (g["subtotalNeto"] / den_kg).fillna(0)
+
+            col_val, _fmt = METRICAS_EVOL[nombre_metrica]
+            g = g.sort_values(["anio_mes", dim])
+
+            fig = px.line(
+                g, x="anio_mes", y=col_val, color=dim, markers=True,
+            )
+            fig.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(title=nivel, orientation="h", y=-0.2),
+                xaxis_title="Mes",
+                yaxis_title=nombre_metrica,
+                height=440,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                "Serie completa (no depende del filtro de período de arriba). "
+                "Cada punto es un mes calendario; el mes en curso puede estar "
+                "incompleto."
+            )
+
+            # Tabla pivote opcional (meses en columnas) para ver los números.
+            with st.expander("Ver tabla de valores"):
+                piv = g.pivot_table(
+                    index=dim, columns="anio_mes", values=col_val,
+                    aggfunc="sum",
+                )
+                st.dataframe(
+                    piv.style.format(_fmt), use_container_width=True
+                )
 
 
 # --- TAB CANALES ----------------------------------------------------------

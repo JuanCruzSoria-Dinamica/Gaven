@@ -40,6 +40,13 @@ DATA_DIR = "data"
 PARQUET_PATH = os.path.join(DATA_DIR, "ventas_actualizadas.parquet")
 META_PATH = os.path.join(DATA_DIR, "metadata.json")
 
+# Serie mensual histórica (agregada, liviana). Se construye UNA sola vez con
+# backfill_serie.py y luego el cron solo corrige los meses que vuelve a traer.
+SERIE_PATH = os.path.join(DATA_DIR, "serie_mensual.parquet")
+
+# Fecha desde la que arranca la serie histórica (la usa el backfill).
+SERIE_DESDE = dt.date(2025, 1, 1)
+
 BASE_URL_DEFAULT = "https://lachichiessa.chesserp.com/AR683/web/api/chess/v1"
 USUARIO_DEFAULT = "DinamicaApis"
 
@@ -433,6 +440,92 @@ def alertas(df_ventas):
 
 
 # ---------------------------------------------------------------------------
+# 3bis) Serie mensual agregada (para la solapa de Evolución)
+# ---------------------------------------------------------------------------
+
+# Grano de la serie histórica. Guardamos a este nivel; en la app se puede
+# "subir" a canal sumando los subcanales (las sumas se re-agregan sin problema).
+SERIE_GRANO = ["anio_mes", "dsCanalMkt", "dsSubcanalMKT"]
+SERIE_COLS = SERIE_GRANO + [
+    "kilos", "subtotalNeto", "costo", "cm", "clientes", "comprobantes"
+]
+
+
+def agregar_serie(df_ventas):
+    """Agrega el detalle a nivel mes × canal × subcanal, guardando SOLO sumas
+    crudas. NUNCA guardamos porcentajes (CM %, share, $/kg): esos se derivan
+    al leer, porque un promedio de porcentajes no se puede re-agregar bien.
+
+    Columnas de salida (SERIE_COLS):
+      anio_mes (YYYY-MM), dsCanalMkt, dsSubcanalMKT,
+      kilos, subtotalNeto, costo, cm, clientes, comprobantes
+
+    Nota: 'clientes' y 'comprobantes' son conteos únicos POR FILA (mes×canal×
+    subcanal). Sirven para graficar por mes, pero no se deben sumar entre meses
+    ni entre subcanales para sacar un único total (se duplicarían clientes que
+    compran en varios subcanales).
+    """
+    if df_ventas is None or df_ventas.empty:
+        return pd.DataFrame(columns=SERIE_COLS)
+
+    d = df_ventas.copy()
+    d["anio_mes"] = d["fechaComprobate"].dt.to_period("M").astype(str)
+    d["_comp"] = comprobante_id(d)
+
+    g = (
+        d.groupby(SERIE_GRANO, dropna=False)
+        .agg(
+            kilos=("kilos", "sum"),
+            subtotalNeto=("subtotalNeto", "sum"),
+            costo=("costo_unitario", "sum"),
+            clientes=("idCliente", "nunique"),
+            comprobantes=("_comp", "nunique"),
+        )
+        .reset_index()
+    )
+    g["cm"] = g["subtotalNeto"] - g["costo"]
+    return g[SERIE_COLS].sort_values(
+        ["anio_mes"] + SERIE_GRANO[1:]
+    ).reset_index(drop=True)
+
+
+def upsert_serie(df_detalle, serie_path=SERIE_PATH):
+    """Inserta/actualiza en la serie histórica los meses presentes en
+    `df_detalle` (en el cron: mes actual + anterior).
+
+    Mecanismo: borra de la serie las filas de ESOS meses y las reemplaza por las
+    recién calculadas. Los meses que no aparecen en df_detalle quedan intactos
+    (nunca se vuelven a pedir al API). Es idempotente: correrlo 1 o N veces da el
+    mismo resultado. Escritura atómica (tmp + replace).
+    """
+    nuevos = agregar_serie(df_detalle)
+    if nuevos.empty:
+        print("  serie: el detalle no tiene filas; serie sin cambios.")
+        return None
+
+    meses_nuevos = set(nuevos["anio_mes"].unique())
+
+    if os.path.exists(serie_path):
+        actual = pd.read_parquet(serie_path)
+        actual = actual[~actual["anio_mes"].isin(meses_nuevos)]
+        serie = pd.concat([actual, nuevos], ignore_index=True)
+    else:
+        serie = nuevos
+
+    serie = serie.sort_values(
+        ["anio_mes"] + SERIE_GRANO[1:]
+    ).reset_index(drop=True)
+
+    os.makedirs(os.path.dirname(serie_path) or ".", exist_ok=True)
+    tmp = serie_path + ".tmp"
+    serie.to_parquet(tmp, index=False)
+    os.replace(tmp, serie_path)
+    print(f"  serie: meses actualizados {sorted(meses_nuevos)} · "
+          f"{len(serie)} filas totales en {serie_path}")
+    return serie
+
+
+# ---------------------------------------------------------------------------
 # 4) Credenciales + persistencia
 # ---------------------------------------------------------------------------
 
@@ -496,6 +589,10 @@ def main():
     df = preparar(df_raw)
     guardar(df)
     print(f"OK: {len(df)} filas guardadas en {PARQUET_PATH}")
+
+    # Actualiza la serie mensual histórica con los meses recién traídos
+    # (upsert: solo corrige el mes actual y el anterior; el resto queda intacto).
+    upsert_serie(df)
 
 
 if __name__ == "__main__":
