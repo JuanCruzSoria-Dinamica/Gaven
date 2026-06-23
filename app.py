@@ -276,9 +276,9 @@ def tabla_dim(g, dim_label, dim_col):
 # Tabs
 # ---------------------------------------------------------------------------
 
-(tab_resumen, tab_evol, tab_canales, tab_prod, tab_clientes,
+(tab_resumen, tab_canales, tab_prod, tab_clientes,
  tab_vend, tab_alertas) = st.tabs(
-    ["Resumen", "Evolución", "Canales", "Productos (SKU)", "Clientes (RFM)",
+    ["Resumen", "Canales", "Productos (SKU)", "Clientes (RFM)",
      "Vendedores", "Alertas"]
 )
 
@@ -306,22 +306,10 @@ with tab_resumen:
 
     st.divider()
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("Facturación por canal")
-        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["subtotalNeto"])
-    with col_b:
-        st.subheader("Kilos por región")
-        st.bar_chart(dp.kilos_por_region(df).set_index("region")["kilos"])
-
-    st.subheader("Kilos por empresa")
-    st.bar_chart(dp.kilos_por_empresa(df).set_index("dsEmpresa")["kilos"])
-
-
-# --- TAB EVOLUCIÓN --------------------------------------------------------
-# Usa la serie mensual histórica (data/serie_mensual.parquet), INDEPENDIENTE
-# del filtro de período: muestra todos los meses 2025–2026 para comparar.
-with tab_evol:
+    # --- Evolución mensual por canal --------------------------------------
+    # Usa la serie mensual histórica (data/serie_mensual.parquet),
+    # INDEPENDIENTE del filtro de período: muestra todos los meses 2025–2026
+    # para comparar.
     st.subheader("Evolución mensual por canal")
 
     if not os.path.exists(dp.SERIE_PATH):
