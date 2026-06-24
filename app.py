@@ -109,6 +109,20 @@ def cargar_serie(_mtime):
     return pd.read_parquet(dp.SERIE_PATH)
 
 
+@st.cache_data(show_spinner="Leyendo IPC (INDEC)...", ttl=60 * 60 * 12)
+def cargar_ipc():
+    """Devuelve el IPC del INDEC. Usa el archivo que deja el pipeline; si todavía
+    no existe (ej. antes de la primera corrida del cron), intenta bajarlo una vez
+    y cachearlo en memoria. Si INDEC no responde, devuelve lo que haya."""
+    ipc = dp.cargar_ipc()
+    if ipc.empty:
+        try:
+            ipc = dp.descargar_ipc()
+        except Exception:
+            pass
+    return ipc
+
+
 def leer_metadata():
     try:
         with open(META_PATH, encoding="utf-8") as f:
@@ -333,12 +347,19 @@ with tab_resumen:
                 "Precio medio $/kg": ("precio_kg", fmt_money),
             }
 
-            c1, c2 = st.columns([1.6, 1])
+            c1, c2, c3 = st.columns([1.5, 0.9, 1.2])
             nombre_metrica = c1.selectbox(
                 "Métrica", list(METRICAS_EVOL.keys()), index=0
             )
             nivel = c2.radio(
                 "Abrir por", ["Canal", "Subcanal"], horizontal=True
+            )
+            moneda = c3.radio(
+                "Moneda", ["Corriente", "Constante (s/ inflación)"],
+                horizontal=True,
+                help="Corriente = pesos de cada mes (nominal). "
+                     "Constante = todo llevado a pesos de hoy con el IPC del "
+                     "INDEC, para comparar sin el efecto de la inflación.",
             )
             dim = "dsCanalMkt" if nivel == "Canal" else "dsSubcanalMKT"
 
@@ -361,6 +382,30 @@ with tab_resumen:
                 )
                 .reset_index()
             )
+
+            # --- Pesos constantes: deflactar $ con el IPC del INDEC ---------
+            base_mes = None
+            nota_moneda = "Pesos corrientes (nominales, de cada mes)."
+            if moneda.startswith("Constante"):
+                ipc = cargar_ipc()
+                factores, base_mes = dp.factores_constantes(ipc)
+                if not factores:
+                    st.warning(
+                        "No hay IPC disponible todavía (corré el pipeline o "
+                        "esperá a que INDEC responda). Mostrando pesos corrientes."
+                    )
+                else:
+                    # Factor por mes; meses sin IPC (ej. mes en curso) usan el
+                    # último factor disponible (≈1 respecto del mes base).
+                    ult = min(factores.values())  # el del mes más reciente
+                    fac = g["anio_mes"].map(factores).fillna(ult)
+                    g["subtotalNeto"] = g["subtotalNeto"] * fac
+                    g["cm"] = g["cm"] * fac
+                    nota_moneda = (
+                        f"Pesos constantes de {base_mes} (deflactado con IPC "
+                        f"Nivel General INDEC). Kilos y % no se ven afectados."
+                    )
+
             # Métricas derivadas (porcentaje y $/kg se calculan acá, no se guardan).
             den_fc = g["subtotalNeto"].replace(0, pd.NA)
             den_kg = g["kilos"].replace(0, pd.NA)
@@ -385,9 +430,8 @@ with tab_resumen:
             )
             st.plotly_chart(fig, use_container_width=True)
             st.caption(
-                "Serie completa (no depende del filtro de período de arriba). "
-                "Cada punto es un mes calendario; el mes en curso puede estar "
-                "incompleto."
+                f"{nota_moneda}  ·  Serie completa (no depende del filtro de "
+                "período de arriba). El mes en curso puede estar incompleto."
             )
 
             # Tabla pivote opcional (meses en columnas) para ver los números.

@@ -47,6 +47,12 @@ SERIE_PATH = os.path.join(DATA_DIR, "serie_mensual.parquet")
 # Fecha desde la que arranca la serie histórica (la usa el backfill).
 SERIE_DESDE = dt.date(2025, 1, 1)
 
+# IPC Nivel General Nacional (INDEC). Se usa para expresar la facturación en
+# pesos CONSTANTES (ajustados por inflación) y poder comparar meses "con la
+# misma vara". Se cachea local para no depender de que INDEC esté online.
+IPC_URL = "https://www.indec.gob.ar/ftp/cuadros/economia/serie_ipc_divisiones.csv"
+IPC_PATH = os.path.join(DATA_DIR, "ipc_indec.parquet")
+
 BASE_URL_DEFAULT = "https://lachichiessa.chesserp.com/AR683/web/api/chess/v1"
 USUARIO_DEFAULT = "DinamicaApis"
 
@@ -526,6 +532,74 @@ def upsert_serie(df_detalle, serie_path=SERIE_PATH):
 
 
 # ---------------------------------------------------------------------------
+# 3ter) IPC INDEC + deflactor (pesos constantes)
+# ---------------------------------------------------------------------------
+
+def descargar_ipc(url=IPC_URL):
+    """Baja la serie de IPC del INDEC y devuelve un DataFrame con columnas
+    ['anio_mes' (YYYY-MM), 'ipc'] del Nivel General Nacional."""
+    df = pd.read_csv(url, sep=";", encoding="latin1", na_values=["NA"])
+    df = df[(df["Region"] == "Nacional")
+            & (df["Descripcion"] == "NIVEL GENERAL")].copy()
+    df["anio_mes"] = pd.to_datetime(
+        df["Periodo"].astype(str), format="%Y%m"
+    ).dt.strftime("%Y-%m")
+    df["ipc"] = pd.to_numeric(
+        df["Indice_IPC"].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    return (df[["anio_mes", "ipc"]].dropna()
+            .sort_values("anio_mes").reset_index(drop=True))
+
+
+def actualizar_ipc(ipc_path=IPC_PATH):
+    """Baja el IPC y lo guarda (atómico). Si INDEC no responde, deja el archivo
+    anterior intacto y avisa. Devuelve el DataFrame guardado (o None)."""
+    try:
+        ipc = descargar_ipc()
+    except Exception as e:  # red caída, formato cambiado, etc.
+        print(f"  IPC: no se pudo actualizar ({type(e).__name__}: {e}). "
+              f"Se mantiene el archivo guardado si existe.")
+        return None
+    if ipc.empty:
+        print("  IPC: descarga vacía; no se sobrescribe.")
+        return None
+    os.makedirs(os.path.dirname(ipc_path) or ".", exist_ok=True)
+    tmp = ipc_path + ".tmp"
+    ipc.to_parquet(tmp, index=False)
+    os.replace(tmp, ipc_path)
+    print(f"  IPC: {len(ipc)} meses guardados ({ipc['anio_mes'].iloc[0]} → "
+          f"{ipc['anio_mes'].iloc[-1]}) en {ipc_path}")
+    return ipc
+
+
+def cargar_ipc(ipc_path=IPC_PATH):
+    """Lee el IPC cacheado. Devuelve DataFrame vacío si todavía no existe."""
+    if os.path.exists(ipc_path):
+        return pd.read_parquet(ipc_path)
+    return pd.DataFrame(columns=["anio_mes", "ipc"])
+
+
+def factores_constantes(ipc_df, base_mes=None):
+    """Devuelve (factores, base_mes) para llevar pesos corrientes a pesos
+    CONSTANTES del mes base: factor[mes] = ipc_base / ipc[mes].
+
+    base_mes por defecto = el último mes con IPC publicado (así todo queda en
+    "pesos de hoy"). Multiplicar una facturación corriente por su factor la
+    expresa en pesos del mes base.
+    """
+    if ipc_df is None or ipc_df.empty:
+        return {}, None
+    ipc = ipc_df.dropna(subset=["ipc"]).sort_values("anio_mes")
+    meses = set(ipc["anio_mes"])
+    if base_mes is None or base_mes not in meses:
+        base_mes = ipc["anio_mes"].iloc[-1]
+    ipc_base = float(ipc.loc[ipc["anio_mes"] == base_mes, "ipc"].iloc[0])
+    factores = {r.anio_mes: ipc_base / float(r.ipc) for r in ipc.itertuples()}
+    return factores, base_mes
+
+
+# ---------------------------------------------------------------------------
 # 4) Credenciales + persistencia
 # ---------------------------------------------------------------------------
 
@@ -593,6 +667,9 @@ def main():
     # Actualiza la serie mensual histórica con los meses recién traídos
     # (upsert: solo corrige el mes actual y el anterior; el resto queda intacto).
     upsert_serie(df)
+
+    # Refresca el IPC del INDEC (para los pesos constantes de la app).
+    actualizar_ipc()
 
 
 if __name__ == "__main__":
