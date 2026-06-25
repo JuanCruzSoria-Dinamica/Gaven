@@ -419,8 +419,28 @@ with tab_resumen:
             col_val, _fmt = METRICAS_EVOL[nombre_metrica]
             g = g.sort_values(["anio_mes", dim])
 
+            # --- Total por mes (suma de todos los canales/subcanales) --------
+            # Las métricas aditivas se suman; los % y $/kg se recalculan sobre
+            # los totales para que el "Total" sea correcto (no un promedio).
+            tot = (
+                g.groupby("anio_mes", as_index=False)
+                .agg(kilos=("kilos", "sum"),
+                     subtotalNeto=("subtotalNeto", "sum"),
+                     cm=("cm", "sum"))
+            )
+            tot_den_fc = tot["subtotalNeto"].replace(0, pd.NA)
+            tot_den_kg = tot["kilos"].replace(0, pd.NA)
+            tot["cm_pct"] = (tot["cm"] / tot_den_fc * 100).fillna(0)
+            tot["precio_kg"] = (tot["subtotalNeto"] / tot_den_kg).fillna(0)
+            tot = tot.sort_values("anio_mes")
+
             fig = px.line(
                 g, x="anio_mes", y=col_val, color=dim, markers=True,
+            )
+            fig.add_scatter(
+                x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
+                name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
+                marker=dict(size=6),
             )
             fig.update_layout(
                 template="plotly_dark",
