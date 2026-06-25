@@ -109,11 +109,13 @@ def cargar_serie(_mtime):
     return pd.read_parquet(dp.SERIE_PATH)
 
 
-@st.cache_data(show_spinner="Leyendo IPC (INDEC)...", ttl=60 * 60 * 12)
-def cargar_ipc():
+@st.cache_data(show_spinner="Leyendo IPC (INDEC)...")
+def cargar_ipc(_mtime=None):
     """Devuelve el IPC del INDEC. Usa el archivo que deja el pipeline; si todavía
-    no existe (ej. antes de la primera corrida del cron), intenta bajarlo una vez
-    y cachearlo en memoria. Si INDEC no responde, devuelve lo que haya."""
+    no existe (ej. antes de la primera corrida del cron), intenta bajarlo una vez.
+    La clave de caché es el mtime del archivo: cuando el pipeline reescribe el
+    IPC, la caché se invalida sola (igual que la serie). Así nunca queda
+    'pegado' un IPC vacío."""
     ipc = dp.cargar_ipc()
     if ipc.empty:
         try:
@@ -387,7 +389,9 @@ with tab_resumen:
             base_mes = None
             nota_moneda = "Pesos corrientes (nominales, de cada mes)."
             if moneda.startswith("Constante"):
-                ipc = cargar_ipc()
+                _ipc_mtime = (os.path.getmtime(dp.IPC_PATH)
+                              if os.path.exists(dp.IPC_PATH) else None)
+                ipc = cargar_ipc(_ipc_mtime)
                 factores, base_mes = dp.factores_constantes(ipc)
                 if not factores:
                     st.warning(
