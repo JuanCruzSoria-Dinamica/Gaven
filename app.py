@@ -193,13 +193,10 @@ FILTROS = [
 ]
 
 with st.container(border=True):
-    # Fila 1: período + Top N + última actualización
-    f1a, f1b, f1c = st.columns([1.6, 1.2, 1.6])
+    # Fila 1: período + última actualización
+    f1a, f1c = st.columns([2, 2])
     opcion = f1a.radio(
         "Período", ["Este Mes", "Mes Anterior"], index=0, horizontal=True
-    )
-    top_n = f1b.select_slider(
-        "Top N (rankings)", options=[5, 10, 15, 25, 50], value=10
     )
     desde, hasta = rango_mes(opcion)
 
@@ -477,7 +474,20 @@ with tab_canales:
     col_a, col_b = st.columns(2)
     with col_a:
         st.caption("Share de facturación por canal")
-        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["share_fc"])
+        _pc = dp.por_canal(df)
+        fig_torta = px.pie(
+            _pc, names="dsCanalMkt", values="share_fc", hole=0.4,
+        )
+        fig_torta.update_traces(textposition="inside", textinfo="percent+label")
+        fig_torta.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=10, r=10, t=10, b=10),
+            showlegend=False,
+            height=360,
+        )
+        st.plotly_chart(fig_torta, use_container_width=True)
     with col_b:
         st.caption("CM % por canal")
         st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["cm_pct"])
@@ -506,7 +516,13 @@ with tab_prod:
         c3.metric("SKUs clase C (resto)", n_c)
 
         st.divider()
-        st.subheader(f"Ranking de productos con clasificación ABC · Top {top_n}")
+        c_titulo, c_top = st.columns([3, 1])
+        top_n = c_top.select_slider(
+            "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_prod"
+        )
+        c_titulo.subheader(
+            f"Ranking de productos con clasificación ABC · Top {top_n}"
+        )
         cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
                 "cm", "cm_pct", "precio_kg"]
         t = prod[cols].head(top_n).rename(columns={
@@ -535,6 +551,10 @@ with tab_clientes:
         )
 
         st.divider()
+        _, c_top = st.columns([3, 1])
+        top_n = c_top.select_slider(
+            "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_rfm"
+        )
         col_a, col_b = st.columns(2)
         with col_a:
             st.subheader("Top clientes por facturación")
