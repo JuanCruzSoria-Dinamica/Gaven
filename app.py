@@ -578,37 +578,50 @@ with tab_clientes:
         )
 
         st.divider()
-        _, c_top = st.columns([3, 1])
+        # Filtro por segmento: si elegís "Campeones" (o varios), las tablas de
+        # abajo muestran el top SOLO de ese/esos segmento(s). Vacío = todos.
+        ORDEN_SEG = ["Campeones", "Leales", "Nuevos / Prometedores",
+                     "En riesgo", "Hibernando / Perdidos"]
+        segs_disp = [s for s in ORDEN_SEG if s in set(r["segmento"])]
+        c_seg, c_top = st.columns([3, 1])
+        seg_sel = c_seg.multiselect(
+            "Segmento", segs_disp, default=[],
+            placeholder="Todos los segmentos", key="seg_rfm",
+        )
         top_n = c_top.select_slider(
             "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_rfm"
         )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.subheader("Top clientes por facturación")
-            st.dataframe(
-                r.sort_values("monetario", ascending=False).head(top_n)
-                [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
-                .rename(columns={
-                    "nombreCliente": "Cliente", "segmento": "Segmento",
-                    "monetario": "Facturación", "frecuencia": "Frecuencia",
-                    "recencia": "Recencia (días)",
-                })
-                .style.format({"Facturación": fmt_money}),
-                use_container_width=True, hide_index=True,
-            )
-        with col_b:
-            st.subheader("Top clientes por frecuencia")
-            st.dataframe(
-                r.sort_values("frecuencia", ascending=False).head(top_n)
-                [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
-                .rename(columns={
-                    "nombreCliente": "Cliente", "segmento": "Segmento",
-                    "frecuencia": "Frecuencia", "monetario": "Facturación",
-                    "recencia": "Recencia (días)",
-                })
-                .style.format({"Facturación": fmt_money}),
-                use_container_width=True, hide_index=True,
-            )
+        r_f = r[r["segmento"].isin(seg_sel)] if seg_sel else r
+        if r_f.empty:
+            st.info("No hay clientes en el segmento seleccionado.")
+        else:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.subheader("Top clientes por facturación")
+                st.dataframe(
+                    r_f.sort_values("monetario", ascending=False).head(top_n)
+                    [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
+                    .rename(columns={
+                        "nombreCliente": "Cliente", "segmento": "Segmento",
+                        "monetario": "Facturación", "frecuencia": "Frecuencia",
+                        "recencia": "Recencia (días)",
+                    })
+                    .style.format({"Facturación": fmt_money}),
+                    use_container_width=True, hide_index=True,
+                )
+            with col_b:
+                st.subheader("Top clientes por frecuencia")
+                st.dataframe(
+                    r_f.sort_values("frecuencia", ascending=False).head(top_n)
+                    [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
+                    .rename(columns={
+                        "nombreCliente": "Cliente", "segmento": "Segmento",
+                        "frecuencia": "Frecuencia", "monetario": "Facturación",
+                        "recencia": "Recencia (días)",
+                    })
+                    .style.format({"Facturación": fmt_money}),
+                    use_container_width=True, hide_index=True,
+                )
 
 
 # --- TAB VENDEDORES -------------------------------------------------------
