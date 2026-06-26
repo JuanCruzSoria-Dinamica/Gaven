@@ -11,6 +11,7 @@ Correr local:   streamlit run app.py
 
 import os
 import json
+import calendar
 import datetime as dt
 
 import pandas as pd
@@ -327,17 +328,63 @@ def tabla_dim(g, dim_label, dim_col):
 with tab_resumen:
     m = dp.metricas_generales(df)
 
+    # --- Proyección a fin de mes ------------------------------------------
+    # Run-rate lineal: extrapola lo acumulado hasta hoy al total del mes,
+    # usando el ritmo diario promedio. Cuenta solo días HÁBILES: los domingos
+    # no se trabaja, así que no entran ni en los transcurridos ni en el total.
+    # Solo aplica al "Este Mes" en curso; "Mes Anterior" ya está cerrado.
+    def _dias_habiles(anio, mes, hasta_dia):
+        """Días no-domingo del 1 al hasta_dia (inclusive) de un mes."""
+        return sum(
+            1 for d in range(1, hasta_dia + 1)
+            if dt.date(anio, mes, d).weekday() != 6  # 6 = domingo
+        )
+
+    factor = 1.0
+    proyectar = False
+    if opcion == "Este Mes":
+        total_dias = calendar.monthrange(hasta.year, hasta.month)[1]
+        ult = df["fechaComprobate"].max()
+        dia_ult = ult.day if pd.notna(ult) else hasta.day
+        hab_mes = _dias_habiles(hasta.year, hasta.month, total_dias)
+        hab_trans = _dias_habiles(hasta.year, hasta.month, dia_ult)
+        if hab_trans and hab_trans < hab_mes:
+            factor = hab_mes / hab_trans
+            proyectar = True
+
+    def proy(col, valor, fmt, escala=True):
+        """Muestra debajo de la métrica la proyección a fin de mes.
+
+        escala=True  -> métrica aditiva (se multiplica por el run-rate).
+        escala=False -> métrica de tasa/ratio (se mantiene estable).
+        """
+        if not proyectar:
+            return
+        pv = valor * factor if escala else valor
+        col.caption(f"Proy. fin de mes: {fmt(pv)}")
+
+    def _int(x):
+        return f"{round(x):,}".replace(",", ".")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Facturación neta", fmt_money(m["subtotal_neto"]))
+    proy(c1, m["subtotal_neto"], fmt_money)
     c2.metric("Kilos vendidos", fmt_kg(m["total_kilos"]))
+    proy(c2, m["total_kilos"], fmt_kg)
     c3.metric("Contribución marginal", fmt_money(m["contribucion_marginal"]))
+    proy(c3, m["contribucion_marginal"], fmt_money)
     c4.metric("CM %", fmt_pct(m["cm_pct"]))
+    proy(c4, m["cm_pct"], fmt_pct, escala=False)
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Precio medio / kg", fmt_money(m["precio_medio_kg"]))
+    proy(c5, m["precio_medio_kg"], fmt_money, escala=False)
     c6.metric("Clientes únicos", f"{m['n_clientes']:,}".replace(",", "."))
+    proy(c6, m["n_clientes"], _int)
     c7.metric("Ticket promedio", fmt_money(m["ticket_promedio"]))
+    proy(c7, m["ticket_promedio"], fmt_money, escala=False)
     c8.metric("SKUs vendidos", f"{m['n_skus']:,}".replace(",", "."))
+    proy(c8, m["n_skus"], _int)
 
     st.caption(
         f"{m['n_comprobantes']:,}".replace(",", ".") + " comprobantes  ·  "
