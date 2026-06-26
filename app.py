@@ -216,7 +216,10 @@ with st.container(border=True):
         & (fecha.dt.year == 2026)
     ].copy()
 
-    # Fila 2: un selector por dimensión (solo las que tienen datos)
+    # Fila 2: un selector por dimensión (solo las que tienen datos).
+    # Filtros EN CASCADA: las opciones de cada selector se calculan sobre el
+    # df ya filtrado por los OTROS selectores. Así, si filtrás por "food
+    # service", el selector de Vendedor solo ofrece los que vendieron eso.
     seleccion = {}
     if not df_periodo.empty:
         disponibles = [
@@ -224,11 +227,35 @@ with st.container(border=True):
             if col in df_periodo.columns and opciones(df_periodo[col])
         ]
         if disponibles:
+            # Selecciones de la corrida anterior (Streamlit re-ejecuta en cada
+            # interacción): sirven de base para armar las opciones cruzadas.
+            sel_prev = {
+                col: st.session_state.get(f"filtro_{col}", [])
+                for _, col in disponibles
+            }
+
+            def _df_filtrado_excepto(col_excluida):
+                """df del período filtrado por todos los selectores menos uno."""
+                d = df_periodo
+                for c, vals in sel_prev.items():
+                    if c == col_excluida or not vals:
+                        continue
+                    d = d[d[c].astype(str).str.strip().isin(vals)]
+                return d
+
             cols = st.columns(len(disponibles))
             for i, (etiqueta, col) in enumerate(disponibles):
+                opts = opciones(_df_filtrado_excepto(col)[col])
+                key = f"filtro_{col}"
+                # Si algún valor elegido ya no es válido (porque otro filtro lo
+                # excluyó), lo sacamos del estado para evitar el error de
+                # Streamlit "default value not in options".
+                if key in st.session_state:
+                    st.session_state[key] = [
+                        v for v in st.session_state[key] if v in opts
+                    ]
                 seleccion[col] = cols[i].multiselect(
-                    etiqueta, opciones(df_periodo[col]), default=[],
-                    placeholder="Todos",
+                    etiqueta, opts, key=key, placeholder="Todos",
                 )
 
 n_filtros = sum(1 for v in seleccion.values() if v)
