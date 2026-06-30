@@ -385,18 +385,30 @@ def fmt_pct(x):
 COLS_DIM = {
     "kilos": "Kilos", "subtotalNeto": "Facturación", "cm": "Contribución",
     "cm_pct": "CM %", "precio_kg": "$/kg", "clientes": "Clientes",
+    "skus": "SKUs", "skus_por_cliente": "SKUs/Cliente",
     "share_fc": "Share FC %", "share_kg": "Share Kg %",
 }
 FMT_DIM = {
     "Kilos": fmt_kg, "Facturación": fmt_money, "Contribución": fmt_money,
     "CM %": fmt_pct, "$/kg": fmt_money, "Share FC %": fmt_pct, "Share Kg %": fmt_pct,
+    "SKUs/Cliente": lambda x: f"{x:,.1f}".replace(",", "."),
 }
 
 
-def tabla_dim(g, dim_label, dim_col):
-    """Renderiza un resumen de dp.agrupar_dim como tabla formateada."""
+def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
+              mostrar_skus_cliente=False):
+    """Renderiza un resumen de dp.agrupar_dim como tabla formateada.
+
+    mostrar_skus=True agrega la columna 'SKUs' (cantidad de productos únicos
+    que maneja cada fila de la dimensión).
+    mostrar_skus_cliente=True agrega 'SKUs/Cliente' (productos únicos
+    promedio por cliente)."""
     cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "cm_pct",
             "precio_kg", "clientes"]
+    if mostrar_skus:
+        cols.append("skus")
+    if mostrar_skus_cliente:
+        cols.append("skus_por_cliente")
     # Supervisores no ven Contribución ni CM %: se quitan las columnas.
     if not mostrar_cm:
         cols = [c for c in cols if c not in ("cm", "cm_pct")]
@@ -654,7 +666,7 @@ with tab_resumen:
 # --- TAB CANALES ----------------------------------------------------------
 with tab_canales:
     st.subheader("Detalle por canal")
-    tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt")
+    tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt", mostrar_skus=True)
 
     # Para dueños: torta de share + CM % por canal lado a lado.
     # Para supervisores: solo la torta (a ancho completo), sin CM %.
@@ -682,7 +694,7 @@ with tab_canales:
 
     st.divider()
     st.subheader("Detalle por subcanal")
-    tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT")
+    tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT", mostrar_skus=True)
 
     st.subheader("Detalle por marca / línea (proveedor)")
     tabla_dim(dp.por_proveedor(df), "Marca / Línea", "proveedor")
@@ -791,7 +803,8 @@ with tab_clientes:
 # --- TAB VENDEDORES -------------------------------------------------------
 with tab_vend:
     st.subheader("Detalle por vendedor")
-    tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor")
+    tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor", mostrar_skus=True,
+              mostrar_skus_cliente=True)
 
     st.caption("Facturación por vendedor")
     st.bar_chart(dp.por_vendedor(df).set_index("dsVendedor")["subtotalNeto"])

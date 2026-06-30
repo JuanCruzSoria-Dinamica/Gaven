@@ -256,12 +256,14 @@ def agrupar_dim(df_ventas, col):
             subtotalNeto=("subtotalNeto", "sum"),
             costo=("costo_unitario", "sum"),
             clientes=("idCliente", "nunique"),
+            skus=("idArticulo", "nunique"),
         )
         .reset_index()
     )
     g["cm"] = g["subtotalNeto"] - g["costo"]
     g["cm_pct"] = np.where(g["subtotalNeto"] != 0, g["cm"] / g["subtotalNeto"] * 100, 0)
     g["precio_kg"] = np.where(g["kilos"] != 0, g["subtotalNeto"] / g["kilos"], 0)
+    g["skus_por_cliente"] = np.where(g["clientes"] != 0, g["skus"] / g["clientes"], 0)
     total_fc = g["subtotalNeto"].sum()
     total_kg = g["kilos"].sum()
     g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
