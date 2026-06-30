@@ -152,10 +152,101 @@ def rango_mes(opcion, hoy=None):
 
 
 # ---------------------------------------------------------------------------
+# Login + roles
+# ---------------------------------------------------------------------------
+# Dos roles, sin base de datos de usuarios. Las credenciales viven en
+# .streamlit/secrets.toml (sección [acceso]), NO en este archivo.
+#   - "dueno"      -> ve todo, incluida Contribución marginal y CM %.
+#   - "supervisor" -> ve todo MENOS Contribución marginal y CM %.
+# El rol se guarda en st.session_state y sobrevive a las re-ejecuciones.
+
+def _login():
+    """Muestra el login y corta la ejecución hasta que el rol esté seteado."""
+    if "rol" not in st.session_state:
+        st.session_state.rol = None
+    if st.session_state.rol is not None:
+        return  # ya está logueado, seguimos con el tablero
+
+    try:
+        cred = st.secrets["acceso"]
+    except Exception:
+        st.error(
+            "Falta la sección [acceso] en .streamlit/secrets.toml. "
+            "Agregá usuarios y contraseñas para poder entrar."
+        )
+        st.stop()
+
+    # Login centrado en una "cajita" angosta (como cualquier sitio web):
+    # tres columnas y el formulario va en la del medio.
+    st.markdown(
+        """
+        <style>
+          /* Quitamos el borde propio del form: la "caja" la pone el
+             contenedor con borde de afuera, así no se duplica. */
+          [data-testid="stForm"]{border:0; padding:0;}
+          .login-head{text-align:center; margin:0 0 16px;}
+          .login-head h2{margin:0; font-weight:700; letter-spacing:-.3px;
+            font-size:1.25rem;}
+          .login-head p{color:var(--tx2); font-size:.85rem; margin:.25rem 0 0;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    _l, _c, _r = st.columns([1.4, 1, 1.4])
+    with _c:
+        st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                "<div class='login-head'>"
+                "<h2>Panel de Ventas · Gaven</h2>"
+                "<p>Iniciá sesión para continuar</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            with st.form("login"):
+                usuario = st.text_input("Usuario")
+                pwd = st.text_input("Contraseña", type="password")
+                entrar = st.form_submit_button(
+                    "Entrar", type="primary", use_container_width=True
+                )
+        if entrar:
+            if (usuario == cred.get("usuario_duenos")
+                    and pwd == cred.get("password_duenos")):
+                st.session_state.rol = "dueno"
+                st.rerun()
+            elif (usuario == cred.get("usuario_supervisores")
+                    and pwd == cred.get("password_supervisores")):
+                st.session_state.rol = "supervisor"
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
+    st.stop()  # mientras no haya rol válido, no se renderiza nada del tablero
+
+
+_login()
+
+# A partir de acá hay un rol válido en sesión.
+# mostrar_cm es la llave maestra: si es False, los números de Contribución
+# marginal y CM % no se calculan ni se muestran en NINGÚN lado del tablero.
+mostrar_cm = st.session_state.rol == "dueno"
+
+
+# ---------------------------------------------------------------------------
 # Carga + guardas
 # ---------------------------------------------------------------------------
 
-st.title("Panel de Ventas · Gaven")
+# Encabezado con el rol activo y botón para cerrar sesión.
+_ct, _cu = st.columns([4, 1])
+_ct.title("Panel de Ventas · Gaven")
+_rol_label = "Dueño" if st.session_state.rol == "dueno" else "Supervisor"
+_cu.markdown(
+    f"<div style='text-align:right;color:var(--tx2);font-size:.8rem;"
+    f"padding-top:1rem'>Sesión: <b>{_rol_label}</b></div>",
+    unsafe_allow_html=True,
+)
+if _cu.button("Cerrar sesión", use_container_width=True):
+    st.session_state.rol = None
+    st.rerun()
 
 if not os.path.exists(PARQUET_PATH):
     st.warning(
@@ -306,6 +397,9 @@ def tabla_dim(g, dim_label, dim_col):
     """Renderiza un resumen de dp.agrupar_dim como tabla formateada."""
     cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "cm_pct",
             "precio_kg", "clientes"]
+    # Supervisores no ven Contribución ni CM %: se quitan las columnas.
+    if not mostrar_cm:
+        cols = [c for c in cols if c not in ("cm", "cm_pct")]
     cols = [c for c in cols if c in g.columns]
     t = g[cols].rename(columns={dim_col: dim_label, **COLS_DIM})
     st.dataframe(
@@ -366,25 +460,40 @@ with tab_resumen:
     def _int(x):
         return f"{round(x):,}".replace(",", ".")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Facturación neta", fmt_money(m["subtotal_neto"]))
-    proy(c1, m["subtotal_neto"], fmt_money)
-    c2.metric("Kilos vendidos", fmt_kg(m["total_kilos"]))
-    proy(c2, m["total_kilos"], fmt_kg)
-    c3.metric("Contribución marginal", fmt_money(m["contribucion_marginal"]))
-    proy(c3, m["contribucion_marginal"], fmt_money)
-    c4.metric("CM %", fmt_pct(m["cm_pct"]))
-    proy(c4, m["cm_pct"], fmt_pct, escala=False)
+    # Cada métrica: (etiqueta, valor a mostrar, valor para proyectar,
+    # formato de proyección o None, escala). Las de CM solo se agregan para
+    # el rol dueño, así supervisores nunca las reciben.
+    metricas = [
+        ("Facturación neta", fmt_money(m["subtotal_neto"]),
+         m["subtotal_neto"], fmt_money, True),
+        ("Kilos vendidos", fmt_kg(m["total_kilos"]),
+         m["total_kilos"], fmt_kg, True),
+    ]
+    if mostrar_cm:
+        metricas += [
+            ("Contribución marginal", fmt_money(m["contribucion_marginal"]),
+             m["contribucion_marginal"], fmt_money, True),
+            ("CM %", fmt_pct(m["cm_pct"]),
+             m["cm_pct"], fmt_pct, False),
+        ]
+    metricas += [
+        ("Precio medio / kg", fmt_money(m["precio_medio_kg"]),
+         m["precio_medio_kg"], fmt_money, False),
+        ("Clientes únicos", f"{m['n_clientes']:,}".replace(",", "."),
+         m["n_clientes"], _int, True),
+        ("Ticket promedio", fmt_money(m["ticket_promedio"]),
+         m["ticket_promedio"], fmt_money, False),
+        ("SKUs vendidos", f"{m['n_skus']:,}".replace(",", "."),
+         m["n_skus"], _int, True),
+    ]
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Precio medio / kg", fmt_money(m["precio_medio_kg"]))
-    proy(c5, m["precio_medio_kg"], fmt_money, escala=False)
-    c6.metric("Clientes únicos", f"{m['n_clientes']:,}".replace(",", "."))
-    proy(c6, m["n_clientes"], _int)
-    c7.metric("Ticket promedio", fmt_money(m["ticket_promedio"]))
-    proy(c7, m["ticket_promedio"], fmt_money, escala=False)
-    c8.metric("SKUs vendidos", f"{m['n_skus']:,}".replace(",", "."))
-    proy(c8, m["n_skus"], _int)
+    # Render en filas de 4 columnas.
+    for i in range(0, len(metricas), 4):
+        cols = st.columns(4)
+        for col, (lbl, disp, pval, pfmt, escala) in zip(cols, metricas[i:i + 4]):
+            col.metric(lbl, disp)
+            if pfmt is not None:
+                proy(col, pval, pfmt, escala)
 
     st.caption(
         f"{m['n_comprobantes']:,}".replace(",", ".") + " comprobantes  ·  "
@@ -415,10 +524,12 @@ with tab_resumen:
             METRICAS_EVOL = {
                 "Facturación neta": ("subtotalNeto", fmt_money),
                 "Kilos": ("kilos", fmt_kg),
-                "Contribución marginal (MB $)": ("cm", fmt_money),
-                "CM % (margen)": ("cm_pct", fmt_pct),
-                "Precio medio $/kg": ("precio_kg", fmt_money),
             }
+            # Supervisores no ven las métricas de CM en el selector.
+            if mostrar_cm:
+                METRICAS_EVOL["Contribución marginal (MB $)"] = ("cm", fmt_money)
+                METRICAS_EVOL["CM % (margen)"] = ("cm_pct", fmt_pct)
+            METRICAS_EVOL["Precio medio $/kg"] = ("precio_kg", fmt_money)
 
             c1, c2, c3 = st.columns([1.5, 0.9, 1.2])
             nombre_metrica = c1.selectbox(
@@ -545,7 +656,9 @@ with tab_canales:
     st.subheader("Detalle por canal")
     tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt")
 
-    col_a, col_b = st.columns(2)
+    # Para dueños: torta de share + CM % por canal lado a lado.
+    # Para supervisores: solo la torta (a ancho completo), sin CM %.
+    col_a, col_b = st.columns(2) if mostrar_cm else (st.container(), None)
     with col_a:
         st.caption("Share de facturación por canal")
         _pc = dp.por_canal(df)
@@ -562,9 +675,10 @@ with tab_canales:
             height=360,
         )
         st.plotly_chart(fig_torta, use_container_width=True)
-    with col_b:
-        st.caption("CM % por canal")
-        st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["cm_pct"])
+    if mostrar_cm:
+        with col_b:
+            st.caption("CM % por canal")
+            st.bar_chart(dp.por_canal(df).set_index("dsCanalMkt")["cm_pct"])
 
     st.divider()
     st.subheader("Detalle por subcanal")
@@ -599,6 +713,9 @@ with tab_prod:
         )
         cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
                 "cm", "cm_pct", "precio_kg"]
+        # Supervisores no ven Contribución ni CM % en el ranking de SKUs.
+        if not mostrar_cm:
+            cols = [c for c in cols if c not in ("cm", "cm_pct")]
         t = prod[cols].head(top_n).rename(columns={
             "dsArticulo": "Producto", **COLS_DIM,
         })
