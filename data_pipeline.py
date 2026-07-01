@@ -263,7 +263,19 @@ def agrupar_dim(df_ventas, col):
     g["cm"] = g["subtotalNeto"] - g["costo"]
     g["cm_pct"] = np.where(g["subtotalNeto"] != 0, g["cm"] / g["subtotalNeto"] * 100, 0)
     g["precio_kg"] = np.where(g["kilos"] != 0, g["subtotalNeto"] / g["kilos"], 0)
-    g["skus_por_cliente"] = np.where(g["clientes"] != 0, g["skus"] / g["clientes"], 0)
+    # Promedio real de SKUs distintos que compra cada cliente dentro de esta
+    # dimensión: primero se cuentan los SKUs únicos por (dimensión, cliente)
+    # y luego se promedia entre los clientes de cada grupo. (Antes se hacía
+    # SKUs totales del grupo / clientes del grupo, que subestima el valor
+    # cuando los clientes comparten productos entre sí.)
+    skus_cliente = (
+        df_ventas.groupby([col, "idCliente"])["idArticulo"]
+        .nunique()
+        .reset_index(name="_skus_cliente")
+        .groupby(col)["_skus_cliente"]
+        .mean()
+    )
+    g["skus_por_cliente"] = g[col].map(skus_cliente).fillna(0)
     total_fc = g["subtotalNeto"].sum()
     total_kg = g["kilos"].sum()
     g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
