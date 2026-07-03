@@ -514,11 +514,11 @@ with tab_resumen:
 
     st.divider()
 
-    # --- Evolución mensual por canal --------------------------------------
+    # --- Evolución mensual (canal / subcanal / vendedor) --------------------
     # Usa la serie mensual histórica (data/serie_mensual.parquet),
     # INDEPENDIENTE del filtro de período: muestra todos los meses 2025–2026
     # para comparar.
-    st.subheader("Evolución mensual por canal")
+    st.subheader("Evolución mensual")
 
     if not os.path.exists(dp.SERIE_PATH):
         st.warning(
@@ -548,7 +548,7 @@ with tab_resumen:
                 "Métrica", list(METRICAS_EVOL.keys()), index=0
             )
             nivel = c2.radio(
-                "Abrir por", ["Canal", "Subcanal"], horizontal=True
+                "Abrir por", ["Canal", "Subcanal", "Vendedor"], horizontal=True
             )
             moneda = c3.radio(
                 "Moneda", ["Corriente", "Constante (s/ inflación)"],
@@ -557,9 +557,15 @@ with tab_resumen:
                      "Constante = todo llevado a pesos de hoy con el IPC del "
                      "INDEC, para comparar sin el efecto de la inflación.",
             )
-            dim = "dsCanalMkt" if nivel == "Canal" else "dsSubcanalMKT"
+            dim = {
+                "Canal": "dsCanalMkt",
+                "Subcanal": "dsSubcanalMKT",
+                "Vendedor": "dsVendedor",
+            }[nivel]
 
-            # Respeta los filtros globales de canal/subcanal si están activos.
+            # Respeta los filtros globales de canal/subcanal/vendedor si están
+            # activos (las sumas crudas se re-agregan bien sea cual sea el
+            # nivel elegido para abrir el gráfico).
             s = serie.copy()
             if seleccion.get("dsCanalMkt"):
                 s = s[s["dsCanalMkt"].astype(str).str.strip()
@@ -567,6 +573,9 @@ with tab_resumen:
             if seleccion.get("dsSubcanalMKT"):
                 s = s[s["dsSubcanalMKT"].astype(str).str.strip()
                       .isin(seleccion["dsSubcanalMKT"])]
+            if seleccion.get("dsVendedor"):
+                s = s[s["dsVendedor"].astype(str).str.strip()
+                      .isin(seleccion["dsVendedor"])]
 
             # Re-agrega al nivel elegido (las sumas crudas se re-agregan bien).
             g = (
@@ -631,11 +640,15 @@ with tab_resumen:
             fig = px.line(
                 g, x="anio_mes", y=col_val, color=dim, markers=True,
             )
-            fig.add_scatter(
-                x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
-                name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
-                marker=dict(size=6),
-            )
+            # La línea de "Total" solo suma valor cuando se abre por Canal
+            # (pocas categorías). En Subcanal/Vendedor hay demasiadas líneas
+            # y el total se pisa con ellas, así que se omite.
+            if nivel == "Canal":
+                fig.add_scatter(
+                    x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
+                    name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
+                    marker=dict(size=6),
+                )
             fig.update_layout(
                 template="plotly_dark",
                 paper_bgcolor="rgba(0,0,0,0)",
@@ -716,24 +729,108 @@ with tab_prod:
         c3.metric("SKUs clase C (resto)", n_c)
 
         st.divider()
-        c_titulo, c_top = st.columns([3, 1])
-        top_n = c_top.select_slider(
-            "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_prod"
+        # Filtro por clase ABC: si elegís "A" (o varias), el ranking de abajo
+        # muestra el top SOLO de esa/esas clases. Vacío = todas. Sin esto,
+        # el Top N siempre caía en clase A porque "prod" viene ordenado por
+        # facturación descendente (los primeros N son casi siempre A).
+        c_buscar, c_abc, c_top = st.columns([3, 1.4, 1.4])
+        with c_buscar:
+            buscar = st.text_input(
+                "Buscar producto por nombre",
+                placeholder="Buscar Producto",
+                key="buscar_prod",
+            )
+        with c_abc:
+            abc_uno = st.pills(
+                "Clase ABC", ["A", "B", "C"], selection_mode="single",
+                default=None, key="abc_sel_prod",
+            )
+        with c_top:
+            top_n = st.select_slider(
+                "Top N", options=[5, 10, 15, 25, 50], value=10,
+                key="top_n_prod",
+            )
+        abc_sel = [abc_uno] if abc_uno else []
+        prod_f = prod[prod["ABC"].isin(abc_sel)] if abc_sel else prod
+
+        # Búsqueda por nombre: filtra el ranking por coincidencia parcial
+        # (sin distinguir mayúsculas/acentos) en el nombre del producto.
+        if buscar and buscar.strip():
+            termino = buscar.strip()
+            prod_f = prod_f[
+                prod_f["dsArticulo"].astype(str)
+                .str.normalize("NFKD").str.encode("ascii", "ignore").str.decode("ascii")
+                .str.contains(
+                    termino.encode("ascii", "ignore").decode("ascii"),
+                    case=False, na=False,
+                )
+            ]
+
+        titulo_clase = f" (clase {abc_uno})" if abc_uno else ""
+        titulo_buscar = f' · "{buscar.strip()}"' if buscar and buscar.strip() else ""
+        st.subheader(
+            f"Ranking de productos con clasificación ABC{titulo_clase} · "
+            f"Top {top_n}{titulo_buscar}"
         )
-        c_titulo.subheader(
-            f"Ranking de productos con clasificación ABC · Top {top_n}"
-        )
-        cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
-                "cm", "cm_pct", "precio_kg"]
-        # Supervisores no ven Contribución ni CM % en el ranking de SKUs.
-        if not mostrar_cm:
-            cols = [c for c in cols if c not in ("cm", "cm_pct")]
-        t = prod[cols].head(top_n).rename(columns={
-            "dsArticulo": "Producto", **COLS_DIM,
-        })
-        st.dataframe(
-            t.style.format(FMT_DIM), use_container_width=True, hide_index=True,
-        )
+        if prod_f.empty:
+            st.info("No hay productos en la clase seleccionada.")
+        else:
+            cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
+                    "cm", "cm_pct", "precio_kg", "clientes"]
+            # Supervisores no ven Contribución ni CM % en el ranking de SKUs.
+            if not mostrar_cm:
+                cols = [c for c in cols if c not in ("cm", "cm_pct")]
+            # Copia sin renombrar: sirve para recuperar el nombre real del
+            # producto a partir de la fila que el usuario seleccione (la
+            # selección devuelve la posición de la fila en este mismo orden).
+            prod_top = prod_f[cols].head(top_n).reset_index(drop=True)
+            # "clientes" = a cuántos clientes distintos se le vende el producto
+            # (cobertura). COLS_DIM lo llama "Clientes"; acá lo mostramos como
+            # "Cobertura" para dejar claro el sentido.
+            t = prod_top.rename(columns={
+                "dsArticulo": "Producto", **COLS_DIM, "clientes": "Cobertura",
+            })
+            sel_evt = st.dataframe(
+                t.style.format(FMT_DIM), use_container_width=True,
+                hide_index=True, on_select="rerun",
+                selection_mode="single-row", key="tabla_prod",
+            )
+            st.caption("Hacé clic en un producto para ver su desglose por canal.")
+
+            # --- Desglose por canal del producto seleccionado ---------------
+            filas_sel = sel_evt.selection.rows if sel_evt and sel_evt.selection else []
+            if filas_sel:
+                fila = filas_sel[0]
+                nombre_prod = prod_top.iloc[fila]["dsArticulo"]
+                det = df[df["dsArticulo"].astype(str) == str(nombre_prod)]
+                if det.empty:
+                    st.info("Sin datos de canal para este producto.")
+                else:
+                    g_can = (
+                        det.groupby("dsCanalMkt", dropna=False)
+                        .agg(kilos=("kilos", "sum"),
+                             subtotalNeto=("subtotalNeto", "sum"))
+                        .reset_index()
+                        .sort_values("subtotalNeto", ascending=False)
+                    )
+                    total_fc = g_can["subtotalNeto"].sum()
+                    g_can["share_fc"] = (
+                        g_can["subtotalNeto"] / total_fc * 100
+                        if total_fc else 0
+                    )
+                    st.divider()
+                    st.subheader(f"Desglose por canal · {nombre_prod}")
+                    det_tbl = g_can.rename(columns={
+                        "dsCanalMkt": "Canal", "kilos": "Kilos",
+                        "subtotalNeto": "Facturación", "share_fc": "Share FC %",
+                    })
+                    st.dataframe(
+                        det_tbl.style.format({
+                            "Kilos": fmt_kg, "Facturación": fmt_money,
+                            "Share FC %": fmt_pct,
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
 
 
 # --- TAB CLIENTES (RFM) ---------------------------------------------------

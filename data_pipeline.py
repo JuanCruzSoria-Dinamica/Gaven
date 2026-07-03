@@ -464,26 +464,29 @@ def alertas(df_ventas):
 # ---------------------------------------------------------------------------
 
 # Grano de la serie histórica. Guardamos a este nivel; en la app se puede
-# "subir" a canal sumando los subcanales (las sumas se re-agregan sin problema).
-SERIE_GRANO = ["anio_mes", "dsCanalMkt", "dsSubcanalMKT"]
+# "subir" a canal, subcanal o vendedor sumando el resto de las dimensiones
+# (las sumas se re-agregan sin problema porque son crudas, no porcentajes).
+SERIE_GRANO = ["anio_mes", "dsCanalMkt", "dsSubcanalMKT", "dsVendedor"]
 SERIE_COLS = SERIE_GRANO + [
     "kilos", "subtotalNeto", "costo", "cm", "clientes", "comprobantes"
 ]
 
 
 def agregar_serie(df_ventas):
-    """Agrega el detalle a nivel mes × canal × subcanal, guardando SOLO sumas
-    crudas. NUNCA guardamos porcentajes (CM %, share, $/kg): esos se derivan
-    al leer, porque un promedio de porcentajes no se puede re-agregar bien.
+    """Agrega el detalle a nivel mes × canal × subcanal × vendedor, guardando
+    SOLO sumas crudas. NUNCA guardamos porcentajes (CM %, share, $/kg): esos
+    se derivan al leer, porque un promedio de porcentajes no se puede
+    re-agregar bien.
 
     Columnas de salida (SERIE_COLS):
-      anio_mes (YYYY-MM), dsCanalMkt, dsSubcanalMKT,
+      anio_mes (YYYY-MM), dsCanalMkt, dsSubcanalMKT, dsVendedor,
       kilos, subtotalNeto, costo, cm, clientes, comprobantes
 
     Nota: 'clientes' y 'comprobantes' son conteos únicos POR FILA (mes×canal×
-    subcanal). Sirven para graficar por mes, pero no se deben sumar entre meses
-    ni entre subcanales para sacar un único total (se duplicarían clientes que
-    compran en varios subcanales).
+    subcanal×vendedor). Sirven para graficar por mes, pero no se deben sumar
+    entre meses ni entre subcanales/vendedores para sacar un único total (se
+    duplicarían clientes que compran en varios subcanales o le compran a más
+    de un vendedor).
     """
     if df_ventas is None or df_ventas.empty:
         return pd.DataFrame(columns=SERIE_COLS)
