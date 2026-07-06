@@ -360,11 +360,15 @@ def rfm(df_ventas):
     if base.empty:
         return base
 
+    # El df tiene una fila por línea de artículo; para contar compras reales
+    # usamos el comprobante único (empresa + tipo doc + nº doc), no las filas.
+    base["_comp_id"] = comprobante_id(base)
+
     fecha_analisis = base["fechaComprobate"].max()
     r = base.groupby("idCliente").agg(
         nombreCliente=("nombreCliente", "first"),
         ultima_compra=("fechaComprobate", "max"),
-        frecuencia=("dsDocumento", "count"),
+        frecuencia=("_comp_id", "nunique"),
         monetario=("subtotalNeto", "sum"),
     ).reset_index()
     r["recencia"] = (fecha_analisis - r["ultima_compra"]).dt.days
