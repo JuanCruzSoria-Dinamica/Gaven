@@ -393,6 +393,60 @@ def por_proveedor(df_ventas):
     return agrupar_dim(d, "marca_linea")
 
 
+# --- Línea de producto "estricta" (para la solapa Líneas) ------------------
+# A diferencia de marca_linea (que cae al proveedor cuando el artículo no está
+# en el lookup), acá los SKUs sin regla caen a SIN_ASIGNAR. Así la solapa de
+# gestión comercial los agrupa y los deja detectar sin romper nada.
+SIN_ASIGNAR = "SIN ASIGNAR"
+
+
+def agregar_linea_estricta(df, col_destino="linea_producto"):
+    """Agrega la columna `linea_producto`: marca/línea del lookup por artículo,
+    o SIN_ASIGNAR si el artículo no figura en data/marca_linea_lookup.csv.
+    NO modifica 'marca_linea' ni afecta a las otras solapas."""
+    if df is None:
+        return df
+    df = df.copy()
+    if df.empty:
+        df[col_destino] = pd.Series(dtype="object")
+        return df
+    lookup = _cargar_lookup_marca()
+    if "dsArticulo" in df.columns:
+        m = df["dsArticulo"].map(_norm_articulo).map(lookup)
+    else:
+        m = pd.Series([np.nan] * len(df), index=df.index)
+    m = m.astype("object")
+    vacia = m.isna() | (m.astype(str).str.strip() == "")
+    df[col_destino] = m.where(~vacia, SIN_ASIGNAR)
+    return df
+
+
+def agrupar_multi(df_ventas, cols):
+    """Como agrupar_dim pero por VARIAS dimensiones anidadas (ej. canal ×
+    vendedor). Devuelve sumas crudas + cm, cm_pct, precio_kg, clientes, skus
+    y share_fc / share_kg calculados sobre el total del df recibido (si el df
+    ya viene filtrado a una línea, el share es "dentro de la línea")."""
+    g = (
+        df_ventas.groupby(list(cols), dropna=False)
+        .agg(
+            kilos=("kilos", "sum"),
+            subtotalNeto=("subtotalNeto", "sum"),
+            costo=("costo_unitario", "sum"),
+            clientes=("idCliente", "nunique"),
+            skus=("idArticulo", "nunique"),
+        )
+        .reset_index()
+    )
+    g["cm"] = g["subtotalNeto"] - g["costo"]
+    g["cm_pct"] = np.where(g["subtotalNeto"] != 0, g["cm"] / g["subtotalNeto"] * 100, 0)
+    g["precio_kg"] = np.where(g["kilos"] != 0, g["subtotalNeto"] / g["kilos"], 0)
+    total_fc = g["subtotalNeto"].sum()
+    total_kg = g["kilos"].sum()
+    g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
+    g["share_kg"] = np.where(total_kg != 0, g["kilos"] / total_kg * 100, 0)
+    return g.sort_values("subtotalNeto", ascending=False).reset_index(drop=True)
+
+
 def ranking_productos(df_ventas):
     """Ranking de SKUs con clasificación ABC (Pareto sobre facturación):
     A = hasta el 80 % acumulado, B = 80-95 %, C = el resto."""

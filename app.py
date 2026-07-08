@@ -438,9 +438,9 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
 # Tabs
 # ---------------------------------------------------------------------------
 
-(tab_resumen, tab_canales, tab_prod, tab_clientes,
+(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_clientes,
  tab_vend, tab_alertas) = st.tabs(
-    ["Resumen", "Canales", "Productos (SKU)", "Clientes (RFM)",
+    ["Resumen", "Avance", "Canales", "Productos (SKU)", "Clientes (RFM)",
      "Vendedores", "Alertas"]
 )
 
@@ -689,6 +689,255 @@ with tab_resumen:
                 st.dataframe(
                     piv.style.format(_fmt), use_container_width=True
                 )
+
+
+# --- TAB LÍNEAS (gestión comercial por línea / marca) ----------------------
+# Estructura en 3 niveles: panorama (qué pesa cada línea), apertura de una
+# línea (por vendedor / canal / canal→vendedor / canal→subcanal) y la mirada
+# inversa vendedor → línea → producto. Respeta los filtros globales de arriba:
+# trabaja sobre el mismo `df` ya filtrado, así los shares se recalculan sobre
+# la selección vigente.
+with tab_lineas:
+    # Línea "estricta": lookup por artículo; SKUs sin regla -> SIN ASIGNAR
+    # (solo en esta solapa; en el resto siguen cayendo al proveedor).
+    dfl = dp.agregar_linea_estricta(df)
+    g_lin = dp.agrupar_dim(dfl, "linea_producto")
+
+    def _cols_cm(cols):
+        """Quita las columnas de CM si el rol no puede verlas."""
+        return cols if mostrar_cm else [c for c in cols if c not in ("cm", "cm_pct")]
+
+    def _barras_share(g, col_dim, etiqueta, col_val, col_share, top_n=12):
+        """Barras horizontales de composición: top N + 'OTRAS', con el share
+        % como texto. Devuelve la figura lista para st.plotly_chart."""
+        top = g.nlargest(top_n, col_val).copy()
+        resto = g[~g[col_dim].isin(top[col_dim])]
+        if len(resto):
+            fila = {col_dim: f"OTRAS ({len(resto)})",
+                    col_val: resto[col_val].sum(),
+                    col_share: resto[col_share].sum()}
+            top = pd.concat([top, pd.DataFrame([fila])], ignore_index=True)
+        top = top.sort_values(col_val)
+        fig = px.bar(
+            top, x=col_val, y=col_dim, orientation="h",
+            text=top[col_share].map(lambda v: f"{v:.1f} %"),
+        )
+        fig.update_traces(textposition="outside", cliponaxis=False,
+                          marker_color="#00b87a")
+        fig.update_layout(
+            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=10, r=60, t=10, b=10),
+            xaxis_title=None, yaxis_title=None,
+            height=max(300, 30 * len(top) + 60),
+        )
+        return fig
+
+    # --- 1) Panorama: cuánto pesa cada línea --------------------------------
+    st.subheader("Composición de la venta por línea de producto")
+
+    _total_fc = g_lin["subtotalNeto"].sum()
+    _fc_sin = g_lin.loc[
+        g_lin["linea_producto"] == dp.SIN_ASIGNAR, "subtotalNeto"
+    ].sum()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Líneas activas", f"{len(g_lin)}")
+    c1.caption("con ventas en el período/filtros")
+    c2.metric("Línea principal", g_lin.iloc[0]["linea_producto"])
+    c2.caption(f"{g_lin.iloc[0]['share_fc']:.1f} % de la facturación")
+    c3.metric("Top 3 líneas", fmt_pct(g_lin["share_fc"].head(3).sum()))
+    c3.caption("de la facturación (concentración)")
+    c4.metric("Sin asignar", fmt_money(_fc_sin))
+    c4.caption(
+        f"{(_fc_sin / _total_fc * 100) if _total_fc else 0:.1f} % de la "
+        "facturación en SKUs sin línea"
+    )
+
+    met_lin = st.radio(
+        "Ver composición por", ["Facturación", "Kilos"],
+        horizontal=True, key="lin_met",
+    )
+    _cv = "subtotalNeto" if met_lin == "Facturación" else "kilos"
+    _cs = "share_fc" if met_lin == "Facturación" else "share_kg"
+    st.plotly_chart(
+        _barras_share(g_lin, "linea_producto", "Línea", _cv, _cs),
+        use_container_width=True,
+    )
+
+    with st.expander("Ver tabla completa de líneas"):
+        _cols = _cols_cm(["linea_producto", "kilos", "share_kg", "subtotalNeto",
+                          "share_fc", "cm", "cm_pct", "precio_kg", "clientes",
+                          "skus"])
+        st.dataframe(
+            g_lin[_cols].rename(columns={"linea_producto": "Línea", **COLS_DIM})
+            .style.format(FMT_DIM),
+            use_container_width=True, hide_index=True,
+        )
+
+    # --- 2) Apertura de una línea -------------------------------------------
+    st.divider()
+    st.subheader("Apertura de una línea")
+
+    c_sel, c_ap = st.columns([1.4, 2.2])
+    linea_sel = c_sel.selectbox(
+        "Línea de producto", g_lin["linea_producto"].tolist(), key="lin_sel",
+        help="Ordenadas por facturación (de mayor a menor).",
+    )
+    apertura = c_ap.radio(
+        "Abrir por",
+        ["Vendedor", "Canal", "Canal → Vendedor", "Canal → Subcanal"],
+        horizontal=True, key="lin_apertura",
+    )
+
+    d_lin = dfl[dfl["linea_producto"] == linea_sel]
+    m_lin = g_lin[g_lin["linea_producto"] == linea_sel].iloc[0]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Facturación", fmt_money(m_lin["subtotalNeto"]))
+    k1.caption(f"{m_lin['share_fc']:.1f} % del total")
+    k2.metric("Kilos", fmt_kg(m_lin["kilos"]))
+    k2.caption(f"{m_lin['share_kg']:.1f} % del total")
+    k3.metric("Precio medio", fmt_money(m_lin["precio_kg"]) + " /kg")
+    k4.metric("Clientes · SKUs",
+              f"{int(m_lin['clientes'])} · {int(m_lin['skus'])}")
+
+    DIM_APERTURA = {"Vendedor": "dsVendedor", "Canal": "dsCanalMkt"}
+    if apertura in DIM_APERTURA:
+        _col_d = DIM_APERTURA[apertura]
+        g_ap = dp.agrupar_dim(d_lin, _col_d)  # share = dentro de la línea
+        _conc = g_ap["share_fc"].head(3).sum()
+        st.caption(
+            f"Los primeros 3 {apertura.lower()}es concentran "
+            f"{_conc:.1f} % de la facturación de la línea."
+        )
+        st.plotly_chart(
+            _barras_share(g_ap, _col_d, apertura, "subtotalNeto", "share_fc"),
+            use_container_width=True,
+        )
+        tabla_dim(g_ap, apertura, _col_d, mostrar_skus=True)
+    else:
+        _col2 = ("dsVendedor" if "Vendedor" in apertura else "dsSubcanalMKT")
+        _lbl2 = "Vendedor" if "Vendedor" in apertura else "Subcanal"
+        g2 = dp.agrupar_multi(d_lin, ["dsCanalMkt", _col2])
+
+        _g2c = g2[g2["subtotalNeto"] > 0]
+        if not _g2c.empty:
+            fig_tm = px.treemap(
+                _g2c, path=["dsCanalMkt", _col2], values="subtotalNeto",
+                color="dsCanalMkt",
+            )
+            fig_tm.update_traces(
+                texttemplate="%{label}<br>%{percentRoot:.1%}",
+                hovertemplate="%{label}<br>%{value:,.0f} $<extra></extra>",
+            )
+            fig_tm.update_layout(
+                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=10, t=10, b=10), height=420,
+            )
+            st.plotly_chart(fig_tm, use_container_width=True)
+            st.caption(
+                "Tamaño = facturación. El primer nivel es el canal; "
+                "hacé clic en un canal para entrar."
+            )
+
+        # Tabla: canales ordenados por facturación, y adentro por facturación
+        _orden_canal = (
+            g2.groupby("dsCanalMkt")["subtotalNeto"].sum()
+            .sort_values(ascending=False).index.tolist()
+        )
+        g2["_oc"] = g2["dsCanalMkt"].map({c: i for i, c in enumerate(_orden_canal)})
+        g2 = (g2.sort_values(["_oc", "subtotalNeto"], ascending=[True, False])
+              .drop(columns="_oc"))
+        _cols2 = _cols_cm(["dsCanalMkt", _col2, "kilos", "subtotalNeto",
+                           "share_fc", "cm", "cm_pct", "precio_kg",
+                           "clientes", "skus"])
+        st.dataframe(
+            g2[_cols2].rename(columns={
+                "dsCanalMkt": "Canal", _col2: _lbl2, **COLS_DIM,
+            }).style.format(FMT_DIM),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("Share FC % = participación dentro de la línea seleccionada.")
+
+    # --- 3) Vendedor → Línea → Producto -------------------------------------
+    st.divider()
+    st.subheader("Vendedor → Línea → Producto")
+    st.caption(
+        "Qué líneas y qué productos concretos vende cada vendedor. "
+        "'$/kg línea (total)' es el precio medio de esa línea en toda la "
+        "empresa: sirve para ver quién vende volumen a precios bajos."
+    )
+
+    _vends = dp.agrupar_dim(dfl, "dsVendedor")["dsVendedor"].tolist()
+    vend_sel = st.selectbox("Vendedor", _vends, key="lin_vend",
+                            help="Ordenados por facturación.")
+    d_v = dfl[dfl["dsVendedor"] == vend_sel]
+    g_vl = dp.agrupar_dim(d_v, "linea_producto")
+
+    # Comparación de precio: $/kg del vendedor vs $/kg total de la línea
+    _ref = g_lin[["linea_producto", "precio_kg"]].rename(
+        columns={"precio_kg": "pk_total"})
+    g_vl = g_vl.merge(_ref, on="linea_producto", how="left")
+    g_vl["dif_pk"] = (
+        (g_vl["precio_kg"] / g_vl["pk_total"].replace(0, pd.NA) - 1) * 100
+    ).fillna(0)
+
+    _cols_v = _cols_cm(["linea_producto", "kilos", "subtotalNeto", "share_fc",
+                        "cm", "cm_pct", "precio_kg", "pk_total", "dif_pk",
+                        "clientes", "skus"])
+    st.dataframe(
+        g_vl[_cols_v].rename(columns={
+            "linea_producto": "Línea", **COLS_DIM,
+            "pk_total": "$/kg línea (total)", "dif_pk": "Δ precio %",
+        }).style.format({**FMT_DIM, "$/kg línea (total)": fmt_money,
+                         "Δ precio %": lambda x: f"{x:+.1f} %"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Share FC % = peso de cada línea dentro del vendedor. "
+        "Δ precio % negativo = el vendedor vende esa línea más barata que "
+        "el promedio de la empresa (mix de productos básicos o precios bajos)."
+    )
+
+    _op_lin_v = ["Todas"] + g_vl["linea_producto"].tolist()
+    lin_v = st.selectbox(
+        "Ver productos de la línea", _op_lin_v, key="lin_vend_linea",
+    )
+    d_vp = d_v if lin_v == "Todas" else d_v[d_v["linea_producto"] == lin_v]
+    g_prod_v = dp.agrupar_multi(d_vp, ["linea_producto", "dsArticulo"])
+    _cols_p = _cols_cm(["linea_producto", "dsArticulo", "kilos",
+                        "subtotalNeto", "share_fc", "cm", "cm_pct",
+                        "precio_kg", "clientes"])
+    st.dataframe(
+        g_prod_v[_cols_p].rename(columns={
+            "linea_producto": "Línea", "dsArticulo": "Producto", **COLS_DIM,
+        }).style.format(FMT_DIM),
+        use_container_width=True, hide_index=True,
+    )
+
+    # --- 4) SKUs sin línea asignada ------------------------------------------
+    st.divider()
+    _sin = dfl[dfl["linea_producto"] == dp.SIN_ASIGNAR]
+    _n_sin = _sin["dsArticulo"].nunique()
+    with st.expander(f"SKUs sin línea asignada ({_n_sin})"):
+        if _sin.empty:
+            st.success("Todos los SKUs del período tienen línea asignada.")
+        else:
+            g_sin = dp.agrupar_multi(_sin, ["dsArticulo", "proveedor"])
+            _cols_s = ["dsArticulo", "proveedor", "kilos", "subtotalNeto",
+                       "clientes"]
+            st.dataframe(
+                g_sin[_cols_s].rename(columns={
+                    "dsArticulo": "Producto", "proveedor": "Proveedor",
+                    **COLS_DIM,
+                }).style.format(FMT_DIM),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Para clasificarlos: agregar la fila correspondiente en "
+                "data/marca_linea_lookup.csv (columnas dsArticulo,marca_linea) "
+                "con el nombre EXACTO del artículo. El próximo run del "
+                "pipeline los toma solo."
+            )
 
 
 # --- TAB CANALES ----------------------------------------------------------
