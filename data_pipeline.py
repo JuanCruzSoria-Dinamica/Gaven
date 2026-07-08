@@ -22,6 +22,7 @@ Credenciales (en este orden):
 """
 
 import os
+import re
 import json
 import datetime as dt
 
@@ -97,6 +98,92 @@ MAPA_REGION = {
     "CAMPANA": "CAMPO", "EXALTACION DE LA CRUZ": "CAMPO", "PARADA ROBLES": "CAMPO",
     "SAN ANDRÉS": "A DEFINIR", "SAN JOSE": "A DEFINIR",
 }
+
+
+# ---------------------------------------------------------------------------
+# 0bis) Marca / Línea  (lookup por artículo)
+# ---------------------------------------------------------------------------
+# El API todavía no expone un campo confiable de "marca / línea". Agrupar por
+# PROVEEDOR no alcanza: un mismo proveedor tiene varias líneas (RETAIL, FOOD
+# SERVICE, REFRIGERADOS, ...) y además la marca comercial no se deduce del
+# nombre del proveedor (ej. GARCIA HNOS -> TREGAR, ELCOR -> TONADITA,
+# ERNESTO RODRIGUEZ -> VACALIN, FRIGORIFICO PALADINI -> PALADINI/FELA).
+#
+# Solución temporal: una TABLA FIJA artículo -> marca/línea extraída del tablero
+# comercial de referencia (data/marca_linea_lookup.csv), que se joina por el
+# nombre del artículo (dsArticulo). Los SKUs que no estén en la tabla caen al
+# nombre del proveedor.
+#
+# Para actualizar la clasificación: editar/agregar filas en el CSV con las
+# columnas  dsArticulo,marca_linea  (usando el nombre EXACTO del artículo).
+LOOKUP_MARCA_PATH = os.path.join(DATA_DIR, "marca_linea_lookup.csv")
+
+# DIAGNÓSTICO: con True, los artículos que NO están en la tabla se marcan
+# "SIN REGLA · <proveedor>" en vez de caer al proveedor. Sirve para detectar
+# SKUs sin clasificar. En producción dejar en False.
+MARCA_LINEA_DEBUG = False
+
+
+def _norm_articulo(s):
+    """Normaliza el nombre de artículo para el join: mayúsculas y espacios
+    colapsados (robusto a dobles espacios y a mayúsculas/minúsculas)."""
+    return re.sub(r"\s+", " ", str(s).strip().upper())
+
+
+def _prov_limpio(prov):
+    """Saca el prefijo de código del proveedor: '9 - MC CAIN ...' -> 'MC CAIN ...'."""
+    if prov is None:
+        return ""
+    return re.sub(r"^\s*\d+\s*-\s*", "", str(prov)).strip()
+
+
+_LOOKUP_MARCA = None
+
+
+def _cargar_lookup_marca(path=LOOKUP_MARCA_PATH):
+    """Carga (y cachea en memoria) la tabla artículo -> marca/línea como dict
+    con las claves normalizadas. Si el CSV no está, devuelve dict vacío."""
+    global _LOOKUP_MARCA
+    if _LOOKUP_MARCA is not None:
+        return _LOOKUP_MARCA
+    d = {}
+    if os.path.exists(path):
+        tab = pd.read_csv(path)
+        for art, marca in zip(tab["dsArticulo"], tab["marca_linea"]):
+            k = _norm_articulo(art)
+            if k:
+                d[k] = str(marca).strip()
+    _LOOKUP_MARCA = d
+    return d
+
+
+def agregar_marca_linea(df):
+    """Agrega/renueva la columna 'marca_linea' por lookup de dsArticulo contra
+    data/marca_linea_lookup.csv. Fallback (artículo no listado) = nombre del
+    proveedor sin el prefijo de código (o 'SIN REGLA · ...' si MARCA_LINEA_DEBUG).
+    """
+    if df is None:
+        return df
+    df = df.copy()
+    if df.empty:
+        df["marca_linea"] = pd.Series(dtype="object")
+        return df
+
+    lookup = _cargar_lookup_marca()
+
+    if "dsArticulo" in df.columns:
+        marca = df["dsArticulo"].map(_norm_articulo).map(lookup)
+    else:
+        marca = pd.Series([np.nan] * len(df), index=df.index)
+
+    if "proveedor" in df.columns:
+        prov_limpio = df["proveedor"].map(_prov_limpio)
+    else:
+        prov_limpio = pd.Series([""] * len(df), index=df.index)
+
+    fallback = ("SIN REGLA · " + prov_limpio) if MARCA_LINEA_DEBUG else prov_limpio
+    df["marca_linea"] = marca.where(marca.notna(), fallback)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +285,9 @@ def preparar(df_ventas):
         df_ventas["preciocomprant"] * df_ventas["kilos"],
     )
 
+    # Marca / línea por lookup de artículo (ver agregar_marca_linea).
+    df_ventas = agregar_marca_linea(df_ventas)
+
     return df_ventas
 
 
@@ -296,8 +386,11 @@ def por_vendedor(df_ventas):
 
 
 def por_proveedor(df_ventas):
-    """Equivalente a 'Marca / Línea' del tablero de referencia."""
-    return agrupar_dim(df_ventas, "proveedor")
+    """'Marca / Línea': agrupa por la clasificación de negocio (marca_linea),
+    NO por el proveedor crudo. La columna se arma con agregar_marca_linea()
+    (lookup por artículo); si el df todavía no la tiene, se calcula al vuelo."""
+    d = df_ventas if "marca_linea" in df_ventas.columns else agregar_marca_linea(df_ventas)
+    return agrupar_dim(d, "marca_linea")
 
 
 def ranking_productos(df_ventas):

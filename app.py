@@ -109,7 +109,12 @@ def fmt_kg(x):
 
 @st.cache_data(show_spinner="Leyendo datos...")
 def cargar_datos_local(_mtime):
-    return pd.read_parquet(PARQUET_PATH)
+    df = pd.read_parquet(PARQUET_PATH)
+    # Compatibilidad: si el parquet es viejo y no trae 'marca_linea', se arma
+    # al vuelo (el próximo run del pipeline ya la deja guardada).
+    if "marca_linea" not in df.columns:
+        df = dp.agregar_marca_linea(df)
+    return df
 
 
 @st.cache_data(show_spinner="Leyendo serie histórica...")
@@ -290,7 +295,7 @@ FILTROS = [
     ("Subcanal", "dsSubcanalMKT"),
     ("Región", "region"),
     ("Vendedor", "dsVendedor"),
-    ("Marca / Línea", "proveedor"),
+    ("Marca / Línea", "marca_linea"),
     ("Cliente", "nombreCliente"),
 ]
 
@@ -719,8 +724,8 @@ with tab_canales:
     st.subheader("Detalle por subcanal")
     tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT", mostrar_skus=True)
 
-    st.subheader("Detalle por marca / línea (proveedor)")
-    tabla_dim(dp.por_proveedor(df), "Marca / Línea", "proveedor")
+    st.subheader("Detalle por marca / línea")
+    tabla_dim(dp.por_proveedor(df), "Marca / Línea", "marca_linea")
 
 
 # --- TAB PRODUCTOS (SKU) --------------------------------------------------
