@@ -56,6 +56,16 @@ st.markdown(
       .stTabs [aria-selected="true"]{
         background:var(--verde); color:#04221a !important;
       }
+      /* FIX: mantener ocultas las solapas inactivas.
+         Streamlit manda el contenido de TODAS las solapas al navegador y solo
+         esconde las inactivas con CSS. Cuando un widget dentro de una solapa
+         (ej. el evolutivo) dispara un rerun, esa regla de ocultamiento a veces
+         se pierde y todo el contenido aparece apilado en todas las solapas.
+         Forzamos que los paneles inactivos ([hidden]) sigan ocultos. */
+      .stTabs [data-baseweb="tab-panel"][hidden],
+      .stTabs [role="tabpanel"][hidden]{
+        display:none !important;
+      }
       /* Sidebar vacía: la ocultamos (los filtros van arriba) */
       section[data-testid="stSidebar"]{display:none;}
       /* Barra de filtros (contenedor con borde) */
