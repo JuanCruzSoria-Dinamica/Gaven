@@ -331,7 +331,7 @@ with st.container(border=True):
         )
         st.stop()
     mes_sel = f1a.selectbox(
-        "Período (mes)", _meses_disp, index=0, format_func=etiqueta_mes,
+        "Período", _meses_disp, index=0, format_func=etiqueta_mes,
         help="Todos los meses de 2026 con datos. El pipeline trae los meses "
              "faltantes una sola vez y después solo actualiza el mes en curso "
              "y el anterior.",
