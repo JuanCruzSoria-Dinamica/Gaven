@@ -34,6 +34,13 @@ Si abrís la app sin haber corrido el pipeline, te avisa que falta el archivo.
 "Iniciar en" = la carpeta del proyecto.
 
 ## 3) Período en la app
-Solo dos opciones (meses calendario, año 2026):
-- **Este Mes**: del 1° del mes actual hasta hoy.
-- **Mes Anterior**: del 1° al último día del mes anterior.
+Selector con **todos los meses de 2026** que estén en el parquet:
+- El mes **en curso** va del 1° hasta hoy (con proyección a fin de mes).
+- Los meses **cerrados** van del 1° al último día del mes.
+
+El pipeline mantiene el detalle de todo el año por **upsert mensual**: en cada
+corrida re-trae solo el mes actual + el anterior, y si detecta meses de 2026
+que faltan en el parquet los baja UNA sola vez (auto-backfill). Los meses
+cerrados ya guardados no se vuelven a pedir, así la corrida normal sigue
+siendo rápida. La primera corrida después de este cambio tarda más (baja
+enero → hoy).

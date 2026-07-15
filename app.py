@@ -1,7 +1,7 @@
 """
 app.py
 ------
-Panel de ventas (Gaven). SOLO presentación.
+Panel de ventas (Gaven). SOLO presentación (todos los meses de 2026).
 
 NO llama al API ni hace el procesamiento pesado: lee el archivo que dejó
 data_pipeline.py (data/ventas_actualizadas.parquet) y muestra todo.
@@ -150,20 +150,41 @@ def leer_metadata():
 
 
 # ---------------------------------------------------------------------------
-# Rango de fechas: solo "Este Mes" o "Mes Anterior" (meses calendario, 2026)
+# Rango de fechas: cualquier mes de 2026 con datos en el parquet.
+# El pipeline mantiene el detalle de TODO el año por upsert mensual, así que
+# acá solo listamos los meses disponibles y armamos el rango del elegido.
 # ---------------------------------------------------------------------------
 
-def rango_mes(opcion, hoy=None):
+MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
+            "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+
+def rango_mes(anio_mes, hoy=None):
+    """(desde, hasta) del mes calendario 'YYYY-MM'. El mes en curso se corta
+    en hoy; los meses cerrados van del día 1 al último día del mes."""
     hoy = hoy or dt.date.today()
-    if opcion == "Este Mes":
-        desde = hoy.replace(day=1)          # primer día del mes actual
-        hasta = hoy                         # hasta hoy
-    else:  # "Mes Anterior"
-        primer_dia_actual = hoy.replace(day=1)
-        ultimo_dia_anterior = primer_dia_actual - dt.timedelta(days=1)  # último día mes anterior
-        desde = ultimo_dia_anterior.replace(day=1)                      # primer día mes anterior
-        hasta = ultimo_dia_anterior                                     # último día mes anterior
-    return desde, hasta
+    anio, mes = map(int, str(anio_mes).split("-"))
+    desde = dt.date(anio, mes, 1)
+    ultimo = dt.date(anio, mes, calendar.monthrange(anio, mes)[1])
+    return desde, min(ultimo, hoy)
+
+
+def etiqueta_mes(anio_mes, hoy=None):
+    """'2026-07' -> 'Julio 2026 (Actual)' / '2026-03' -> 'Marzo 2026'."""
+    hoy = hoy or dt.date.today()
+    anio, mes = map(int, str(anio_mes).split("-"))
+    lbl = f"{MESES_ES[mes - 1]} {anio}"
+    if anio_mes == hoy.strftime("%Y-%m"):
+        lbl += " (Actual)"
+    return lbl
+
+
+def meses_disponibles(df, anio=None):
+    """Meses 'YYYY-MM' del año con datos en el parquet, más reciente primero."""
+    anio = anio or dp.ANIO
+    f = pd.to_datetime(df["fechaComprobate"], errors="coerce").dropna()
+    f = f[f.dt.year == anio]
+    return sorted(f.dt.strftime("%Y-%m").unique(), reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +323,21 @@ FILTROS = [
 with st.container(border=True):
     # Fila 1: período + última actualización
     f1a, f1c = st.columns([2, 2])
-    opcion = f1a.radio(
-        "Período", ["Este Mes", "Mes Anterior"], index=0, horizontal=True
+    _meses_disp = meses_disponibles(df)
+    if not _meses_disp:
+        st.warning(
+            f"El parquet no tiene datos de {dp.ANIO}. "
+            "Corré el pipeline: `python data_pipeline.py`"
+        )
+        st.stop()
+    mes_sel = f1a.selectbox(
+        "Período (mes)", _meses_disp, index=0, format_func=etiqueta_mes,
+        help="Todos los meses de 2026 con datos. El pipeline trae los meses "
+             "faltantes una sola vez y después solo actualiza el mes en curso "
+             "y el anterior.",
     )
-    desde, hasta = rango_mes(opcion)
+    es_mes_actual = mes_sel == dt.date.today().strftime("%Y-%m")
+    desde, hasta = rango_mes(mes_sel)
 
     meta = leer_metadata()
     ultima = meta.get("ultima_actualizacion", "—")
@@ -320,7 +352,7 @@ with st.container(border=True):
     df_periodo = df[
         (fecha >= pd.Timestamp(desde))
         & (fecha < pd.Timestamp(hasta) + pd.Timedelta(days=1))
-        & (fecha.dt.year == 2026)
+        & (fecha.dt.year == dp.ANIO)
     ].copy()
 
     # Fila 2: un selector por dimensión (solo las que tienen datos).
@@ -453,7 +485,7 @@ with tab_resumen:
     # Run-rate lineal: extrapola lo acumulado hasta hoy al total del mes,
     # usando el ritmo diario promedio. Cuenta solo días HÁBILES: los domingos
     # no se trabaja, así que no entran ni en los transcurridos ni en el total.
-    # Solo aplica al "Este Mes" en curso; "Mes Anterior" ya está cerrado.
+    # Solo aplica al mes EN CURSO; los meses cerrados ya están completos.
     def _dias_habiles(anio, mes, hasta_dia):
         """Días no-domingo del 1 al hasta_dia (inclusive) de un mes."""
         return sum(
@@ -463,7 +495,7 @@ with tab_resumen:
 
     factor = 1.0
     proyectar = False
-    if opcion == "Este Mes":
+    if es_mes_actual:
         total_dias = calendar.monthrange(hasta.year, hasta.month)[1]
         ult = df["fechaComprobate"].max()
         dia_ult = ult.day if pd.notna(ult) else hasta.day
@@ -1159,6 +1191,81 @@ with tab_clientes:
                     .style.format({"Facturación": fmt_money}),
                     use_container_width=True, hide_index=True,
                 )
+
+    # --- Altas y bajas de clientes ------------------------------------------
+    # Compara el MES ELEGIDO arriba contra SU mes anterior (necesita ver los
+    # dos meses a la vez, por eso usa el parquet completo y no df_periodo).
+    # Los filtros de dimensión (canal, vendedor, etc.) sí aplican.
+    st.divider()
+    st.subheader("Altas y bajas de clientes")
+
+    _df_ab = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
+    for _c_ab, _v_ab in seleccion.items():
+        if _v_ab:
+            _df_ab = _df_ab[_df_ab[_c_ab].astype(str).str.strip().isin(_v_ab)]
+
+    _mes_ant_ab = desde - dt.timedelta(days=1)  # último día del mes anterior
+    _f_ab = _df_ab["fechaComprobate"]
+    _hay_ant = (
+        (_f_ab >= pd.Timestamp(_mes_ant_ab.replace(day=1)))
+        & (_f_ab < pd.Timestamp(desde))
+    ).any()
+
+    if not _hay_ant:
+        st.info(
+            f"No hay datos de {_mes_ant_ab:%m/%Y} en el parquet, así que no "
+            f"se puede comparar {hasta:%m/%Y} contra su mes anterior."
+        )
+    else:
+        # hoy=hasta: para el mes en curso corta en hoy; para un mes cerrado
+        # usa el mes completo. Así funciona con cualquier mes de 2026.
+        altas, bajas = dp.altas_bajas(_df_ab, hoy=hasta)
+
+        _nota_curso = (
+            f" (al {hasta:%d/%m/%Y}, puede revertirse si compran antes de "
+            f"fin de mes)" if es_mes_actual else ""
+        )
+        st.caption(
+            f"Altas: compraron en {hasta:%m/%Y} y no en {_mes_ant_ab:%m/%Y}. "
+            f"Bajas: compraron en {_mes_ant_ab:%m/%Y} y no en "
+            f"{hasta:%m/%Y}{_nota_curso}."
+        )
+
+        _cols_ab = ["nombreCliente", "compras", "kilos", "facturacion",
+                    "ultima_compra"]
+        _ren_ab = {
+            "nombreCliente": "Cliente", "compras": "Compras", "kilos": "Kilos",
+            "facturacion": "Facturación", "ultima_compra": "Última compra",
+        }
+        _fmt_ab = {
+            "Kilos": fmt_kg, "Facturación": fmt_money,
+            "Última compra": lambda x: f"{x:%d/%m/%Y}",
+        }
+
+        col_alta, col_baja = st.columns(2)
+        with col_alta:
+            st.metric("Altas", len(altas))
+            if altas.empty:
+                st.info("Sin altas en el mes seleccionado.")
+            else:
+                st.dataframe(
+                    altas[_cols_ab].rename(columns=_ren_ab).style.format(_fmt_ab),
+                    use_container_width=True, hide_index=True,
+                )
+        with col_baja:
+            st.metric("Bajas", len(bajas))
+            if bajas.empty:
+                st.info("Sin bajas: todos los clientes del mes anterior "
+                        "volvieron a comprar.")
+            else:
+                st.dataframe(
+                    bajas[_cols_ab].rename(columns=_ren_ab).style.format(_fmt_ab),
+                    use_container_width=True, hide_index=True,
+                )
+        st.caption(
+            "Las cifras de cada tabla corresponden al mes en que el cliente "
+            "compró (altas: mes seleccionado · bajas: su mes anterior)."
+        )
 
 
 # --- TAB VENDEDORES -------------------------------------------------------

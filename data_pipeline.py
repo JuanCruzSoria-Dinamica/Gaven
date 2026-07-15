@@ -1,9 +1,17 @@
 """
 data_pipeline.py
 ----------------
-ETL: se conecta al API de Chess, trae las ventas del MES ANTERIOR (completo) y
-del MES ACTUAL (del día 1 hasta hoy), las limpia/procesa y guarda el resultado
-final en data/ventas_actualizadas.parquet.
+ETL: se conecta al API de Chess y mantiene data/ventas_actualizadas.parquet
+con el DETALLE de ventas de TODO el año (ANIO), por UPSERT mensual:
+
+  - En cada corrida SIEMPRE re-trae el MES ANTERIOR (completo) y el MES
+    ACTUAL (del día 1 hasta hoy), porque pueden entrar comprobantes nuevos.
+  - Además detecta qué meses del año FALTAN en el parquet y los trae UNA
+    sola vez (auto-backfill). La primera corrida tarda más (baja todo el
+    año); las siguientes vuelven a ser rápidas (solo actual + anterior).
+  - Cada mes se guarda apenas se termina de traer (upsert atómico): si la
+    conexión se corta, lo ya bajado queda persistido y la próxima corrida
+    solo busca lo que falta.
 
 Importante: la API NO responde bien a rangos largos (varios meses de una sola
 vez devuelve 0 filas). Por eso se consulta MES POR MES y se concatena. Así los
@@ -24,6 +32,7 @@ Credenciales (en este orden):
 import os
 import re
 import json
+import time
 import datetime as dt
 
 import requests
@@ -233,6 +242,83 @@ def meses_a_traer(hoy=None):
         (primer_dia_anterior, ultimo_dia_anterior),  # mes anterior completo
         (primer_dia_actual, hoy),                    # mes actual hasta hoy
     ]
+
+
+def _ventana_mes(primer_dia, hoy):
+    """(primer_dia, ultimo_dia) del mes calendario de `primer_dia`, cortado
+    en `hoy` si el mes todavía no terminó."""
+    if primer_dia.month == 12:
+        fin = dt.date(primer_dia.year, 12, 31)
+    else:
+        fin = dt.date(primer_dia.year, primer_dia.month + 1, 1) - dt.timedelta(days=1)
+    return primer_dia, min(fin, hoy)
+
+
+def meses_detalle_esperados(hoy=None):
+    """Primeros días de TODOS los meses que deberían estar en el parquet de
+    detalle: de enero de ANIO hasta el mes actual (inclusive)."""
+    hoy = hoy or dt.date.today()
+    meses, cursor = [], dt.date(ANIO, 1, 1)
+    while cursor <= hoy:
+        meses.append(cursor)
+        cursor = (cursor.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+    return meses
+
+
+def meses_en_detalle(parquet_path=PARQUET_PATH):
+    """Set de 'YYYY-MM' que ya están guardados en el parquet de detalle."""
+    if not os.path.exists(parquet_path):
+        return set()
+    try:
+        f = pd.read_parquet(parquet_path, columns=["fechaComprobate"])
+        f = pd.to_datetime(f["fechaComprobate"], errors="coerce").dropna()
+        return set(f.dt.strftime("%Y-%m").unique())
+    except Exception:
+        return set()
+
+
+def ventanas_a_traer(hoy=None, parquet_path=PARQUET_PATH):
+    """Ventanas [(desde, hasta), ...] que el pipeline debe pedir al API:
+
+      1) SIEMPRE: mes anterior completo + mes actual hasta hoy (pueden
+         haber entrado comprobantes nuevos o correcciones).
+      2) ADEMÁS: los meses de ANIO que FALTEN en el parquet de detalle
+         (auto-backfill). Solo pasa en la primera corrida o si un mes quedó
+         a medias; después esta lista queda vacía y la corrida es rápida.
+
+    Devuelve las ventanas ordenadas cronológicamente, una por mes.
+    """
+    hoy = hoy or dt.date.today()
+    ventanas = {d.strftime("%Y-%m"): (d, h) for d, h in meses_a_traer(hoy)}
+    ya = meses_en_detalle(parquet_path)
+    for primer_dia in meses_detalle_esperados(hoy):
+        mes = primer_dia.strftime("%Y-%m")
+        if mes in ventanas or mes in ya:
+            continue
+        ventanas[mes] = _ventana_mes(primer_dia, hoy)
+    return [ventanas[m] for m in sorted(ventanas)]
+
+
+def traer_mes_seguro(cfg, headers, fecha_desde, fecha_hasta, max_reintentos=3):
+    """Trae un mes reintentando (con re-login) si el servidor corta la
+    conexión. Devuelve (df_mes, headers); headers puede renovarse."""
+    for intento in range(1, max_reintentos + 1):
+        try:
+            return traer_ventas(cfg["base_url"], headers,
+                                fecha_desde, fecha_hasta), headers
+        except requests.exceptions.RequestException as e:
+            if intento == max_reintentos:
+                raise
+            espera = 5 * intento
+            print(f"    intento {intento}/{max_reintentos} falló "
+                  f"({type(e).__name__}). Reintento en {espera}s...")
+            time.sleep(espera)
+            try:
+                headers = login(cfg["base_url"], cfg["usuario"], cfg["password"])
+            except Exception as e2:
+                print(f"       (re-login falló: {type(e2).__name__}; "
+                      f"se reintenta igual)")
+    raise RuntimeError(f"No se pudo traer {fecha_desde} -> {fecha_hasta}")
 
 
 def traer_ventas_meses(base_url, headers, ventanas):
@@ -561,6 +647,61 @@ def resumen_segmentos(df_rfm):
     return g
 
 
+def altas_bajas(df_ventas, hoy=None):
+    """Altas y bajas de clientes entre un mes de REFERENCIA y su anterior.
+
+    `hoy` es la fecha de referencia (default: hoy). El "mes actual" es el mes
+    de esa fecha, cortado en esa fecha; el "anterior" es el mes previo
+    completo. Pasando hoy=último día de un mes cerrado, compara ese mes
+    completo contra su anterior (así la app lo usa para cualquier mes de 2026).
+
+    - Altas: compraron este mes y NO el mes pasado.
+    - Bajas: compraron el mes pasado y NO este mes.
+
+    Recibe el df SIN filtrar por período (necesita ver ambos meses).
+    Devuelve (altas, bajas): un df por lado con compras, kilos, facturación
+    y fecha de última compra por cliente.
+    """
+    hoy = hoy or dt.date.today()
+    base = df_ventas.copy()
+    base["fechaComprobate"] = pd.to_datetime(base["fechaComprobate"], errors="coerce")
+    base = base.dropna(subset=["idCliente", "fechaComprobate"])
+
+    ini_act = pd.Timestamp(hoy.replace(day=1))            # 1° del mes actual
+    ini_ant = pd.Timestamp((hoy.replace(day=1) - dt.timedelta(days=1)).replace(day=1))
+    fin_act = pd.Timestamp(hoy) + pd.Timedelta(days=1)    # hasta hoy inclusive
+
+    f = base["fechaComprobate"]
+    m_act = base[(f >= ini_act) & (f < fin_act)]
+    m_ant = base[(f >= ini_ant) & (f < ini_act)]
+
+    def _resumen(d):
+        if d.empty:
+            return pd.DataFrame(columns=[
+                "idCliente", "nombreCliente", "compras",
+                "kilos", "facturacion", "ultima_compra",
+            ])
+        d = d.copy()
+        d["_comp_id"] = comprobante_id(d)
+        return d.groupby("idCliente").agg(
+            nombreCliente=("nombreCliente", "first"),
+            compras=("_comp_id", "nunique"),
+            kilos=("kilos", "sum"),
+            facturacion=("subtotalNeto", "sum"),
+            ultima_compra=("fechaComprobate", "max"),
+        ).reset_index()
+
+    res_act = _resumen(m_act)
+    res_ant = _resumen(m_ant)
+
+    altas = res_act[~res_act["idCliente"].isin(set(res_ant["idCliente"]))]
+    bajas = res_ant[~res_ant["idCliente"].isin(set(res_act["idCliente"]))]
+
+    altas = altas.sort_values("facturacion", ascending=False).reset_index(drop=True)
+    bajas = bajas.sort_values("facturacion", ascending=False).reset_index(drop=True)
+    return altas, bajas
+
+
 def alertas(df_ventas):
     """Alertas e insights automáticos (lista de dicts: nivel + texto)."""
     avisos = []
@@ -791,50 +932,96 @@ def cargar_credenciales():
     )
 
 
-def guardar(df_ventas):
-    """Guarda el parquet de forma atómica (tmp + replace) y un metadata.json
-    con la fecha/hora de última actualización."""
+def guardar(df_ventas, parquet_path=PARQUET_PATH):
+    """UPSERT del parquet de DETALLE (mismo mecanismo que upsert_serie).
+
+    Borra del parquet los meses presentes en `df_ventas` y los reemplaza por
+    las filas recién traídas. Los meses que NO vienen en df_ventas quedan
+    intactos (nunca se vuelven a pedir al API). Idempotente y atómico
+    (tmp + replace). También actualiza metadata.json.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
 
+    fechas = pd.to_datetime(df_ventas["fechaComprobate"], errors="coerce")
+    meses_nuevos = set(fechas.dropna().dt.strftime("%Y-%m").unique())
+
+    if os.path.exists(parquet_path) and meses_nuevos:
+        actual = pd.read_parquet(parquet_path)
+        f_act = pd.to_datetime(actual["fechaComprobate"], errors="coerce")
+        actual = actual[~f_act.dt.strftime("%Y-%m").isin(meses_nuevos)]
+        total = pd.concat([actual, df_ventas], ignore_index=True)
+    else:
+        total = df_ventas
+
+    total = total.sort_values("fechaComprobate").reset_index(drop=True)
+
     # Parquet: escribir en .tmp y luego reemplazar (lectura siempre consistente)
-    tmp_parquet = PARQUET_PATH + ".tmp"
-    df_ventas.to_parquet(tmp_parquet, index=False)
-    os.replace(tmp_parquet, PARQUET_PATH)
+    tmp_parquet = parquet_path + ".tmp"
+    total.to_parquet(tmp_parquet, index=False)
+    os.replace(tmp_parquet, parquet_path)
+
+    meses_total = sorted(
+        pd.to_datetime(total["fechaComprobate"], errors="coerce")
+        .dropna().dt.strftime("%Y-%m").unique()
+    )
 
     # Metadata: misma técnica atómica
     meta = {
         "ultima_actualizacion": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "filas": int(len(df_ventas)),
+        "filas": int(len(total)),
+        "meses": meses_total,
     }
     tmp_meta = META_PATH + ".tmp"
     with open(tmp_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     os.replace(tmp_meta, META_PATH)
+    return total
 
 
 def main():
     cfg = cargar_credenciales()
     headers = login(cfg["base_url"], cfg["usuario"], cfg["password"])
 
-    ventanas = meses_a_traer()
-    desde = ventanas[0][0]   # día 1 del mes anterior
-    hasta = ventanas[-1][1]  # hoy
+    # Mes actual + anterior SIEMPRE, más los meses de ANIO que falten en el
+    # parquet (auto-backfill: solo la primera vez o si un mes quedó a medias).
+    ventanas = ventanas_a_traer()
+    meses = [d.strftime("%Y-%m") for d, _ in ventanas]
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Meses a traer: "
+          f"{', '.join(meses)}")
+    if len(ventanas) > 2:
+        print(f"  ({len(ventanas) - 2} mes(es) faltantes en el parquet: se "
+              f"traen UNA sola vez; las próximas corridas vuelven a ser solo "
+              f"mes actual + anterior)")
 
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Trayendo ventas mes por mes "
-          f"({desde:%Y-%m-%d} -> {hasta:%Y-%m-%d}) ...")
-    df_raw = traer_ventas_meses(cfg["base_url"], headers, ventanas)
+    procesados = 0
+    for desde, hasta in ventanas:
+        fd, fh = desde.strftime("%Y-%m-%d"), hasta.strftime("%Y-%m-%d")
+        try:
+            df_raw, headers = traer_mes_seguro(cfg, headers, fd, fh)
+        except requests.exceptions.RequestException as e:
+            print(f"  {fd} -> {fh}: ERROR ({type(e).__name__}: {e}). "
+                  f"Ese mes queda pendiente para la próxima corrida.")
+            continue
 
-    if df_raw.empty:
-        print("El API no devolvió filas. No se sobrescribe el archivo existente.")
-        return
+        print(f"  {fd} -> {fh}: {len(df_raw)} filas")
+        if df_raw.empty:
+            continue
 
-    df = preparar(df_raw)
-    guardar(df)
-    print(f"OK: {len(df)} filas guardadas en {PARQUET_PATH}")
+        df_mes = preparar(df_raw)
 
-    # Actualiza la serie mensual histórica con los meses recién traídos
-    # (upsert: solo corrige el mes actual y el anterior; el resto queda intacto).
-    upsert_serie(df)
+        # Guarda YA este mes en el detalle (upsert atómico): si se corta el
+        # siguiente, lo bajado queda persistido y la próxima corrida solo
+        # busca lo que falta.
+        guardar(df_mes)
+
+        # Y actualiza la serie mensual histórica con el mismo mes.
+        upsert_serie(df_mes)
+        procesados += 1
+
+    if procesados:
+        print(f"OK: {procesados} mes(es) actualizados en {PARQUET_PATH}")
+    else:
+        print("El API no devolvió filas. Archivos existentes sin cambios.")
 
     # Refresca el IPC del INDEC (para los pesos constantes de la app).
     actualizar_ipc()
