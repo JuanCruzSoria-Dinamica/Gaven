@@ -1091,41 +1091,65 @@ with tab_prod:
                 hide_index=True, on_select="rerun",
                 selection_mode="single-row", key="tabla_prod",
             )
-            st.caption("Hacé clic en un producto para ver su desglose por canal.")
+            st.caption(
+                "Hacé clic en un producto para ver su apertura por canal, "
+                "vendedor o cliente."
+            )
 
-            # --- Desglose por canal del producto seleccionado ---------------
+            # --- Apertura del producto seleccionado --------------------------
+            # Mismo formato que "Apertura de una línea" en la solapa Avance:
+            # métricas del producto + apertura por dimensión a elección
+            # (canal, vendedor, cliente o canal → cliente).
             filas_sel = sel_evt.selection.rows if sel_evt and sel_evt.selection else []
             if filas_sel:
                 fila = filas_sel[0]
                 nombre_prod = prod_top.iloc[fila]["dsArticulo"]
                 det = df[df["dsArticulo"].astype(str) == str(nombre_prod)]
                 if det.empty:
-                    st.info("Sin datos de canal para este producto.")
+                    st.info("Sin datos para este producto.")
                 else:
-                    g_can = (
-                        det.groupby("dsCanalMkt", dropna=False)
-                        .agg(kilos=("kilos", "sum"),
-                             subtotalNeto=("subtotalNeto", "sum"))
-                        .reset_index()
-                        .sort_values("subtotalNeto", ascending=False)
-                    )
-                    total_fc = g_can["subtotalNeto"].sum()
-                    g_can["share_fc"] = (
-                        g_can["subtotalNeto"] / total_fc * 100
-                        if total_fc else 0
-                    )
                     st.divider()
-                    st.subheader(f"Desglose por canal · {nombre_prod}")
-                    det_tbl = g_can.rename(columns={
-                        "dsCanalMkt": "Canal", "kilos": "Kilos",
-                        "subtotalNeto": "Facturación", "share_fc": "Share FC %",
-                    })
-                    st.dataframe(
-                        det_tbl.style.format({
-                            "Kilos": fmt_kg, "Facturación": fmt_money,
-                            "Share FC %": fmt_pct,
-                        }),
-                        use_container_width=True, hide_index=True,
+                    st.subheader(f"Apertura del producto · {nombre_prod}")
+
+                    m_prod = prod_top.iloc[fila]
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Facturación", fmt_money(m_prod["subtotalNeto"]))
+                    k1.caption(f"{m_prod['share_fc']:.1f} % del total")
+                    k2.metric("Kilos", fmt_kg(m_prod["kilos"]))
+                    k3.metric("Precio medio",
+                              fmt_money(m_prod["precio_kg"]) + " /kg")
+                    k4.metric("Cobertura", f"{int(m_prod['clientes'])} clientes")
+
+                    apertura_p = st.radio(
+                        "Abrir por",
+                        ["Canal", "Vendedor", "Cliente"],
+                        horizontal=True, key="prod_apertura",
+                    )
+
+                    DIM_AP_PROD = {
+                        "Canal": ("dsCanalMkt", "Canal"),
+                        "Vendedor": ("dsVendedor", "Vendedor"),
+                        "Cliente": ("nombreCliente", "Cliente"),
+                    }
+                    _col_p, _lbl_p = DIM_AP_PROD[apertura_p]
+                    # share = dentro del producto seleccionado
+                    g_ap_p = dp.agrupar_dim(det, _col_p)
+                    _conc_p = g_ap_p["share_fc"].head(3).sum()
+                    _plural = {"Canal": "canales", "Vendedor": "vendedores",
+                               "Cliente": "clientes"}[apertura_p]
+                    st.caption(
+                        f"Los primeros 3 {_plural} concentran "
+                        f"{_conc_p:.1f} % de la facturación del producto."
+                    )
+                    st.plotly_chart(
+                        _barras_share(g_ap_p, _col_p, _lbl_p,
+                                      "subtotalNeto", "share_fc"),
+                        use_container_width=True,
+                    )
+                    tabla_dim(g_ap_p, _lbl_p, _col_p)
+                    st.caption(
+                        "Share FC % = participación dentro del producto "
+                        "seleccionado."
                     )
 
 
