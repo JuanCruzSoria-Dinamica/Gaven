@@ -11,6 +11,7 @@ Correr local:   streamlit run app.py
 
 import os
 import json
+import time
 import calendar
 import datetime as dt
 
@@ -201,6 +202,37 @@ def _login():
     if "rol" not in st.session_state:
         st.session_state.rol = None
     if st.session_state.rol is not None:
+        # Pantalla de carga de 1 segundo, solo justo después de loguearse.
+        if st.session_state.pop("_cargando_login", False):
+            st.markdown(
+                """
+                <style>
+                  @keyframes girar{to{transform:rotate(360deg);}}
+                  /* Overlay a pantalla completa: tapa el contenido "viejo"
+                     que Streamlit deja visible mientras corre el script. */
+                  .carga-login{
+                    position:fixed; inset:0; z-index:999999;
+                    background:#0a0e17;
+                    display:flex; flex-direction:column; align-items:center;
+                    justify-content:center; gap:18px;
+                  }
+                  .carga-login .aro{
+                    width:44px; height:44px; border-radius:50%;
+                    border:4px solid var(--border);
+                    border-top-color:var(--verde);
+                    animation:girar .8s linear infinite;
+                  }
+                  .carga-login p{color:var(--tx2); font-size:.9rem; margin:0;}
+                </style>
+                <div class="carga-login">
+                  <div class="aro"></div>
+                  <p>Cargando panel…</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            time.sleep(1)
+            st.rerun()
         return  # ya está logueado, seguimos con el tablero
 
     try:
@@ -249,10 +281,12 @@ def _login():
             if (usuario == cred.get("usuario_duenos")
                     and pwd == cred.get("password_duenos")):
                 st.session_state.rol = "dueno"
+                st.session_state._cargando_login = True
                 st.rerun()
             elif (usuario == cred.get("usuario_supervisores")
                     and pwd == cred.get("password_supervisores")):
                 st.session_state.rol = "supervisor"
+                st.session_state._cargando_login = True
                 st.rerun()
             else:
                 st.error("Usuario o contraseña incorrectos.")
