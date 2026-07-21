@@ -507,7 +507,7 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
 
 (tab_resumen, tab_lineas, tab_canales, tab_prod, tab_clientes,
  tab_vend, tab_alertas) = st.tabs(
-    ["Resumen", "Avance", "Canales", "Productos (SKU)", "Clientes (RFM)",
+    ["Resumen", "Proveedores", "Canales", "Productos (SKU)", "Clientes (RFM)",
      "Vendedores", "Alertas"]
 )
 
