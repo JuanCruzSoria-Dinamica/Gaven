@@ -111,10 +111,11 @@ def fmt_kg(x):
 @st.cache_data(show_spinner="Leyendo datos...")
 def cargar_datos_local(_mtime):
     df = pd.read_parquet(PARQUET_PATH)
-    # Compatibilidad: si el parquet es viejo y no trae 'marca_linea', se arma
-    # al vuelo (el próximo run del pipeline ya la deja guardada).
-    if "marca_linea" not in df.columns:
-        df = dp.agregar_marca_linea(df)
+    # 'marca_linea' es una columna DERIVADA del lookup por código
+    # (data/proveedor_objetivo_lookup.csv). Se recalcula siempre al leer para
+    # que la clasificación refleje el lookup vigente aunque el parquet guardado
+    # traiga valores viejos. Es barato (map por idArticulo).
+    df = dp.agregar_marca_linea(df)
     return df
 
 
@@ -519,12 +520,17 @@ with tab_resumen:
     # Run-rate lineal: extrapola lo acumulado hasta hoy al total del mes,
     # usando el ritmo diario promedio. Cuenta solo días HÁBILES: los domingos
     # no se trabaja, así que no entran ni en los transcurridos ni en el total.
+    # Tampoco cuentan los feriados listados en FERIADOS (no se factura).
     # Solo aplica al mes EN CURSO; los meses cerrados ya están completos.
+    # TODO: por ahora sólo el 9 de julio; ampliar con el resto o una API.
+    FERIADOS = {dt.date(2026, 7, 9)}
+
     def _dias_habiles(anio, mes, hasta_dia):
-        """Días no-domingo del 1 al hasta_dia (inclusive) de un mes."""
+        """Días hábiles del 1 al hasta_dia (inclusive): no domingos ni feriados."""
         return sum(
             1 for d in range(1, hasta_dia + 1)
             if dt.date(anio, mes, d).weekday() != 6  # 6 = domingo
+            and dt.date(anio, mes, d) not in FERIADOS
         )
 
     factor = 1.0

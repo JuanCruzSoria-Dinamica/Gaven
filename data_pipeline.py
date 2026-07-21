@@ -110,7 +110,7 @@ MAPA_REGION = {
 
 
 # ---------------------------------------------------------------------------
-# 0bis) Marca / Línea  (lookup por artículo)
+# 0bis) Marca / Línea  (lookup por CÓDIGO de artículo)
 # ---------------------------------------------------------------------------
 # El API todavía no expone un campo confiable de "marca / línea". Agrupar por
 # PROVEEDOR no alcanza: un mismo proveedor tiene varias líneas (RETAIL, FOOD
@@ -118,25 +118,24 @@ MAPA_REGION = {
 # nombre del proveedor (ej. GARCIA HNOS -> TREGAR, ELCOR -> TONADITA,
 # ERNESTO RODRIGUEZ -> VACALIN, FRIGORIFICO PALADINI -> PALADINI/FELA).
 #
-# Solución temporal: una TABLA FIJA artículo -> marca/línea extraída del tablero
-# comercial de referencia (data/marca_linea_lookup.csv), que se joina por el
-# nombre del artículo (dsArticulo). Los SKUs que no estén en la tabla caen al
-# nombre del proveedor.
+# Clasificación: una TABLA FIJA por CÓDIGO de artículo -> marca/línea
+# (data/proveedor_objetivo_lookup.csv). El valor 'marca_linea' es el
+# "PROVEEDOR OBJETIVO" del tablero comercial: se precalcula una sola vez por
+# código replicando exactamente la fórmula del Excel (reglas por proveedor +
+# grupo/familia/línea/código + tabla FOOD para FRIAR). Como grupo, familia,
+# línea y proveedor son atributos fijos del artículo, el resultado es constante
+# por código; por eso se joina por idArticulo (== "Código de Artículo" del ERP),
+# que es exacto y no depende del texto del nombre.
 #
-# Para actualizar la clasificación: editar/agregar filas en el CSV con las
-# columnas  dsArticulo,marca_linea  (usando el nombre EXACTO del artículo).
-LOOKUP_MARCA_PATH = os.path.join(DATA_DIR, "marca_linea_lookup.csv")
+# Los SKUs que no estén en la tabla (artículos nuevos aún no clasificados) caen
+# al nombre del proveedor. Para actualizarla, regenerar el CSV desde el Excel
+# comercial (ver build_lookup_proveedor_objetivo.py).
+LOOKUP_MARCA_PATH = os.path.join(DATA_DIR, "proveedor_objetivo_lookup.csv")
 
 # DIAGNÓSTICO: con True, los artículos que NO están en la tabla se marcan
 # "SIN REGLA · <proveedor>" en vez de caer al proveedor. Sirve para detectar
 # SKUs sin clasificar. En producción dejar en False.
 MARCA_LINEA_DEBUG = False
-
-
-def _norm_articulo(s):
-    """Normaliza el nombre de artículo para el join: mayúsculas y espacios
-    colapsados (robusto a dobles espacios y a mayúsculas/minúsculas)."""
-    return re.sub(r"\s+", " ", str(s).strip().upper())
 
 
 def _prov_limpio(prov):
@@ -150,25 +149,37 @@ _LOOKUP_MARCA = None
 
 
 def _cargar_lookup_marca(path=LOOKUP_MARCA_PATH):
-    """Carga (y cachea en memoria) la tabla artículo -> marca/línea como dict
-    con las claves normalizadas. Si el CSV no está, devuelve dict vacío."""
+    """Carga (y cachea en memoria) la tabla CÓDIGO -> marca/línea como dict
+    {idArticulo(int): marca_linea(str)}. Si el CSV no está, devuelve dict vacío."""
     global _LOOKUP_MARCA
     if _LOOKUP_MARCA is not None:
         return _LOOKUP_MARCA
     d = {}
     if os.path.exists(path):
         tab = pd.read_csv(path)
-        for art, marca in zip(tab["dsArticulo"], tab["marca_linea"]):
-            k = _norm_articulo(art)
-            if k:
-                d[k] = str(marca).strip()
+        for cod, marca in zip(tab["idArticulo"], tab["marca_linea"]):
+            if pd.isna(cod):
+                continue
+            m = str(marca).strip()
+            if m and m.upper() != "NO":
+                d[int(cod)] = m
     _LOOKUP_MARCA = d
     return d
 
 
+def _marca_por_codigo(df):
+    """Serie con la marca/línea de cada fila según idArticulo (NaN si el código
+    no está en el lookup)."""
+    lookup = _cargar_lookup_marca()
+    if "idArticulo" in df.columns:
+        cod = pd.to_numeric(df["idArticulo"], errors="coerce")
+        return cod.map(lookup)
+    return pd.Series([np.nan] * len(df), index=df.index, dtype="object")
+
+
 def agregar_marca_linea(df):
-    """Agrega/renueva la columna 'marca_linea' por lookup de dsArticulo contra
-    data/marca_linea_lookup.csv. Fallback (artículo no listado) = nombre del
+    """Agrega/renueva la columna 'marca_linea' por lookup de idArticulo contra
+    data/proveedor_objetivo_lookup.csv. Fallback (código no listado) = nombre del
     proveedor sin el prefijo de código (o 'SIN REGLA · ...' si MARCA_LINEA_DEBUG).
     """
     if df is None:
@@ -178,12 +189,7 @@ def agregar_marca_linea(df):
         df["marca_linea"] = pd.Series(dtype="object")
         return df
 
-    lookup = _cargar_lookup_marca()
-
-    if "dsArticulo" in df.columns:
-        marca = df["dsArticulo"].map(_norm_articulo).map(lookup)
-    else:
-        marca = pd.Series([np.nan] * len(df), index=df.index)
+    marca = _marca_por_codigo(df)
 
     if "proveedor" in df.columns:
         prov_limpio = df["proveedor"].map(_prov_limpio)
@@ -480,28 +486,24 @@ def por_proveedor(df_ventas):
 
 
 # --- Línea de producto "estricta" (para la solapa Líneas) ------------------
-# A diferencia de marca_linea (que cae al proveedor cuando el artículo no está
+# A diferencia de marca_linea (que cae al proveedor cuando el código no está
 # en el lookup), acá los SKUs sin regla caen a SIN_ASIGNAR. Así la solapa de
 # gestión comercial los agrupa y los deja detectar sin romper nada.
 SIN_ASIGNAR = "SIN ASIGNAR"
 
 
 def agregar_linea_estricta(df, col_destino="linea_producto"):
-    """Agrega la columna `linea_producto`: marca/línea del lookup por artículo,
-    o SIN_ASIGNAR si el artículo no figura en data/marca_linea_lookup.csv.
-    NO modifica 'marca_linea' ni afecta a las otras solapas."""
+    """Agrega la columna `linea_producto`: marca/línea del lookup por código de
+    artículo, o SIN_ASIGNAR si el código no figura en
+    data/proveedor_objetivo_lookup.csv. NO modifica 'marca_linea' ni afecta a
+    las otras solapas."""
     if df is None:
         return df
     df = df.copy()
     if df.empty:
         df[col_destino] = pd.Series(dtype="object")
         return df
-    lookup = _cargar_lookup_marca()
-    if "dsArticulo" in df.columns:
-        m = df["dsArticulo"].map(_norm_articulo).map(lookup)
-    else:
-        m = pd.Series([np.nan] * len(df), index=df.index)
-    m = m.astype("object")
+    m = _marca_por_codigo(df).astype("object")
     vacia = m.isna() | (m.astype(str).str.strip() == "")
     df[col_destino] = m.where(~vacia, SIN_ASIGNAR)
     return df
