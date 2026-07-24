@@ -9,6 +9,7 @@ data_pipeline.py (data/ventas_actualizadas.parquet) y muestra todo.
 Correr local:   streamlit run app.py
 """
 
+import io
 import os
 import json
 import time
@@ -499,6 +500,63 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
     st.dataframe(
         t.style.format(FMT_DIM), use_container_width=True, hide_index=True,
     )
+    # Se devuelve la tabla ya renombrada (y sin CM si el rol no la ve) para
+    # poder incluirla en el Excel descargable de la solapa.
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Descarga en Excel (un botón por solapa)
+# ---------------------------------------------------------------------------
+# El botón nativo de las tablas de Streamlit solo baja CSV crudo. Estos
+# helpers arman un .xlsx real (openpyxl) con una hoja por tabla, números como
+# números y anchos de columna razonables. Las tablas que reciben ya vienen
+# renombradas y filtradas por rol (sin CM para supervisores).
+
+def _excel_bytes(hojas):
+    """hojas: dict {nombre_hoja: DataFrame} -> bytes de un .xlsx."""
+    from openpyxl.utils import get_column_letter
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for nombre, t in hojas.items():
+            if t is None or len(t) == 0:
+                continue
+            nombre = str(nombre)[:31]  # límite de Excel
+            t.to_excel(w, sheet_name=nombre, index=False)
+            ws = w.sheets[nombre]
+            for i, c in enumerate(t.columns, 1):
+                letra = get_column_letter(i)
+                # Fechas: formato corto dd/mm/aaaa (sin la hora 00:00:00,
+                # que hace que Excel muestre '####' si la columna es angosta).
+                if pd.api.types.is_datetime64_any_dtype(t[c]):
+                    for celda in ws[letra][1:]:
+                        celda.number_format = "DD/MM/YYYY"
+                    ws.column_dimensions[letra].width = 14
+                    continue
+                ancho = max(
+                    [len(str(c))]
+                    + t[c].astype(str).str.len().head(200).tolist()
+                )
+                ws.column_dimensions[letra].width = (
+                    min(max(ancho + 2, 10), 45)
+                )
+    return buf.getvalue()
+
+
+def boton_excel(nombre, hojas, key):
+    """Botón de descarga de un .xlsx con las tablas de la solapa."""
+    hojas = {n: t for n, t in hojas.items() if t is not None and len(t)}
+    if not hojas:
+        return
+    st.download_button(
+        "Descargar Excel",
+        data=_excel_bytes(hojas),
+        file_name=f"{nombre}_{desde:%Y-%m-%d}_a_{hasta:%Y-%m-%d}.xlsx",
+        mime=("application/vnd.openxmlformats-officedocument"
+              ".spreadsheetml.sheet"),
+        key=key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +643,12 @@ with tab_resumen:
         ("SKUs vendidos", f"{m['n_skus']:,}".replace(",", "."),
          m["n_skus"], _int, True),
     ]
+
+    # Tablas que junta esta solapa para el Excel descargable.
+    hojas_resumen = {"KPIs": pd.DataFrame(
+        [(lbl, pval) for lbl, _disp, pval, _pf, _e in metricas],
+        columns=["Métrica", "Valor"],
+    )}
 
     # Render en filas de 4 columnas.
     for i in range(0, len(metricas), 4):
@@ -761,6 +825,10 @@ with tab_resumen:
                 st.dataframe(
                     piv.style.format(_fmt), use_container_width=True
                 )
+                hojas_resumen["Evolución mensual"] = piv.reset_index()
+
+    st.divider()
+    boton_excel("resumen", hojas_resumen, key="xlsx_resumen")
 
 
 # --- TAB LÍNEAS (gestión comercial por línea / marca) ----------------------
@@ -774,6 +842,7 @@ with tab_lineas:
     # (solo en esta solapa; en el resto siguen cayendo al proveedor).
     dfl = dp.agregar_linea_estricta(df)
     g_lin = dp.agrupar_dim(dfl, "linea_producto")
+    hojas_lineas = {}  # tablas para el Excel descargable de la solapa
 
     def _cols_cm(cols):
         """Quita las columnas de CM si el rol no puede verlas."""
@@ -840,11 +909,13 @@ with tab_lineas:
         _cols = _cols_cm(["linea_producto", "kilos", "share_kg", "subtotalNeto",
                           "share_fc", "cm", "cm_pct", "precio_kg", "clientes",
                           "skus"])
+        t_lineas = g_lin[_cols].rename(
+            columns={"linea_producto": "Línea", **COLS_DIM})
         st.dataframe(
-            g_lin[_cols].rename(columns={"linea_producto": "Línea", **COLS_DIM})
-            .style.format(FMT_DIM),
+            t_lineas.style.format(FMT_DIM),
             use_container_width=True, hide_index=True,
         )
+        hojas_lineas["Líneas"] = t_lineas
 
     # --- 2) Apertura de una línea -------------------------------------------
     st.divider()
@@ -885,7 +956,8 @@ with tab_lineas:
             _barras_share(g_ap, _col_d, apertura, "subtotalNeto", "share_fc"),
             use_container_width=True,
         )
-        tabla_dim(g_ap, apertura, _col_d, mostrar_skus=True)
+        hojas_lineas["Apertura línea"] = tabla_dim(
+            g_ap, apertura, _col_d, mostrar_skus=True)
     else:
         _col2 = ("dsVendedor" if "Vendedor" in apertura else "dsSubcanalMKT")
         _lbl2 = "Vendedor" if "Vendedor" in apertura else "Subcanal"
@@ -922,12 +994,14 @@ with tab_lineas:
         _cols2 = _cols_cm(["dsCanalMkt", _col2, "kilos", "subtotalNeto",
                            "share_fc", "cm", "cm_pct", "precio_kg",
                            "clientes", "skus"])
+        t_g2 = g2[_cols2].rename(columns={
+            "dsCanalMkt": "Canal", _col2: _lbl2, **COLS_DIM,
+        })
         st.dataframe(
-            g2[_cols2].rename(columns={
-                "dsCanalMkt": "Canal", _col2: _lbl2, **COLS_DIM,
-            }).style.format(FMT_DIM),
+            t_g2.style.format(FMT_DIM),
             use_container_width=True, hide_index=True,
         )
+        hojas_lineas["Apertura línea"] = t_g2
         st.caption("Share FC % = participación dentro de la línea seleccionada.")
 
     # --- 3) Vendedor → Línea → Producto -------------------------------------
@@ -956,14 +1030,16 @@ with tab_lineas:
     _cols_v = _cols_cm(["linea_producto", "kilos", "subtotalNeto", "share_fc",
                         "cm", "cm_pct", "precio_kg", "pk_total", "dif_pk",
                         "clientes", "skus"])
+    t_vl = g_vl[_cols_v].rename(columns={
+        "linea_producto": "Línea", **COLS_DIM,
+        "pk_total": "$/kg línea (total)", "dif_pk": "Δ precio %",
+    })
     st.dataframe(
-        g_vl[_cols_v].rename(columns={
-            "linea_producto": "Línea", **COLS_DIM,
-            "pk_total": "$/kg línea (total)", "dif_pk": "Δ precio %",
-        }).style.format({**FMT_DIM, "$/kg línea (total)": fmt_money,
-                         "Δ precio %": lambda x: f"{x:+.1f} %"}),
+        t_vl.style.format({**FMT_DIM, "$/kg línea (total)": fmt_money,
+                           "Δ precio %": lambda x: f"{x:+.1f} %"}),
         use_container_width=True, hide_index=True,
     )
+    hojas_lineas["Líneas del vendedor"] = t_vl
     st.caption(
         "Share FC % = peso de cada línea dentro del vendedor. "
         "Δ precio % negativo = el vendedor vende esa línea más barata que "
@@ -979,12 +1055,14 @@ with tab_lineas:
     _cols_p = _cols_cm(["linea_producto", "dsArticulo", "kilos",
                         "subtotalNeto", "share_fc", "cm", "cm_pct",
                         "precio_kg", "clientes"])
+    t_pv = g_prod_v[_cols_p].rename(columns={
+        "linea_producto": "Línea", "dsArticulo": "Producto", **COLS_DIM,
+    })
     st.dataframe(
-        g_prod_v[_cols_p].rename(columns={
-            "linea_producto": "Línea", "dsArticulo": "Producto", **COLS_DIM,
-        }).style.format(FMT_DIM),
+        t_pv.style.format(FMT_DIM),
         use_container_width=True, hide_index=True,
     )
+    hojas_lineas["Productos del vendedor"] = t_pv
 
     # --- 4) SKUs sin línea asignada ------------------------------------------
     st.divider()
@@ -997,13 +1075,15 @@ with tab_lineas:
             g_sin = dp.agrupar_multi(_sin, ["dsArticulo", "proveedor"])
             _cols_s = ["dsArticulo", "proveedor", "kilos", "subtotalNeto",
                        "clientes"]
+            t_sin = g_sin[_cols_s].rename(columns={
+                "dsArticulo": "Producto", "proveedor": "Proveedor",
+                **COLS_DIM,
+            })
             st.dataframe(
-                g_sin[_cols_s].rename(columns={
-                    "dsArticulo": "Producto", "proveedor": "Proveedor",
-                    **COLS_DIM,
-                }).style.format(FMT_DIM),
+                t_sin.style.format(FMT_DIM),
                 use_container_width=True, hide_index=True,
             )
+            hojas_lineas["SKUs sin línea"] = t_sin
             st.caption(
                 "Para clasificarlos: agregar la fila correspondiente en "
                 "data/marca_linea_lookup.csv (columnas dsArticulo,marca_linea) "
@@ -1011,11 +1091,15 @@ with tab_lineas:
                 "pipeline los toma solo."
             )
 
+    st.divider()
+    boton_excel("proveedores", hojas_lineas, key="xlsx_lineas")
+
 
 # --- TAB CANALES ----------------------------------------------------------
 with tab_canales:
     st.subheader("Detalle por canal")
-    tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt", mostrar_skus=True)
+    t_canales = tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt",
+                          mostrar_skus=True)
 
     # Para dueños: torta de share + CM % por canal lado a lado.
     # Para supervisores: solo la torta (a ancho completo), sin CM %.
@@ -1043,15 +1127,24 @@ with tab_canales:
 
     st.divider()
     st.subheader("Detalle por subcanal")
-    tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT", mostrar_skus=True)
+    t_subcanales = tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT",
+                             mostrar_skus=True)
 
     st.subheader("Detalle por marca / línea")
-    tabla_dim(dp.por_proveedor(df), "Marca / Línea", "marca_linea")
+    t_marcas = tabla_dim(dp.por_proveedor(df), "Marca / Línea", "marca_linea")
+
+    st.divider()
+    boton_excel("canales", {
+        "Canales": t_canales,
+        "Subcanales": t_subcanales,
+        "Marca - Línea": t_marcas,
+    }, key="xlsx_canales")
 
 
 # --- TAB PRODUCTOS (SKU) --------------------------------------------------
 with tab_prod:
     prod = dp.ranking_productos(df)
+    hojas_prod = {}  # tablas para el Excel descargable de la solapa
 
     if prod.empty:
         st.info("No hay productos en el período seleccionado.")
@@ -1126,6 +1219,10 @@ with tab_prod:
             t = prod_top.rename(columns={
                 "dsArticulo": "Producto", **COLS_DIM, "clientes": "Cobertura",
             })
+            # Al Excel va el ranking COMPLETO filtrado (no solo el Top N).
+            hojas_prod["Ranking ABC"] = prod_f[cols].rename(columns={
+                "dsArticulo": "Producto", **COLS_DIM, "clientes": "Cobertura",
+            })
             sel_evt = st.dataframe(
                 t.style.format(FMT_DIM), use_container_width=True,
                 hide_index=True, on_select="rerun",
@@ -1186,29 +1283,36 @@ with tab_prod:
                                       "subtotalNeto", "share_fc"),
                         use_container_width=True,
                     )
-                    tabla_dim(g_ap_p, _lbl_p, _col_p)
+                    hojas_prod["Apertura producto"] = tabla_dim(
+                        g_ap_p, _lbl_p, _col_p)
                     st.caption(
                         "Share FC % = participación dentro del producto "
                         "seleccionado."
                     )
 
+    st.divider()
+    boton_excel("productos", hojas_prod, key="xlsx_prod")
+
 
 # --- TAB CLIENTES (RFM) ---------------------------------------------------
 with tab_clientes:
     r = dp.rfm(df)
+    hojas_cli = {}  # tablas para el Excel descargable de la solapa
 
     if r.empty:
         st.info("No hay datos suficientes para el RFM.")
     else:
         st.subheader("Segmentos de clientes (RFM)")
         seg = dp.resumen_segmentos(r)
+        t_seg = seg.rename(columns={
+            "segmento": "Segmento", "clientes": "Clientes",
+            "facturacion": "Facturación",
+        })
         st.dataframe(
-            seg.rename(columns={
-                "segmento": "Segmento", "clientes": "Clientes",
-                "facturacion": "Facturación",
-            }).style.format({"Facturación": fmt_money}),
+            t_seg.style.format({"Facturación": fmt_money}),
             use_container_width=True, hide_index=True,
         )
+        hojas_cli["Segmentos"] = t_seg
 
         st.divider()
         # Filtro por segmento: si elegís "Campeones" (o varios), las tablas de
@@ -1225,6 +1329,18 @@ with tab_clientes:
             "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_rfm"
         )
         r_f = r[r["segmento"].isin(seg_sel)] if seg_sel else r
+        # Al Excel va la lista COMPLETA de clientes del filtro (no el Top N).
+        if not r_f.empty:
+            hojas_cli["Clientes RFM"] = (
+                r_f.sort_values("monetario", ascending=False)
+                [["nombreCliente", "segmento", "monetario", "frecuencia",
+                  "recencia"]]
+                .rename(columns={
+                    "nombreCliente": "Cliente", "segmento": "Segmento",
+                    "monetario": "Facturación", "frecuencia": "Frecuencia",
+                    "recencia": "Recencia (días)",
+                })
+            )
         if r_f.empty:
             st.info("No hay clientes en el segmento seleccionado.")
         else:
@@ -1312,34 +1428,44 @@ with tab_clientes:
             if altas.empty:
                 st.info("Sin altas en el mes seleccionado.")
             else:
+                t_altas = altas[_cols_ab].rename(columns=_ren_ab)
                 st.dataframe(
-                    altas[_cols_ab].rename(columns=_ren_ab).style.format(_fmt_ab),
+                    t_altas.style.format(_fmt_ab),
                     use_container_width=True, hide_index=True,
                 )
+                hojas_cli["Altas"] = t_altas
         with col_baja:
             st.metric("Bajas", len(bajas))
             if bajas.empty:
                 st.info("Sin bajas: todos los clientes del mes anterior "
                         "volvieron a comprar.")
             else:
+                t_bajas = bajas[_cols_ab].rename(columns=_ren_ab)
                 st.dataframe(
-                    bajas[_cols_ab].rename(columns=_ren_ab).style.format(_fmt_ab),
+                    t_bajas.style.format(_fmt_ab),
                     use_container_width=True, hide_index=True,
                 )
+                hojas_cli["Bajas"] = t_bajas
         st.caption(
             "Las cifras de cada tabla corresponden al mes en que el cliente "
             "compró (altas: mes seleccionado · bajas: su mes anterior)."
         )
 
+    st.divider()
+    boton_excel("clientes", hojas_cli, key="xlsx_clientes")
+
 
 # --- TAB VENDEDORES -------------------------------------------------------
 with tab_vend:
     st.subheader("Detalle por vendedor")
-    tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor", mostrar_skus=True,
-              mostrar_skus_cliente=True)
+    t_vend = tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor",
+                       mostrar_skus=True, mostrar_skus_cliente=True)
 
     st.caption("Facturación por vendedor")
     st.bar_chart(dp.por_vendedor(df).set_index("dsVendedor")["subtotalNeto"])
+
+    st.divider()
+    boton_excel("vendedores", {"Vendedores": t_vend}, key="xlsx_vend")
 
 
 # --- TAB ALERTAS ----------------------------------------------------------
@@ -1354,3 +1480,11 @@ with tab_alertas:
                 st.error(a["texto"])
             else:
                 st.info(a["texto"])
+
+        st.divider()
+        boton_excel(
+            "alertas",
+            {"Alertas": pd.DataFrame(avisos).rename(
+                columns={"nivel": "Nivel", "texto": "Alerta"})},
+            key="xlsx_alertas",
+        )

@@ -4,3 +4,4 @@ numpy
 requests
 pyarrow
 plotly
+openpyxl
