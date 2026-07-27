@@ -980,13 +980,20 @@ def guardar(df_ventas, parquet_path=PARQUET_PATH):
     return total
 
 
-def main():
+def main(hasta=None):
+    """`hasta` (dt.date, opcional): fecha de corte de los datos. Por defecto
+    es hoy. Pasar una fecha anterior regenera el mes actual solo hasta esa
+    fecha (p. ej. para publicar un tablero con corte a un día específico)."""
     cfg = cargar_credenciales()
     headers = login(cfg["base_url"], cfg["usuario"], cfg["password"])
 
+    if hasta:
+        print(f"*** Corte de datos: {hasta} (el mes actual se trae solo "
+              f"hasta esa fecha) ***")
+
     # Mes actual + anterior SIEMPRE, más los meses de ANIO que falten en el
     # parquet (auto-backfill: solo la primera vez o si un mes quedó a medias).
-    ventanas = ventanas_a_traer()
+    ventanas = ventanas_a_traer(hoy=hasta)
     meses = [d.strftime("%Y-%m") for d, _ in ventanas]
     print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] Meses a traer: "
           f"{', '.join(meses)}")
@@ -1030,4 +1037,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ETL de ventas (API Chess)")
+    parser.add_argument(
+        "--hasta", metavar="YYYY-MM-DD", default=None,
+        help="Fecha de corte de los datos (default: hoy). Ej: --hasta 2026-07-25")
+    args = parser.parse_args()
+
+    hasta = dt.date.fromisoformat(args.hasta) if args.hasta else None
+    main(hasta)
