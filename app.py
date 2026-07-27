@@ -568,6 +568,235 @@ def boton_excel(nombre, hojas, key):
 
 
 # ---------------------------------------------------------------------------
+# Navegación progresiva (árbol de descomposición)
+# ---------------------------------------------------------------------------
+# Reemplaza los cruces sueltos de las solapas Proveedores y Productos (SKU):
+# un único recorrido por niveles (ej. Línea → Canal → Vendedor → Cliente →
+# SKU) donde cada nivel muestra SOLO lo compatible con lo ya elegido y la
+# participación % se calcula dentro del nivel anterior.
+
+def _cols_cm(cols):
+    """Quita las columnas de CM si el rol no puede verlas."""
+    return cols if mostrar_cm else [c for c in cols if c not in ("cm", "cm_pct")]
+
+
+def _barras_share(g, col_dim, etiqueta, col_val, col_share, top_n=12):
+    """Barras horizontales de composición: top N + 'OTRAS', con el share
+    % como texto. Devuelve la figura lista para st.plotly_chart."""
+    top = g.nlargest(top_n, col_val).copy()
+    resto = g[~g[col_dim].isin(top[col_dim])]
+    if len(resto):
+        fila = {col_dim: f"OTRAS ({len(resto)})",
+                col_val: resto[col_val].sum(),
+                col_share: resto[col_share].sum()}
+        top = pd.concat([top, pd.DataFrame([fila])], ignore_index=True)
+    top = top.sort_values(col_val)
+    fig = px.bar(
+        top, x=col_val, y=col_dim, orientation="h",
+        text=top[col_share].map(lambda v: f"{v:.1f} %"),
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False,
+                      marker_color="#00b87a")
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=60, t=10, b=10),
+        xaxis_title=None, yaxis_title=None,
+        height=max(300, 30 * len(top) + 60),
+    )
+    return fig
+
+
+# Métrica principal elegible en el drill: (columna de valor, columna de share)
+METRICAS_DRILL = {
+    "Facturación": ("subtotalNeto", "share_fc"),
+    "Kilos": ("kilos", "share_kg"),
+    "Contribución": ("cm", "share_cm"),
+}
+
+
+def render_drill(df_base, niveles, key, root_id=None):
+    """Navegación progresiva por niveles (tipo árbol de descomposición).
+
+    df_base : datos ya filtrados (filtros globales y, si aplica, la raíz,
+              ej. el producto elegido en el ranking).
+    niveles : lista de (etiqueta, columna) en orden de navegación.
+              El último nivel es solo informativo (no se puede seleccionar).
+    key     : prefijo único para session_state (permite varios drills).
+    root_id : identificador de la raíz. Si cambia (ej. se elige otro
+              producto), el recorrido se reinicia solo.
+
+    El recorrido vive en session_state como lista de valores elegidos.
+    En cada corrida se valida contra los datos vigentes: si un filtro
+    global dejó afuera un valor elegido, el camino se corta en el último
+    nivel válido (evita pantallas vacías).
+
+    Devuelve la tabla completa del nivel visible (renombrada y sin CM si
+    el rol no la ve) para sumarla al Excel de la solapa, o None.
+    """
+    k_path, k_nonce, k_root = f"{key}_path", f"{key}_nonce", f"{key}_root"
+    if k_path not in st.session_state:
+        st.session_state[k_path] = []
+    if k_nonce not in st.session_state:
+        # El nonce entra en la key de la tabla clickeable de cada nivel y se
+        # incrementa CADA vez que el recorrido cambia (avanzar, volver,
+        # reiniciar). Así el widget nuevo nace sin selección "pegada" de una
+        # visita anterior al mismo nivel (gotcha clásico de Streamlit).
+        st.session_state[k_nonce] = 0
+
+    def _set_path(nuevo):
+        st.session_state[k_path] = nuevo
+        st.session_state[k_nonce] += 1
+
+    # Cambió la raíz (ej. otro producto en el ranking): arrancar de cero.
+    if st.session_state.get(k_root, "__sin_raiz__") != root_id:
+        st.session_state[k_root] = root_id
+        _set_path([])
+
+    if df_base.empty:
+        st.info("No hay datos para navegar con los filtros actuales.")
+        return None
+
+    # --- Validación del recorrido contra los datos vigentes ---------------
+    path = st.session_state[k_path]
+    d = df_base
+    validos = []
+    for i, val in enumerate(path):
+        if i >= len(niveles) - 1:
+            break  # nunca se navega más allá del anteúltimo nivel
+        d2 = d[d[niveles[i][1]].astype(str) == str(val)]
+        if d2.empty:
+            break
+        validos.append(val)
+        d = d2
+    if len(validos) != len(path):
+        _set_path(validos)
+        path = validos
+
+    nonce = st.session_state[k_nonce]
+    nivel = len(path)
+    etiqueta_niv, col_niv = niveles[nivel]
+    es_hoja = nivel == len(niveles) - 1
+
+    # --- Métrica principal + reiniciar -------------------------------------
+    ops_met = ["Facturación", "Kilos"] + (["Contribución"] if mostrar_cm else [])
+    c_met, c_res = st.columns([3, 1])
+    met = c_met.radio("Métrica principal", ops_met, horizontal=True,
+                      key=f"{key}_met")
+    col_val, col_share = METRICAS_DRILL[met]
+    c_res.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+    if c_res.button("⟲ Reiniciar recorrido", key=f"{key}_reset",
+                    disabled=not path, use_container_width=True):
+        _set_path([])
+        st.rerun()
+
+    # --- Recorrido (migas): clic en una miga vuelve a ese nivel ------------
+    st.caption("Recorrido: " + " → ".join(
+        f"**{e}**" if i == nivel else e for i, (e, _) in enumerate(niveles)
+    ))
+    if path:
+        cols_bc = st.columns(max(len(path), 4))
+        for i, val in enumerate(path):
+            _et = niveles[i][0]
+            _txt = str(val) if len(str(val)) <= 22 else str(val)[:21] + "…"
+            if cols_bc[i].button(
+                f"✕ {_et}: {_txt}", key=f"{key}_bc_{i}",
+                use_container_width=True,
+                help=f"Quitar este nivel (y los siguientes) y volver a "
+                     f"elegir {_et}.",
+            ):
+                _set_path(path[:i])
+                st.rerun()
+
+        # Métricas del contexto acumulado (todo lo seleccionado hasta acá).
+        _fc = d["subtotalNeto"].sum()
+        _kg = d["kilos"].sum()
+        _fc_base = df_base["subtotalNeto"].sum()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Facturación", fmt_money(_fc))
+        m1.caption(f"{(_fc / _fc_base * 100) if _fc_base else 0:.1f} % del total")
+        m2.metric("Kilos", fmt_kg(_kg))
+        if mostrar_cm:
+            m3.metric("Contribución",
+                      fmt_money(_fc - d["costo_unitario"].sum()))
+        else:
+            m3.metric("Precio medio",
+                      (fmt_money(_fc / _kg) + " /kg") if _kg else "—")
+        m4.metric("Clientes · SKUs",
+                  f"{d['idCliente'].nunique()} · {d['idArticulo'].nunique()}")
+
+    # --- Nivel actual -------------------------------------------------------
+    g = dp.agrupar_dim(d, col_niv)
+    g = g[g[col_niv].astype(str).str.strip() != ""]
+    if g.empty:
+        st.info(f"No hay {etiqueta_niv.lower()} para esta selección.")
+        return None
+    # Share de contribución: agrupar_dim no lo trae; se calcula acá.
+    _tot_cm = g["cm"].sum()
+    g["share_cm"] = (g["cm"] / _tot_cm * 100) if _tot_cm else 0.0
+    g = g.sort_values(col_val, ascending=False).reset_index(drop=True)
+
+    st.subheader(f"Nivel {nivel + 1} de {len(niveles)} · {etiqueta_niv}")
+
+    # Tabla completa del nivel (va al Excel y a la vista final).
+    _cf = [col_niv, "kilos", "share_kg", "subtotalNeto", "share_fc",
+           "cm", "cm_pct", "precio_kg", "clientes", "skus"]
+    if col_niv == "dsArticulo":
+        _cf.remove("skus")  # cada fila ya ES un SKU
+    t_full = g[_cols_cm(_cf)].rename(columns={col_niv: etiqueta_niv,
+                                              **COLS_DIM})
+
+    if es_hoja:
+        # Último nivel: solo se muestra, no se navega más.
+        if path:
+            st.caption("Resultado filtrado por: " + " · ".join(
+                f"{niveles[i][0]} = {v}" for i, v in enumerate(path)
+            ))
+        st.dataframe(t_full.style.format(FMT_DIM),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.caption(
+            f"Hacé clic en una fila para abrir el siguiente nivel "
+            f"(→ {niveles[nivel + 1][0]}). Part. % = participación dentro "
+            f"de lo ya seleccionado."
+        )
+        c_graf, c_tab = st.columns([1.15, 1.45])
+        with c_graf:
+            st.plotly_chart(
+                _barras_share(g, col_niv, etiqueta_niv, col_val, col_share),
+                use_container_width=True,
+                # key explícita: en el nivel 1 esta figura puede ser idéntica
+                # al gráfico de composición de arriba y sin key Streamlit
+                # colisiona los IDs autogenerados.
+                key=f"{key}_fig_{nivel}_{nonce}",
+            )
+        with c_tab:
+            _mn = COLS_DIM[col_val]  # nombre lindo de la métrica elegida
+            t_click = g[[col_niv, col_val, col_share, "clientes",
+                         "skus"]].rename(columns={
+                col_niv: etiqueta_niv, col_val: _mn, col_share: "Part. %",
+                "clientes": "Clientes", "skus": "SKUs",
+            })
+            ev = st.dataframe(
+                t_click.style.format({_mn: FMT_DIM.get(_mn),
+                                      "Part. %": fmt_pct}),
+                use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row",
+                key=f"{key}_sel_{nivel}_{nonce}",
+                height=min(420, 36 * (len(t_click) + 1) + 20),
+            )
+            filas = ev.selection.rows if ev and ev.selection else []
+            if filas:
+                _set_path(path + [str(g.iloc[filas[0]][col_niv])])
+                st.rerun()
+        with st.expander(f"Ver tabla completa del nivel ({len(t_full)})"):
+            st.dataframe(t_full.style.format(FMT_DIM),
+                         use_container_width=True, hide_index=True)
+
+    return t_full
+
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
@@ -852,36 +1081,6 @@ with tab_lineas:
     g_lin = dp.agrupar_dim(dfl, "linea_producto")
     hojas_lineas = {}  # tablas para el Excel descargable de la solapa
 
-    def _cols_cm(cols):
-        """Quita las columnas de CM si el rol no puede verlas."""
-        return cols if mostrar_cm else [c for c in cols if c not in ("cm", "cm_pct")]
-
-    def _barras_share(g, col_dim, etiqueta, col_val, col_share, top_n=12):
-        """Barras horizontales de composición: top N + 'OTRAS', con el share
-        % como texto. Devuelve la figura lista para st.plotly_chart."""
-        top = g.nlargest(top_n, col_val).copy()
-        resto = g[~g[col_dim].isin(top[col_dim])]
-        if len(resto):
-            fila = {col_dim: f"OTRAS ({len(resto)})",
-                    col_val: resto[col_val].sum(),
-                    col_share: resto[col_share].sum()}
-            top = pd.concat([top, pd.DataFrame([fila])], ignore_index=True)
-        top = top.sort_values(col_val)
-        fig = px.bar(
-            top, x=col_val, y=col_dim, orientation="h",
-            text=top[col_share].map(lambda v: f"{v:.1f} %"),
-        )
-        fig.update_traces(textposition="outside", cliponaxis=False,
-                          marker_color="#00b87a")
-        fig.update_layout(
-            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=10, r=60, t=10, b=10),
-            xaxis_title=None, yaxis_title=None,
-            height=max(300, 30 * len(top) + 60),
-        )
-        return fig
-
     # --- 1) Panorama: cuánto pesa cada línea --------------------------------
     st.subheader("Composición de la venta por línea de producto")
 
@@ -925,154 +1124,26 @@ with tab_lineas:
         )
         hojas_lineas["Líneas"] = t_lineas
 
-    # --- 2) Apertura de una línea -------------------------------------------
+    # --- 2) Navegación progresiva: Línea → Canal → ... → SKU -----------------
     st.divider()
-    st.subheader("Apertura de una línea")
-
-    c_sel, c_ap = st.columns([1.4, 2.2])
-    linea_sel = c_sel.selectbox(
-        "Línea de producto", g_lin["linea_producto"].tolist(), key="lin_sel",
-        help="Ordenadas por facturación (de mayor a menor).",
-    )
-    apertura = c_ap.radio(
-        "Abrir por",
-        ["Vendedor", "Canal", "Canal → Vendedor", "Canal → Subcanal"],
-        horizontal=True, key="lin_apertura",
-    )
-
-    d_lin = dfl[dfl["linea_producto"] == linea_sel]
-    m_lin = g_lin[g_lin["linea_producto"] == linea_sel].iloc[0]
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Facturación", fmt_money(m_lin["subtotalNeto"]))
-    k1.caption(f"{m_lin['share_fc']:.1f} % del total")
-    k2.metric("Kilos", fmt_kg(m_lin["kilos"]))
-    k2.caption(f"{m_lin['share_kg']:.1f} % del total")
-    k3.metric("Precio medio", fmt_money(m_lin["precio_kg"]) + " /kg")
-    k4.metric("Clientes · SKUs",
-              f"{int(m_lin['clientes'])} · {int(m_lin['skus'])}")
-
-    DIM_APERTURA = {"Vendedor": "dsVendedor", "Canal": "dsCanalMkt"}
-    if apertura in DIM_APERTURA:
-        _col_d = DIM_APERTURA[apertura]
-        g_ap = dp.agrupar_dim(d_lin, _col_d)  # share = dentro de la línea
-        _conc = g_ap["share_fc"].head(3).sum()
-        st.caption(
-            f"Los primeros 3 {apertura.lower()}es concentran "
-            f"{_conc:.1f} % de la facturación de la línea."
-        )
-        st.plotly_chart(
-            _barras_share(g_ap, _col_d, apertura, "subtotalNeto", "share_fc"),
-            use_container_width=True,
-        )
-        hojas_lineas["Apertura línea"] = tabla_dim(
-            g_ap, apertura, _col_d, mostrar_skus=True)
-    else:
-        _col2 = ("dsVendedor" if "Vendedor" in apertura else "dsSubcanalMKT")
-        _lbl2 = "Vendedor" if "Vendedor" in apertura else "Subcanal"
-        g2 = dp.agrupar_multi(d_lin, ["dsCanalMkt", _col2])
-
-        _g2c = g2[g2["subtotalNeto"] > 0]
-        if not _g2c.empty:
-            fig_tm = px.treemap(
-                _g2c, path=["dsCanalMkt", _col2], values="subtotalNeto",
-                color="dsCanalMkt",
-            )
-            fig_tm.update_traces(
-                texttemplate="%{label}<br>%{percentRoot:.1%}",
-                hovertemplate="%{label}<br>%{value:,.0f} $<extra></extra>",
-            )
-            fig_tm.update_layout(
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=10, r=10, t=10, b=10), height=420,
-            )
-            st.plotly_chart(fig_tm, use_container_width=True)
-            st.caption(
-                "Tamaño = facturación. El primer nivel es el canal; "
-                "hacé clic en un canal para entrar."
-            )
-
-        # Tabla: canales ordenados por facturación, y adentro por facturación
-        _orden_canal = (
-            g2.groupby("dsCanalMkt")["subtotalNeto"].sum()
-            .sort_values(ascending=False).index.tolist()
-        )
-        g2["_oc"] = g2["dsCanalMkt"].map({c: i for i, c in enumerate(_orden_canal)})
-        g2 = (g2.sort_values(["_oc", "subtotalNeto"], ascending=[True, False])
-              .drop(columns="_oc"))
-        _cols2 = _cols_cm(["dsCanalMkt", _col2, "kilos", "subtotalNeto",
-                           "share_fc", "cm", "cm_pct", "precio_kg",
-                           "clientes", "skus"])
-        t_g2 = g2[_cols2].rename(columns={
-            "dsCanalMkt": "Canal", _col2: _lbl2, **COLS_DIM,
-        })
-        st.dataframe(
-            t_g2.style.format(FMT_DIM),
-            use_container_width=True, hide_index=True,
-        )
-        hojas_lineas["Apertura línea"] = t_g2
-        st.caption("Share FC % = participación dentro de la línea seleccionada.")
-
-    # --- 3) Vendedor → Línea → Producto -------------------------------------
-    st.divider()
-    st.subheader("Vendedor → Línea → Producto")
+    st.subheader("Navegación por línea")
     st.caption(
-        "Qué líneas y qué productos concretos vende cada vendedor. "
-        "'$/kg línea (total)' es el precio medio de esa línea en toda la "
-        "empresa: sirve para ver quién vende volumen a precios bajos."
+        "Elegí una línea y bajá nivel por nivel: Línea → Canal → Vendedor → "
+        "Cliente → SKU. Cada nivel muestra solo lo compatible con lo ya "
+        "seleccionado; con las etiquetas del recorrido volvés a un nivel "
+        "anterior."
     )
-
-    _vends = dp.agrupar_dim(dfl, "dsVendedor")["dsVendedor"].tolist()
-    vend_sel = st.selectbox("Vendedor", _vends, key="lin_vend",
-                            help="Ordenados por facturación.")
-    d_v = dfl[dfl["dsVendedor"] == vend_sel]
-    g_vl = dp.agrupar_dim(d_v, "linea_producto")
-
-    # Comparación de precio: $/kg del vendedor vs $/kg total de la línea
-    _ref = g_lin[["linea_producto", "precio_kg"]].rename(
-        columns={"precio_kg": "pk_total"})
-    g_vl = g_vl.merge(_ref, on="linea_producto", how="left")
-    g_vl["dif_pk"] = (
-        (g_vl["precio_kg"] / g_vl["pk_total"].replace(0, pd.NA) - 1) * 100
-    ).fillna(0)
-
-    _cols_v = _cols_cm(["linea_producto", "kilos", "subtotalNeto", "share_fc",
-                        "cm", "cm_pct", "precio_kg", "pk_total", "dif_pk",
-                        "clientes", "skus"])
-    t_vl = g_vl[_cols_v].rename(columns={
-        "linea_producto": "Línea", **COLS_DIM,
-        "pk_total": "$/kg línea (total)", "dif_pk": "Δ precio %",
-    })
-    st.dataframe(
-        t_vl.style.format({**FMT_DIM, "$/kg línea (total)": fmt_money,
-                           "Δ precio %": lambda x: f"{x:+.1f} %"}),
-        use_container_width=True, hide_index=True,
+    t_drill_lin = render_drill(
+        dfl,
+        [("Línea", "linea_producto"), ("Canal", "dsCanalMkt"),
+         ("Vendedor", "dsVendedor"), ("Cliente", "nombreCliente"),
+         ("SKU", "dsArticulo")],
+        key="drill_prov",
     )
-    hojas_lineas["Líneas del vendedor"] = t_vl
-    st.caption(
-        "Share FC % = peso de cada línea dentro del vendedor. "
-        "Δ precio % negativo = el vendedor vende esa línea más barata que "
-        "el promedio de la empresa (mix de productos básicos o precios bajos)."
-    )
+    if t_drill_lin is not None:
+        hojas_lineas["Navegación"] = t_drill_lin
 
-    _op_lin_v = ["Todas"] + g_vl["linea_producto"].tolist()
-    lin_v = st.selectbox(
-        "Ver productos de la línea", _op_lin_v, key="lin_vend_linea",
-    )
-    d_vp = d_v if lin_v == "Todas" else d_v[d_v["linea_producto"] == lin_v]
-    g_prod_v = dp.agrupar_multi(d_vp, ["linea_producto", "dsArticulo"])
-    _cols_p = _cols_cm(["linea_producto", "dsArticulo", "kilos",
-                        "subtotalNeto", "share_fc", "cm", "cm_pct",
-                        "precio_kg", "clientes"])
-    t_pv = g_prod_v[_cols_p].rename(columns={
-        "linea_producto": "Línea", "dsArticulo": "Producto", **COLS_DIM,
-    })
-    st.dataframe(
-        t_pv.style.format(FMT_DIM),
-        use_container_width=True, hide_index=True,
-    )
-    hojas_lineas["Productos del vendedor"] = t_pv
-
-    # --- 4) SKUs sin línea asignada ------------------------------------------
+    # --- 3) SKUs sin línea asignada ------------------------------------------
     st.divider()
     _sin = dfl[dfl["linea_producto"] == dp.SIN_ASIGNAR]
     _n_sin = _sin["dsArticulo"].nunique()
@@ -1254,7 +1325,7 @@ with tab_prod:
                     st.info("Sin datos para este producto.")
                 else:
                     st.divider()
-                    st.subheader(f"Apertura del producto · {nombre_prod}")
+                    st.subheader(f"Navegación del producto · {nombre_prod}")
 
                     m_prod = prod_top.iloc[fila]
                     k1, k2, k3, k4 = st.columns(4)
@@ -1265,38 +1336,24 @@ with tab_prod:
                               fmt_money(m_prod["precio_kg"]) + " /kg")
                     k4.metric("Cobertura", f"{int(m_prod['clientes'])} clientes")
 
-                    apertura_p = st.radio(
-                        "Abrir por",
-                        ["Canal", "Vendedor", "Cliente"],
-                        horizontal=True, key="prod_apertura",
-                    )
-
-                    DIM_AP_PROD = {
-                        "Canal": ("dsCanalMkt", "Canal"),
-                        "Vendedor": ("dsVendedor", "Vendedor"),
-                        "Cliente": ("nombreCliente", "Cliente"),
-                    }
-                    _col_p, _lbl_p = DIM_AP_PROD[apertura_p]
-                    # share = dentro del producto seleccionado
-                    g_ap_p = dp.agrupar_dim(det, _col_p)
-                    _conc_p = g_ap_p["share_fc"].head(3).sum()
-                    _plural = {"Canal": "canales", "Vendedor": "vendedores",
-                               "Cliente": "clientes"}[apertura_p]
                     st.caption(
-                        f"Los primeros 3 {_plural} concentran "
-                        f"{_conc_p:.1f} % de la facturación del producto."
-                    )
-                    st.plotly_chart(
-                        _barras_share(g_ap_p, _col_p, _lbl_p,
-                                      "subtotalNeto", "share_fc"),
-                        use_container_width=True,
-                    )
-                    hojas_prod["Apertura producto"] = tabla_dim(
-                        g_ap_p, _lbl_p, _col_p)
-                    st.caption(
-                        "Share FC % = participación dentro del producto "
+                        "Bajá nivel por nivel: Canal → Vendedor → Cliente. "
+                        "Al final ves qué clientes compraron este producto "
+                        "con todos los filtros acumulados. Part. % = "
+                        "participación dentro del producto y de lo ya "
                         "seleccionado."
                     )
+                    # El recorrido se reinicia solo si se elige otro producto
+                    # en el ranking (root_id).
+                    t_drill_p = render_drill(
+                        det,
+                        [("Canal", "dsCanalMkt"),
+                         ("Vendedor", "dsVendedor"),
+                         ("Cliente", "nombreCliente")],
+                        key="drill_prod", root_id=str(nombre_prod),
+                    )
+                    if t_drill_p is not None:
+                        hojas_prod["Navegación producto"] = t_drill_p
 
     st.divider()
     boton_excel("productos", hojas_prod, key="xlsx_prod")
