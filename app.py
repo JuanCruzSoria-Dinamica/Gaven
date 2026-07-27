@@ -375,6 +375,14 @@ with st.container(border=True):
     es_mes_actual = mes_sel == dt.date.today().strftime("%Y-%m")
     desde, hasta = rango_mes(mes_sel)
 
+    # El mes en curso se corta en la última fecha CON DATOS, no en hoy: si el
+    # pipeline corrió con --hasta (corte a un día específico), la etiqueta
+    # "Período" refleja ese corte real y no la fecha de hoy.
+    if es_mes_actual:
+        _ult_dato = df["fechaComprobate"].max()
+        if pd.notna(_ult_dato):
+            hasta = min(hasta, _ult_dato.date())
+
     meta = leer_metadata()
     ultima = meta.get("ultima_actualizacion", "—")
     f1c.markdown(
