@@ -1165,8 +1165,8 @@ with tab_lineas:
             hojas_lineas["SKUs sin línea"] = t_sin
             st.caption(
                 "Para clasificarlos: agregar la fila correspondiente en "
-                "data/marca_linea_lookup.csv (columnas dsArticulo,marca_linea) "
-                "con el nombre EXACTO del artículo. El próximo run del "
+                "data/proveedor_objetivo_lookup.csv (columnas idArticulo,"
+                "marca_linea) con el código del artículo. El próximo run del "
                 "pipeline los toma solo."
             )
 
