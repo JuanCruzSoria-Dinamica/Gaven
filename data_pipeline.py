@@ -57,6 +57,13 @@ SERIE_PATH = os.path.join(DATA_DIR, "serie_mensual.parquet")
 # Fecha desde la que arranca la serie histórica (la usa el backfill).
 SERIE_DESDE = dt.date(2025, 1, 1)
 
+# Acuerdos comerciales McCain: descuentos en el costo por cliente-artículo-mes
+# que el reporte de Chess NO incluye. Se cargan por Excel desde el tablero
+# (solapa "Acuerdos McCain") y se consolidan acá. El costo del parquet de
+# ventas queda SIEMPRE crudo (tal como viene de Chess); el ajuste se aplica
+# al leer, con aplicar_acuerdos().
+ACUERDOS_PATH = os.path.join(DATA_DIR, "acuerdos_mccain.parquet")
+
 # IPC Nivel General Nacional (INDEC). Se usa para expresar la facturación en
 # pesos CONSTANTES (ajustados por inflación) y poder comparar meses "con la
 # misma vara". Se cachea local para no depender de que INDEC esté online.
@@ -82,6 +89,15 @@ COLUMNAS_NUMERICAS = [
 ]
 
 CLIENTES_EXCLUIR = [194, 762, 1043, 1046, 1050, 1054]
+
+# Réplica del filtro "Flt Art = SI" del Excel comercial (2026 Conversor):
+# artículos que no son mercadería real y distorsionan la contribución.
+#   0    -> líneas de CONCEPTOS: NC/ND por diferencia de precios, acuerdos
+#           comerciales, rechazo de cheques. Sin costo asociado.
+#   1000 -> VIANDAS DE REFRIGERIO (artículo dado de baja).
+# Criterio acordado con Tomás (jul-2026) para que el tablero y el Excel
+# comercial midan lo mismo.
+ARTICULOS_EXCLUIR = [0, 1000]
 
 MAPA_REGION = {
     "CIUDAD AUTONOMA BUENOS AIRES": "CABA",
@@ -365,22 +381,64 @@ def preparar(df_ventas):
         & (df_ventas["dsVendedor"].astype(str).str.upper().str.strip() != "DIRECTA")
         & (df_ventas["dsSubcanalMKT"].astype(str).str.upper().str.strip() != "VIANDAS")
         & (~df_ventas["idCliente"].isin(CLIENTES_EXCLUIR))
+        & (~pd.to_numeric(df_ventas["idArticulo"], errors="coerce")
+           .isin(ARTICULOS_EXCLUIR))
     ].copy()
 
-    df_ventas["kilos"] = np.where(
-        df_ventas["pesoTotal"] == 0, df_ventas["unimedtotal"], df_ventas["pesoTotal"]
-    )
-    df_ventas["Categoria"] = np.where(df_ventas["pesoTotal"] > 0, "Pesable", "No Pesable")
-    df_ventas["costo_unitario"] = np.where(
-        df_ventas["Categoria"] == "No Pesable",
-        df_ventas["preciocomprant"] * df_ventas["cantidadesTotal"],
-        df_ventas["preciocomprant"] * df_ventas["kilos"],
-    )
+    df_ventas = recalcular_costo(df_ventas)
 
     # Marca / línea por lookup de artículo (ver agregar_marca_linea).
     df_ventas = agregar_marca_linea(df_ventas)
 
     return df_ventas
+
+
+def recalcular_costo(df):
+    """Columnas derivadas de kilos y costo. MISMA LÓGICA que el Excel
+    comercial (solapa Formulador del 2026 Conversor), para que el tablero y
+    el reporte del Excel den idéntico. Criterios acordados con Tomás (jul-2026):
+
+    kilos        -> todo lo que salió, incluido lo bonificado. pesoTotal, o
+                    unimedtotal si el artículo no registra peso.
+                    (= columna "Kg vendidos" del Excel)
+    kilos_cargo  -> solo lo COBRADO. pesoTotal, o unimedcargo si no hay peso;
+                    0 si la línea no tiene bultos. (= columna "Kilos" del Excel)
+    bultos_cargo -> bultos cobrados. La API no lo informa directo; se deriva
+                    prorrateando por unimedcargo/unimedtotal (en la práctica
+                    las líneas son 100% cobradas o 100% bonificadas, no hay
+                    mixtas, así que el prorrateo da todo o nada).
+    Categoria    -> Pesable si pesoTotal != 0. OJO: != 0 y no > 0, porque las
+                    devoluciones (NC) tienen peso NEGATIVO y son pesables; con
+                    "> 0" se les revertía el costo por bulto en vez de por kilo.
+    costo_unitario -> Pesable: preciocomprant x kilos_cargo
+                      No pesable: preciocomprant x bultos_cargo
+                    La mercadería bonificada (sin cargo) NO lleva costo: el
+                    proveedor la repone (confirmado para McCain; mismo criterio
+                    que el Excel comercial para el resto).
+
+    Es idempotente y trabaja solo con columnas crudas de la API, así que
+    sirve tanto en preparar() como para re-derivar un parquet ya guardado.
+    """
+    df = df.copy()
+    df["kilos"] = np.where(
+        df["pesoTotal"] == 0, df["unimedtotal"], df["pesoTotal"]
+    )
+    df["kilos_cargo"] = np.where(
+        df["cantidadesTotal"] == 0, 0.0,
+        np.where(df["pesoTotal"] == 0, df["unimedcargo"], df["pesoTotal"]),
+    )
+    # Prorrateo seguro: si unimedtotal es 0 (línea sin unidades de medida)
+    # se asume todo con cargo, como hacía la fórmula anterior.
+    _um_total = df["unimedtotal"].replace(0, np.nan)
+    _frac_cargo = (df["unimedcargo"] / _um_total).fillna(1.0)
+    df["bultos_cargo"] = df["cantidadesTotal"] * _frac_cargo
+    df["Categoria"] = np.where(df["pesoTotal"] != 0, "Pesable", "No Pesable")
+    df["costo_unitario"] = np.where(
+        df["Categoria"] == "No Pesable",
+        df["preciocomprant"] * df["bultos_cargo"],
+        df["preciocomprant"] * df["kilos_cargo"],
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +632,10 @@ def food_service(df_ventas):
     ].copy()
 
     subtotal_neto = fs["subtotalNeto"].sum()
-    costo_total = (fs["preciocomprant"] * fs["cantidadesTotal"]).sum()
+    # costo_unitario ya trae la lógica oficial (pesable/no pesable, sin cargo
+    # a costo 0, ajuste McCain si se aplicó antes). Antes acá se recalculaba
+    # precio x cantidades, que daba distinto al resto del tablero.
+    costo_total = fs["costo_unitario"].sum()
     cm = subtotal_neto - costo_total
     cm_pct = (cm / subtotal_neto * 100) if subtotal_neto else 0
 
@@ -840,6 +901,165 @@ def upsert_serie(df_detalle, serie_path=SERIE_PATH):
     print(f"  serie: meses actualizados {sorted(meses_nuevos)} · "
           f"{len(serie)} filas totales en {serie_path}")
     return serie
+
+
+# ---------------------------------------------------------------------------
+# 3bis-b) Acuerdos comerciales McCain (descuento en el costo por
+#         cliente-artículo-mes que Chess no informa)
+# ---------------------------------------------------------------------------
+# Flujo mensual: McCain manda un Excel con los acuerdos vigentes (los valores
+# cambian todos los meses por inflación). Desde el tablero se sube el archivo,
+# se valida y se hace UPSERT POR MES en ACUERDOS_PATH: los meses que trae el
+# Excel nuevo reemplazan a los guardados; los demás quedan intactos. Así da
+# igual si el Excel trae solo el mes nuevo o el acumulado del año.
+
+# Columnas del almacén consolidado. desc_kg es $/kg a RESTAR del costo.
+ACUERDOS_COLS = ["anio", "mes", "idCliente", "idArticulo", "desc_kg"]
+
+# Nombres esperados en el Excel (hoja "Descuentos"), normalizados a minúscula
+# y sin espacios extra -> nombre interno.
+_ACUERDOS_MAPA_COLS = {
+    "año": "anio",
+    "ano": "anio",
+    "mes": "mes",
+    "cod cliente": "idCliente",
+    "cod artic": "idArticulo",
+    "desc en el costo": "desc_kg",
+}
+
+
+def procesar_excel_acuerdos(archivo):
+    """Lee y valida un Excel de acuerdos McCain. Devuelve (df, resumen).
+
+    `archivo` puede ser una ruta o un file-like (st.file_uploader).
+    Tolerante al formato: busca la hoja y la fila de encabezado que contengan
+    'Desc en el costo', así el Excel puede traer títulos arriba o columnas
+    en otro orden sin romper la carga.
+
+    Reglas (definidas con Juan):
+      - filas sin cliente/artículo/mes/valor -> se descartan
+      - clave cliente-artículo-mes duplicada -> gana la ÚLTIMA fila del Excel
+      - valores negativos -> se aplican con su signo (suben el costo), pero
+        se informan en el resumen para poder auditarlos
+    """
+    xls = pd.ExcelFile(archivo)
+    hoja_ok, header_idx = None, None
+    for hoja in xls.sheet_names:
+        crudo = xls.parse(hoja, header=None, nrows=15)
+        for i, fila in crudo.iterrows():
+            vals = [str(v).strip().lower() for v in fila.tolist()]
+            if "desc en el costo" in vals:
+                hoja_ok, header_idx = hoja, i
+                break
+        if hoja_ok is not None:
+            break
+    if hoja_ok is None:
+        raise ValueError(
+            "No encontré la columna 'Desc en el costo' en ninguna hoja. "
+            "¿Es el Excel de acuerdos McCain con el formato de siempre?"
+        )
+
+    df = xls.parse(hoja_ok, header=header_idx)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    df = df.rename(columns=_ACUERDOS_MAPA_COLS)
+
+    faltan = [c for c in ACUERDOS_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"Faltan columnas en el Excel: {faltan}")
+
+    df = df[ACUERDOS_COLS].copy()
+    filas_leidas = len(df)
+
+    # Numéricos + descarte de filas incompletas (las vacías del final, etc.)
+    for c in ACUERDOS_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna()
+    for c in ["anio", "mes", "idCliente", "idArticulo"]:
+        df[c] = df[c].astype(int)
+    descartadas = filas_leidas - len(df)
+
+    # Duplicados por clave: gana la última aparición en el archivo.
+    clave = ["anio", "mes", "idCliente", "idArticulo"]
+    duplicados = int(df.duplicated(subset=clave).sum())
+    df = df.drop_duplicates(subset=clave, keep="last").reset_index(drop=True)
+
+    resumen = {
+        "filas_leidas": filas_leidas,
+        "filas_validas": len(df),
+        "descartadas": descartadas,
+        "duplicados_resueltos": duplicados,
+        "negativos": int((df["desc_kg"] < 0).sum()),
+        "meses": sorted(
+            f"{int(a)}-{int(m):02d}"
+            for a, m in df[["anio", "mes"]].drop_duplicates().itertuples(index=False)
+        ),
+    }
+    return df, resumen
+
+
+def cargar_acuerdos(path=ACUERDOS_PATH):
+    """Acuerdos consolidados. DataFrame vacío (con columnas) si aún no hay."""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=ACUERDOS_COLS)
+    return pd.read_parquet(path)
+
+
+def upsert_acuerdos(df_nuevos, path=ACUERDOS_PATH):
+    """UPSERT POR MES (mismo mecanismo que upsert_serie): borra del almacén
+    los (año, mes) presentes en `df_nuevos` y los reemplaza. Idempotente,
+    escritura atómica."""
+    actual = cargar_acuerdos(path)
+    meses_nuevos = set(map(tuple, df_nuevos[["anio", "mes"]].drop_duplicates().values))
+    if not actual.empty:
+        clave_actual = list(map(tuple, actual[["anio", "mes"]].values))
+        actual = actual[[k not in meses_nuevos for k in clave_actual]]
+        total = pd.concat([actual, df_nuevos], ignore_index=True)
+    else:
+        total = df_nuevos.copy()
+    total = total.sort_values(
+        ["anio", "mes", "idCliente", "idArticulo"]
+    ).reset_index(drop=True)
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    total.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+    return total
+
+
+def aplicar_acuerdos(df_ventas, acuerdos=None):
+    """Ajusta el costo de las ventas con los acuerdos McCain.
+
+    Para cada línea de venta busca el acuerdo de su cliente-artículo-mes y
+    calcula ajuste = desc_kg × kilos_cargo, que se RESTA de costo_unitario.
+    Se usa kilos_cargo (solo lo COBRADO) y no kilos: los kilos bonificados
+    no llevan costo, así que tampoco corresponde descontarles el acuerdo
+    (mismo criterio que el Excel comercial). Las notas de crédito tienen
+    kilos negativos, así que el ajuste se revierte solo en las devoluciones.
+    Sin acuerdo -> ajuste 0 (costo intacto).
+
+    Agrega la columna 'ajuste_mccain' para auditar. CM y CM% no se tocan acá:
+    toda la app los deriva de costo_unitario, así que quedan bien solos.
+    """
+    if acuerdos is None:
+        acuerdos = cargar_acuerdos()
+    df = df_ventas.copy()
+    if "kilos_cargo" not in df.columns:
+        # Parquet guardado con la lógica vieja: re-derivar desde las columnas
+        # crudas (siempre viajan en el parquet) para no depender de re-bajar.
+        df = recalcular_costo(df)
+    if acuerdos.empty:
+        df["ajuste_mccain"] = 0.0
+        return df
+
+    df["_anio"] = df["fechaComprobate"].dt.year
+    df["_mes"] = df["fechaComprobate"].dt.month
+    ac = acuerdos.rename(columns={"anio": "_anio", "mes": "_mes"})
+    df = df.merge(ac, on=["_anio", "_mes", "idCliente", "idArticulo"], how="left")
+    df["desc_kg"] = df["desc_kg"].fillna(0.0)
+    df["ajuste_mccain"] = df["desc_kg"] * df["kilos_cargo"]
+    df["costo_unitario"] = df["costo_unitario"] - df["ajuste_mccain"]
+    return df.drop(columns=["_anio", "_mes", "desc_kg"])
 
 
 # ---------------------------------------------------------------------------

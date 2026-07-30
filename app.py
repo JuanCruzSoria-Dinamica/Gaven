@@ -109,23 +109,54 @@ def fmt_kg(x):
 # el mtime cambia y la caché se invalida sola.
 # ---------------------------------------------------------------------------
 
+def _mtime_acuerdos():
+    """mtime del almacén de acuerdos McCain (0 si aún no existe). Entra en la
+    clave de caché: al subir un Excel nuevo, las cachés se invalidan solas."""
+    try:
+        return os.path.getmtime(dp.ACUERDOS_PATH)
+    except OSError:
+        return 0
+
+
 @st.cache_data(show_spinner="Leyendo datos...")
-def cargar_datos_local(_mtime):
+def cargar_datos_local(mtime, mtime_acuerdos=0):
     df = pd.read_parquet(PARQUET_PATH)
     # 'marca_linea' es una columna DERIVADA del lookup por código
     # (data/proveedor_objetivo_lookup.csv). Se recalcula siempre al leer para
     # que la clasificación refleje el lookup vigente aunque el parquet guardado
     # traiga valores viejos. Es barato (map por idArticulo).
     df = dp.agregar_marca_linea(df)
+    # Ajuste de costo por acuerdos McCain (descuentos que Chess no informa).
+    # El parquet guarda el costo CRUDO; acá se aplica el descuento vigente,
+    # así subir un Excel nuevo corrige CM y CM% al instante, sin re-correr
+    # el pipeline. Agrega la columna 'ajuste_mccain' (auditoría).
+    df = dp.aplicar_acuerdos(df)
     return df
 
 
 @st.cache_data(show_spinner="Leyendo serie histórica...")
-def cargar_serie(_mtime):
+def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     """Lee la serie mensual agregada (data/serie_mensual.parquet).
     La clave de caché es el mtime: si el pipeline reescribe la serie, se
-    invalida sola (mismo patrón que cargar_datos_local)."""
-    return pd.read_parquet(dp.SERIE_PATH)
+    invalida sola (mismo patrón que cargar_datos_local).
+
+    Los meses que también están en el parquet de DETALLE se recalculan desde
+    el detalle con el costo ya ajustado por acuerdos McCain, para que la
+    evolución de CM/CM% coincida con el resto del tablero. Los meses viejos
+    (solo-serie, ej. 2025) quedan tal cual los dejó el backfill."""
+    serie = pd.read_parquet(dp.SERIE_PATH)
+    if dp.cargar_acuerdos().empty:
+        return serie
+    det = cargar_datos_local(mtime_parquet, mtime_acuerdos)
+    nuevos = dp.agregar_serie(det)
+    if nuevos.empty:
+        return serie
+    serie = serie[~serie["anio_mes"].isin(set(nuevos["anio_mes"]))]
+    return (
+        pd.concat([serie, nuevos], ignore_index=True)
+        .sort_values(["anio_mes"] + dp.SERIE_GRANO[1:])
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(show_spinner="Leyendo IPC (INDEC)...")
@@ -328,7 +359,7 @@ if not os.path.exists(PARQUET_PATH):
     )
     st.stop()
 
-df = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
+df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
 
 
 # ---------------------------------------------------------------------------
@@ -800,11 +831,17 @@ def render_drill(df_base, niveles, key, root_id=None):
 # Tabs
 # ---------------------------------------------------------------------------
 
+# La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
+# (los supervisores no ven CM). Se arma la lista de tabs según el rol.
+_labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
+                "Clientes (RFM)", "Vendedores", "Alertas"]
+if mostrar_cm:
+    _labels_tabs.append("Acuerdos McCain")
+
+_tabs = st.tabs(_labels_tabs)
 (tab_resumen, tab_lineas, tab_canales, tab_prod, tab_clientes,
- tab_vend, tab_alertas) = st.tabs(
-    ["Resumen", "Proveedores", "Canales", "Productos (SKU)", "Clientes (RFM)",
-     "Vendedores", "Alertas"]
-)
+ tab_vend, tab_alertas) = _tabs[:7]
+tab_acuerdos = _tabs[7] if mostrar_cm else None
 
 
 # --- TAB RESUMEN ----------------------------------------------------------
@@ -916,7 +953,11 @@ with tab_resumen:
             "Después el pipeline normal la mantiene actualizada sola."
         )
     else:
-        serie = cargar_serie(os.path.getmtime(dp.SERIE_PATH))
+        serie = cargar_serie(
+            os.path.getmtime(dp.SERIE_PATH),
+            os.path.getmtime(PARQUET_PATH),
+            _mtime_acuerdos(),
+        )
 
         if serie.empty:
             st.info("La serie histórica está vacía.")
@@ -1553,3 +1594,109 @@ with tab_alertas:
                 columns={"nivel": "Nivel", "texto": "Alerta"})},
             key="xlsx_alertas",
         )
+
+
+# --- TAB ACUERDOS MCCAIN --------------------------------------------------
+# Carga mensual del Excel de descuentos en el costo (cliente-artículo-mes).
+# UPSERT POR MES: los meses que trae el Excel reemplazan a los guardados,
+# los demás quedan intactos. El ajuste impacta en CM y CM% de todo el
+# tablero al instante (el costo de Chess se guarda crudo y se ajusta al leer).
+if tab_acuerdos is not None:
+    with tab_acuerdos:
+        st.subheader("Acuerdos comerciales McCain")
+        st.caption(
+            "Chess no incluye estos descuentos en el costo, así que el CM% "
+            "sale más bajo de lo real. Subí acá el Excel de acuerdos de cada "
+            "mes"
+        )
+
+        _msg_ok = st.session_state.pop("_acuerdos_ok", None)
+        if _msg_ok:
+            st.success(_msg_ok)
+
+        # --- Estado actual (auditoría) ---------------------------------
+        # OJO: acá se usa el dataset COMPLETO (df_full), no `df`, porque a
+        # esta altura `df` ya viene filtrado por el período/filtros globales
+        # y la auditoría debe mostrar el año entero sin importar qué mes
+        # esté seleccionado arriba.
+        _ac = dp.cargar_acuerdos()
+        if _ac.empty:
+            st.info("Todavía no hay acuerdos cargados.")
+        else:
+            _df_full = cargar_datos_local(
+                os.path.getmtime(PARQUET_PATH), _mtime_acuerdos()
+            )
+            _aud = _df_full[_df_full["ajuste_mccain"] != 0].copy()
+            _aud["Mes"] = _aud["fechaComprobate"].dt.to_period("M").astype(str)
+            _por_mes = (
+                _aud.groupby("Mes")
+                .agg(**{
+                    "Líneas ajustadas": ("ajuste_mccain", "size"),
+                    "Ajuste aplicado $": ("ajuste_mccain", "sum"),
+                })
+                .reset_index()
+            )
+            _n_ac = (
+                _ac.assign(Mes=lambda x: x["anio"].astype(str) + "-"
+                           + x["mes"].astype(str).str.zfill(2))
+                .groupby("Mes").size().rename("Acuerdos cargados")
+                .reset_index()
+            )
+            _tabla = _n_ac.merge(_por_mes, on="Mes", how="left").fillna(0)
+            _tabla["Líneas ajustadas"] = _tabla["Líneas ajustadas"].astype(int)
+            _tabla["Ajuste aplicado $"] = _tabla["Ajuste aplicado $"].map(fmt_money)
+            c1, c2 = st.columns([2, 1])
+            c1.dataframe(_tabla, use_container_width=True, hide_index=True)
+            c2.metric(
+                "Ajuste total aplicado (todo el año)",
+                fmt_money(_df_full["ajuste_mccain"].sum()),
+                help="Importe restado del costo de Chess por acuerdos "
+                     "McCain. Es la mejora directa de la contribución.",
+            )
+
+        st.divider()
+
+        # --- Carga de un Excel nuevo ------------------------------------
+        _subida = st.file_uploader(
+            "Excel de acuerdos (.xlsx)", type=["xlsx", "xlsm"],
+            key="up_acuerdos",
+            help="Sirve tanto el acumulado del año como un archivo con "
+                 "solo el mes nuevo.",
+        )
+        if _subida is not None:
+            try:
+                _nuevos, _res = dp.procesar_excel_acuerdos(_subida)
+            except Exception as e:
+                st.error(f"No pude procesar el archivo: {e}")
+            else:
+                st.markdown(
+                    f"**{_res['filas_validas']}** acuerdos válidos "
+                    f"(de {_res['filas_leidas']} filas leídas · "
+                    f"{_res['descartadas']} vacías/incompletas descartadas · "
+                    f"{_res['duplicados_resueltos']} duplicados resueltos "
+                    "quedándose con el último)."
+                )
+                st.markdown(
+                    "Meses que trae el archivo (van a **reemplazar** a los "
+                    "cargados): " + ", ".join(_res["meses"])
+                )
+                if _res["negativos"]:
+                    st.warning(
+                        f"{_res['negativos']} acuerdos con valor NEGATIVO "
+                        "(suben el costo en vez de bajarlo). Se aplican con "
+                        "su signo; revisalos si no es intencional."
+                    )
+                    _neg = _nuevos[_nuevos["desc_kg"] < 0]
+                    st.dataframe(_neg, use_container_width=True,
+                                 hide_index=True)
+
+                if st.button("Confirmar y aplicar al tablero",
+                             type="primary", key="btn_acuerdos"):
+                    dp.upsert_acuerdos(_nuevos)
+                    st.cache_data.clear()  # recarga datos y serie ajustados
+                    st.session_state["_acuerdos_ok"] = (
+                        f"Listo: {_res['filas_validas']} acuerdos aplicados "
+                        f"({', '.join(_res['meses'])}). CM y CM% ya están "
+                        "recalculados en todo el tablero."
+                    )
+                    st.rerun()
