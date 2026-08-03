@@ -518,8 +518,10 @@ def agrupar_dim(df_ventas, col):
     g["skus_por_cliente"] = g[col].map(skus_cliente).fillna(0)
     total_fc = g["subtotalNeto"].sum()
     total_kg = g["kilos"].sum()
+    total_cm = g["cm"].sum()
     g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
     g["share_kg"] = np.where(total_kg != 0, g["kilos"] / total_kg * 100, 0)
+    g["share_cm"] = np.where(total_cm != 0, g["cm"] / total_cm * 100, 0)
     return g.sort_values("subtotalNeto", ascending=False).reset_index(drop=True)
 
 
@@ -588,8 +590,10 @@ def agrupar_multi(df_ventas, cols):
     g["precio_kg"] = np.where(g["kilos"] != 0, g["subtotalNeto"] / g["kilos"], 0)
     total_fc = g["subtotalNeto"].sum()
     total_kg = g["kilos"].sum()
+    total_cm = g["cm"].sum()
     g["share_fc"] = np.where(total_fc != 0, g["subtotalNeto"] / total_fc * 100, 0)
     g["share_kg"] = np.where(total_kg != 0, g["kilos"] / total_kg * 100, 0)
+    g["share_cm"] = np.where(total_cm != 0, g["cm"] / total_cm * 100, 0)
     return g.sort_values("subtotalNeto", ascending=False).reset_index(drop=True)
 
 

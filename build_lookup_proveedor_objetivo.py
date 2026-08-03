@@ -101,13 +101,27 @@ def main(xlsx_path, out_path=None):
             "linea": linea,
         }
 
+    # Agregados manuales: artículos sin ventas en el Excel (no aparecen en
+    # t_Base) cuya marca/línea se definió a mano. Se mergean al regenerar;
+    # si un código ya sale del Excel, gana el Excel.
+    manual_path = os.path.join(os.path.dirname(out_path), "proveedor_objetivo_lookup.manual.csv")
+    n_manual = 0
+    if os.path.exists(manual_path):
+        with open(manual_path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                cod = int(r["idArticulo"])
+                if cod not in rec:
+                    r["idArticulo"] = cod
+                    rec[cod] = r
+                    n_manual += 1
+
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["idArticulo", "dsArticulo", "marca_linea",
                                           "proveedor_ref", "grupo", "familia", "linea"])
         w.writeheader()
         for cod in sorted(rec):
             w.writerow(rec[cod])
-    print(f"OK: {len(rec)} códigos -> {out_path}")
+    print(f"OK: {len(rec)} códigos ({n_manual} manuales) -> {out_path}")
 
 
 if __name__ == "__main__":

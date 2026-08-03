@@ -509,10 +509,12 @@ COLS_DIM = {
     "cm_pct": "CM %", "precio_kg": "$/kg", "clientes": "Clientes",
     "skus": "SKUs", "skus_por_cliente": "SKUs/Cliente",
     "share_fc": "Share FC %", "share_kg": "Share Kg %",
+    "share_cm": "Share CM %",
 }
 FMT_DIM = {
     "Kilos": fmt_kg, "Facturación": fmt_money, "Contribución": fmt_money,
     "CM %": fmt_pct, "$/kg": fmt_money, "Share FC %": fmt_pct, "Share Kg %": fmt_pct,
+    "Share CM %": fmt_pct,
     "SKUs/Cliente": lambda x: f"{x:,.1f}".replace(",", "."),
 }
 
@@ -525,15 +527,15 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
     que maneja cada fila de la dimensión).
     mostrar_skus_cliente=True agrega 'SKUs/Cliente' (productos únicos
     promedio por cliente)."""
-    cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "cm_pct",
-            "precio_kg", "clientes"]
+    cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "share_cm",
+            "cm_pct", "precio_kg", "clientes"]
     if mostrar_skus:
         cols.append("skus")
     if mostrar_skus_cliente:
         cols.append("skus_por_cliente")
     # Supervisores no ven Contribución ni CM %: se quitan las columnas.
     if not mostrar_cm:
-        cols = [c for c in cols if c not in ("cm", "cm_pct")]
+        cols = [c for c in cols if c not in ("cm", "share_cm", "cm_pct")]
     cols = [c for c in cols if c in g.columns]
     t = g[cols].rename(columns={dim_col: dim_label, **COLS_DIM})
     st.dataframe(
@@ -608,7 +610,9 @@ def boton_excel(nombre, hojas, key):
 
 def _cols_cm(cols):
     """Quita las columnas de CM si el rol no puede verlas."""
-    return cols if mostrar_cm else [c for c in cols if c not in ("cm", "cm_pct")]
+    if mostrar_cm:
+        return cols
+    return [c for c in cols if c not in ("cm", "share_cm", "cm_pct")]
 
 
 def _barras_share(g, col_dim, etiqueta, col_val, col_share, top_n=12):
@@ -762,16 +766,14 @@ def render_drill(df_base, niveles, key, root_id=None):
     if g.empty:
         st.info(f"No hay {etiqueta_niv.lower()} para esta selección.")
         return None
-    # Share de contribución: agrupar_dim no lo trae; se calcula acá.
-    _tot_cm = g["cm"].sum()
-    g["share_cm"] = (g["cm"] / _tot_cm * 100) if _tot_cm else 0.0
+    # share_cm ya viene de agrupar_dim (mismo criterio que share_fc/share_kg).
     g = g.sort_values(col_val, ascending=False).reset_index(drop=True)
 
     st.subheader(f"Nivel {nivel + 1} de {len(niveles)} · {etiqueta_niv}")
 
     # Tabla completa del nivel (va al Excel y a la vista final).
     _cf = [col_niv, "kilos", "share_kg", "subtotalNeto", "share_fc",
-           "cm", "cm_pct", "precio_kg", "clientes", "skus"]
+           "cm", "share_cm", "cm_pct", "precio_kg", "clientes", "skus"]
     if col_niv == "dsArticulo":
         _cf.remove("skus")  # cada fila ya ES un SKU
     t_full = g[_cols_cm(_cf)].rename(columns={col_niv: etiqueta_niv,
@@ -1155,8 +1157,8 @@ with tab_lineas:
 
     with st.expander("Ver tabla completa de líneas"):
         _cols = _cols_cm(["linea_producto", "kilos", "share_kg", "subtotalNeto",
-                          "share_fc", "cm", "cm_pct", "precio_kg", "clientes",
-                          "skus"])
+                          "share_fc", "cm", "share_cm", "cm_pct", "precio_kg",
+                          "clientes", "skus"])
         t_lineas = g_lin[_cols].rename(
             columns={"linea_producto": "Línea", **COLS_DIM})
         st.dataframe(
@@ -1325,10 +1327,10 @@ with tab_prod:
             st.info("No hay productos en la clase seleccionada.")
         else:
             cols = ["dsArticulo", "ABC", "kilos", "subtotalNeto", "share_fc",
-                    "cm", "cm_pct", "precio_kg", "clientes"]
+                    "cm", "share_cm", "cm_pct", "precio_kg", "clientes"]
             # Supervisores no ven Contribución ni CM % en el ranking de SKUs.
             if not mostrar_cm:
-                cols = [c for c in cols if c not in ("cm", "cm_pct")]
+                cols = [c for c in cols if c not in ("cm", "share_cm", "cm_pct")]
             # Copia sin renombrar: sirve para recuperar el nombre real del
             # producto a partir de la fila que el usuario seleccione (la
             # selección devuelve la posición de la fila en este mismo orden).
