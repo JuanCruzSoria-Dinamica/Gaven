@@ -33,6 +33,7 @@ import os
 import re
 import json
 import time
+import warnings
 import datetime as dt
 
 import requests
@@ -1064,6 +1065,891 @@ def aplicar_acuerdos(df_ventas, acuerdos=None):
     df["ajuste_mccain"] = df["desc_kg"] * df["kilos_cargo"]
     df["costo_unitario"] = df["costo_unitario"] - df["ajuste_mccain"]
     return df.drop(columns=["_anio", "_mes", "desc_kg"])
+
+
+# ---------------------------------------------------------------------------
+# 3bis) Metas de venta en KILOS (canal → proveedor → vendedor)
+# ---------------------------------------------------------------------------
+# Reemplaza los Excel de "Cierre / Meta" que se armaban a mano. El objetivo se
+# carga desde la solapa "Metas" del tablero y se guarda acá, con el mismo
+# mecanismo de upsert que los acuerdos.
+#
+# ESTRUCTURA (definida con la gestión comercial): se planifica EMPEZANDO POR
+# EL CANAL, porque cada supervisor responde por el rendimiento de su canal.
+# Recién después se abre por proveedor/línea y se reparte entre vendedores:
+#
+#     canal  →  proveedor / línea  →  vendedor
+#
+# Eso se modela con dos ejes en la misma tabla:
+#
+#   tipo   'objetivo'     meta del mes, se puede reajustar durante el mes.
+#          'presupuesto'  lo que se estimó a principio de año para ese mes.
+#                         Es la línea base; NO se toca durante el año.
+#   nivel  'canal'        total del canal. Se CARGA a mano (no se deriva),
+#                         para poder validar que la apertura cierre contra él.
+#          'proveedor'    apertura por marca/línea dentro del canal.
+#          'vendedor'     reparto entre los vendedores del canal.
+#
+# El nivel 'vendedor' es canal × vendedor (no canal × proveedor × vendedor):
+# la grilla de tres ejes se vuelve inmanejable mes a mes y el control que se
+# pidió (que la suma de los vendedores cierre contra el canal) se cumple
+# igual. Si más adelante hace falta, se agrega un nivel 'proveedor_vendedor'
+# sin tocar el esquema.
+#
+# No hay metas por cliente: es un nivel de desagregación demasiado fino para
+# administrar. Los clientes aparecen en el análisis de ventas, sin objetivo.
+#
+# La meta SIEMPRE está en kilos. No se guardan porcentajes ni proyecciones:
+# esos se derivan al leer con seguimiento_metas(), para que se recalculen
+# solos a medida que entran ventas nuevas.
+
+METAS_PATH = os.path.join(DATA_DIR, "metas.parquet")
+METAS_HIST_PATH = os.path.join(DATA_DIR, "metas_historial.parquet")
+
+METAS_COLS = ["anio_mes", "tipo", "nivel", "dsCanalMkt", "marca_linea",
+              "dsVendedor", "meta_kg", "fecha_carga"]
+
+METAS_TIPOS = ("objetivo", "presupuesto")
+METAS_NIVELES = ("canal", "proveedor", "vendedor")
+
+# Columna que identifica la fila dentro del canal, según el nivel. En 'canal'
+# no hay apertura: las dos columnas de etiqueta van vacías.
+METAS_ETIQUETA = {"canal": None, "proveedor": "marca_linea", "vendedor": "dsVendedor"}
+
+# Clave lógica de una meta. Todo el upsert y la normalización giran alrededor
+# de esto.
+METAS_CLAVE = ["anio_mes", "tipo", "nivel", "dsCanalMkt", "marca_linea", "dsVendedor"]
+
+
+def _metas_vacio():
+    """DataFrame vacío con el esquema y los dtypes correctos."""
+    d = pd.DataFrame(columns=METAS_COLS)
+    d["meta_kg"] = d["meta_kg"].astype("float64")
+    d["fecha_carga"] = pd.to_datetime(d["fecha_carga"])
+    return d
+
+
+def _concat_metas(*partes):
+    """Concatena las tablas de metas dejando los dtypes fijos.
+
+    Se descartan los DataFrames vacíos y se fuerzan las columnas al tipo que
+    corresponde ANTES de concatenar. pandas avisa (FutureWarning) cuando en el
+    concat hay columnas enteras en NA —pasa siempre que las metas viejas no
+    tienen fecha_carga— porque en el futuro va a inferir los dtypes distinto:
+    como acá el tipo se impone a mano, ese cambio no nos afecta y el aviso se
+    silencia solo para esta operación.
+    """
+    vivas = []
+    for p in partes:
+        if p is None or len(p) == 0:
+            continue
+        d = p.copy()
+        for c in METAS_COLS:
+            if c not in d.columns:
+                d[c] = np.nan
+        for c in ["anio_mes", "tipo", "nivel", "dsCanalMkt", "marca_linea",
+                  "dsVendedor"]:
+            d[c] = d[c].astype(str).str.strip().replace(
+                {"nan": "", "None": ""})
+        d["meta_kg"] = pd.to_numeric(d["meta_kg"], errors="coerce").fillna(0.0)
+        d["fecha_carga"] = pd.to_datetime(d["fecha_carga"], errors="coerce")
+        vivas.append(d[METAS_COLS])
+
+    if not vivas:
+        return _metas_vacio()
+    if len(vivas) == 1:
+        return vivas[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        return pd.concat(vivas, ignore_index=True)
+
+
+def _migrar_metas(df):
+    """Lleva el parquet viejo (anio_mes, dsCanalMkt, marca_linea, meta_kg) al
+    esquema nuevo. Todo lo que existía era el objetivo mensual abierto por
+    proveedor, así que se etiqueta como tipo='objetivo', nivel='proveedor'.
+    Es idempotente: si el archivo ya tiene las columnas nuevas, no toca nada."""
+    d = df.copy()
+    if "tipo" not in d.columns:
+        d["tipo"] = "objetivo"
+    if "nivel" not in d.columns:
+        # Sin la columna 'nivel' toda fila con marca es apertura por proveedor.
+        d["nivel"] = np.where(
+            d.get("marca_linea", pd.Series(index=d.index, dtype=object))
+            .astype(str).str.strip().isin(["", "nan", "None"]),
+            "canal", "proveedor")
+    if "dsVendedor" not in d.columns:
+        d["dsVendedor"] = ""
+    if "fecha_carga" not in d.columns:
+        d["fecha_carga"] = pd.NaT
+    return d
+
+
+def cargar_metas(path=METAS_PATH):
+    """Metas cargadas, en el esquema nuevo. DataFrame vacío (con columnas) si
+    todavía no hay. Migra al vuelo el formato viejo, así el tablero sigue
+    andando con el parquet que ya está en disco."""
+    if not os.path.exists(path):
+        return _metas_vacio()
+    df = _migrar_metas(pd.read_parquet(path))
+    for c in METAS_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[METAS_COLS].copy()
+    for c in ["anio_mes", "tipo", "nivel", "dsCanalMkt", "marca_linea", "dsVendedor"]:
+        df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
+    df["meta_kg"] = pd.to_numeric(df["meta_kg"], errors="coerce").fillna(0.0)
+    df["fecha_carga"] = pd.to_datetime(df["fecha_carga"], errors="coerce")
+    return df
+
+
+def normalizar_metas(df, tipo=None, nivel=None):
+    """Limpia lo que viene de la grilla editable: normaliza textos, completa
+    tipo/nivel si vienen por parámetro, blanquea las columnas de etiqueta que
+    no corresponden al nivel, suma duplicados y tira las metas en cero (una
+    meta de 0 kg equivale a no tener meta cargada).
+
+    Descarta las filas sin la etiqueta que el nivel exige: sin marca en
+    'proveedor', sin vendedor en 'vendedor'. En 'canal' no hace falta ninguna.
+    """
+    if df is None or len(df) == 0:
+        return _metas_vacio()
+    d = df.copy()
+    for c in METAS_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+    if tipo is not None:
+        d["tipo"] = tipo
+    if nivel is not None:
+        d["nivel"] = nivel
+    d = d[METAS_COLS]
+    for c in ["anio_mes", "tipo", "nivel", "dsCanalMkt", "marca_linea", "dsVendedor"]:
+        d[c] = d[c].astype(str).str.strip().replace({"nan": "", "None": ""})
+    d["tipo"] = d["tipo"].str.lower().replace({"": "objetivo"})
+    d["nivel"] = d["nivel"].str.lower().replace({"": "proveedor"})
+    d["meta_kg"] = pd.to_numeric(d["meta_kg"], errors="coerce").fillna(0.0)
+    d["fecha_carga"] = pd.to_datetime(d["fecha_carga"], errors="coerce")
+
+    d = d[d["tipo"].isin(METAS_TIPOS) & d["nivel"].isin(METAS_NIVELES)]
+    d = d[d["dsCanalMkt"] != ""].copy()   # .copy(): abajo se asigna con .loc
+
+    # Cada nivel usa una sola columna de etiqueta; las demás se blanquean para
+    # que la clave no se ensucie con restos de otra grilla.
+    for niv, col in METAS_ETIQUETA.items():
+        m = d["nivel"] == niv
+        for otra in ("marca_linea", "dsVendedor"):
+            if otra != col:
+                d.loc[m, otra] = ""
+        if col is not None:
+            d = d[~(m & (d[col] == ""))].copy()
+
+    d = d[d["meta_kg"] > 0]
+    if d.empty:
+        return _metas_vacio()
+    return (
+        d.groupby(METAS_CLAVE, as_index=False)
+        .agg(meta_kg=("meta_kg", "sum"), fecha_carga=("fecha_carga", "max"))
+        .sort_values(["anio_mes", "tipo", "nivel", "dsCanalMkt", "meta_kg"],
+                     ascending=[True, True, True, True, False])
+        .reset_index(drop=True)
+    )
+
+
+def cargar_historial_metas(path=METAS_HIST_PATH):
+    """Log append-only de cada guardado. Sirve para mostrar 'objetivo original
+    vs. objetivo vigente' cuando la meta del mes se reajusta a mitad de mes."""
+    if not os.path.exists(path):
+        return _metas_vacio()
+    df = pd.read_parquet(path)
+    for c in METAS_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[METAS_COLS].copy()
+    df["meta_kg"] = pd.to_numeric(df["meta_kg"], errors="coerce").fillna(0.0)
+    df["fecha_carga"] = pd.to_datetime(df["fecha_carga"], errors="coerce")
+    return df
+
+
+def _append_historial(snapshot, path=METAS_HIST_PATH):
+    """Agrega el snapshot recién guardado al log. Nunca borra: si el archivo
+    está corrupto o ilegible se saltea, porque el historial es informativo y
+    no debe hacer fallar el guardado de la meta."""
+    if snapshot is None or snapshot.empty:
+        return
+    try:
+        prev = cargar_historial_metas(path)
+        total = _concat_metas(prev, snapshot)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        total.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def upsert_metas(df_nuevas, anio_mes, canales=None, tipo="objetivo",
+                 nivel="proveedor", path=METAS_PATH, historial=True,
+                 path_historial=METAS_HIST_PATH):
+    """UPSERT POR (mes, tipo, nivel, canal): borra del almacén esas
+    combinaciones y las reemplaza por `df_nuevas`. Si `canales` viene dado,
+    esos canales se reescriben aunque queden sin filas (así borrar una meta en
+    la grilla efectivamente la borra).
+
+    Acotar la clave a (tipo, nivel) además del canal es lo que permite guardar
+    la grilla de vendedores sin pisar la de proveedores del mismo canal y mes.
+
+    `anio_mes` puede ser un mes o una lista de meses (el presupuesto anual se
+    guarda de una, los 12 meses juntos, en una sola escritura).
+
+    Escritura atómica e idempotente. Devuelve la tabla completa resultante.
+    """
+    ahora = pd.Timestamp.now().floor("s")
+    meses = ([str(anio_mes)] if isinstance(anio_mes, str)
+             else [str(x) for x in anio_mes])
+    nuevas = normalizar_metas(df_nuevas, tipo=tipo, nivel=nivel)
+    nuevas["fecha_carga"] = ahora
+    actual = cargar_metas(path)
+
+    if canales is None:
+        canales = sorted(nuevas["dsCanalMkt"].unique()) if not nuevas.empty else []
+    canales = {str(c).strip() for c in canales}
+
+    if not actual.empty and canales:
+        borrar = (
+            (actual["anio_mes"].astype(str).isin(meses))
+            & (actual["tipo"].astype(str) == str(tipo))
+            & (actual["nivel"].astype(str) == str(nivel))
+            & (actual["dsCanalMkt"].astype(str).str.strip().isin(canales))
+        )
+        actual = actual[~borrar]
+
+    # OJO: normalizar_metas() sin tipo/nivel, para no reetiquetar las filas
+    # que ya estaban guardadas de otros niveles.
+    total = normalizar_metas(_concat_metas(actual, nuevas))
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    total.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+    if historial:
+        _append_historial(nuevas, path=path_historial)
+    return total
+
+
+def filtrar_metas(metas, anio_mes=None, tipo=None, nivel=None, canal=None,
+                  canales=None):
+    """Corte de la tabla de metas por los ejes de siempre. Devuelve una copia."""
+    m = cargar_metas() if metas is None else metas.copy()
+    if m.empty:
+        return _metas_vacio()
+    if anio_mes is not None:
+        m = m[m["anio_mes"].astype(str) == str(anio_mes)]
+    if tipo is not None:
+        m = m[m["tipo"].astype(str) == str(tipo)]
+    if nivel is not None:
+        m = m[m["nivel"].astype(str) == str(nivel)]
+    if canal is not None:
+        m = m[m["dsCanalMkt"].astype(str).str.strip() == str(canal).strip()]
+    if canales is not None:
+        cs = {str(c).strip() for c in canales}
+        m = m[m["dsCanalMkt"].astype(str).str.strip().isin(cs)]
+    return m.reset_index(drop=True)
+
+
+def total_meta(metas, anio_mes, tipo, nivel, canal=None, canales=None):
+    """Suma de kilos de un corte. 0.0 si no hay nada cargado."""
+    m = filtrar_metas(metas, anio_mes=anio_mes, tipo=tipo, nivel=nivel,
+                      canal=canal, canales=canales)
+    return float(m["meta_kg"].sum()) if not m.empty else 0.0
+
+
+def metas_original_vs_vigente(anio_mes, tipo, nivel, canal, historial=None,
+                              path=METAS_HIST_PATH):
+    """Primer valor cargado vs. último, para un (mes, tipo, nivel, canal).
+
+    El objetivo mensual se reajusta a propósito (si julio vendió de más porque
+    los clientes adelantaron compras, agosto baja). Esto deja ver ese ajuste en
+    vez de que el número original desaparezca al pisarse.
+
+    Devuelve dict con original_kg / vigente_kg / fecha_original / fecha_vigente
+    / n_cargas, o None si el historial no tiene nada de ese corte.
+    """
+    h = cargar_historial_metas(path) if historial is None else historial.copy()
+    h = filtrar_metas(h, anio_mes=anio_mes, tipo=tipo, nivel=nivel, canal=canal)
+    if h.empty or h["fecha_carga"].isna().all():
+        return None
+    tot = (h.dropna(subset=["fecha_carga"])
+           .groupby("fecha_carga", as_index=False)["meta_kg"].sum()
+           .sort_values("fecha_carga"))
+    if tot.empty:
+        return None
+    return {
+        "original_kg": float(tot["meta_kg"].iloc[0]),
+        "vigente_kg": float(tot["meta_kg"].iloc[-1]),
+        "fecha_original": tot["fecha_carga"].iloc[0],
+        "fecha_vigente": tot["fecha_carga"].iloc[-1],
+        "n_cargas": int(len(tot)),
+    }
+
+
+def dias_habiles(desde, hasta, con_sabado=True, feriados=None):
+    """Cantidad de días de venta entre dos fechas (ambas inclusive).
+    Por defecto cuenta lunes a sábado (no se factura los domingos). Es la base
+    de la proyección a fin de mes; en el tablero el número se puede pisar a
+    mano si el mes tuvo feriados o cierres.
+
+    `feriados`: colección de dt.date que no se cuentan (no se factura)."""
+    if desde is None or hasta is None or hasta < desde:
+        return 0
+    tope = 5 if con_sabado else 4  # weekday(): lunes=0 ... domingo=6
+    fer = set(feriados or ())
+    dias = 0
+    d = desde
+    while d <= hasta:
+        if d.weekday() <= tope and d not in fer:
+            dias += 1
+        d += dt.timedelta(days=1)
+    return dias
+
+
+# --- Días de facturación de Food Service -----------------------------------
+# Food Service NO factura todos los días. Cada vendedor está en la calle y
+# vuelca los pedidos en dos a cuatro días fijos de la semana, así que proyectar
+# ese canal contra días hábiles lo distorsiona: si el mes arranca un martes ya
+# se "comió" un día de facturación, y una venta del 31 puede caer cargada el 3
+# del mes siguiente. RETAIL, GRANJAS y MAYORISTAS facturan todos los días y
+# siguen proyectando con dias_habiles().
+#
+# Es un PARCHE consciente mientras se ordena el proceso de facturación de Food
+# (se les va a proponer facturar en el momento). Refleja los días declarados
+# por Gaven en agosto 2026: si cambian, se cambian acá y nada más.
+#
+# weekday(): lunes=0, martes=1, miércoles=2, jueves=3, viernes=4, sábado=5.
+CANAL_DIAS_FACTURACION = "FOOD SERVICE"
+
+DIAS_FACTURACION = {
+    "AVETTA SANCHEZ, MARIA NOELIA": (0, 2, 4),     # lunes, miércoles, viernes
+    "BALLESTEROS, LAURA":           (0, 1, 3, 4),  # lunes, martes, jueves, viernes
+    "CASTILLON AGUSTIN DAMIAN":     (0, 4),        # lunes, viernes
+    "COLOMBO, CARLOS":              (0, 3),        # lunes, jueves
+    "MORENO GERMAN":                (0, 1, 3),     # lunes, martes, jueves
+}
+
+DIAS_SEMANA_NOMBRE = ("lunes", "martes", "miércoles", "jueves", "viernes",
+                      "sábado", "domingo")
+
+
+def _norm_nombre(s):
+    """Nombre comparable: mayúsculas, sin espacios de más."""
+    return re.sub(r"\s+", " ", str(s).upper().strip())
+
+
+def dias_facturacion_vendedor(canal, vendedor):
+    """Días de la semana en que factura un vendedor.
+
+    Devuelve None cuando no corresponde aplicar la lógica: o el canal no es
+    Food Service (el resto factura todos los días), o el vendedor todavía no
+    tiene los días declarados. En ambos casos la proyección se cae a
+    dias_habiles(), que es el comportamiento de siempre.
+
+    Importante que dependa del canal y no solo del nombre: MORENO GERMAN tiene
+    ventas sueltas en GRANJAS y RETAIL, y ahí no factura en días fijos.
+    """
+    if _norm_nombre(canal) != _norm_nombre(CANAL_DIAS_FACTURACION):
+        return None
+    tabla = {_norm_nombre(k): v for k, v in DIAS_FACTURACION.items()}
+    return tabla.get(_norm_nombre(vendedor))
+
+
+def contar_dias_facturacion(desde, hasta, dias_semana, feriados=None):
+    """Cuántos días de facturación hay entre dos fechas (ambas inclusive)."""
+    if desde is None or hasta is None or hasta < desde:
+        return 0
+    dias = {int(d) for d in (dias_semana or ())}
+    if not dias:
+        return 0
+    fer = set(feriados or ())
+    n = 0
+    d = desde
+    while d <= hasta:
+        if d.weekday() in dias and d not in fer:
+            n += 1
+        d += dt.timedelta(days=1)
+    return n
+
+
+def dias_venta(canal, vendedor, desde, corte, hasta, feriados=None):
+    """(días transcurridos, días totales) de venta de un vendedor en el mes.
+
+    Food Service cuenta días de facturación del vendedor; el resto de los
+    canales, días hábiles de lunes a sábado.
+    """
+    dias = dias_facturacion_vendedor(canal, vendedor)
+    if dias is None:
+        return (dias_habiles(desde, corte, feriados=feriados),
+                max(dias_habiles(desde, hasta, feriados=feriados), 1))
+    return (contar_dias_facturacion(desde, corte, dias, feriados=feriados),
+            max(contar_dias_facturacion(desde, hasta, dias, feriados=feriados), 1))
+
+
+def factor_proyeccion(canal, vendedor, desde, corte, hasta, feriados=None):
+    """Cuánto hay que escalar el avance de un vendedor para proyectarlo a fin
+    de mes. 1.0 si el mes ya cerró o si todavía no hay días transcurridos."""
+    pas, tot = dias_venta(canal, vendedor, desde, corte, hasta,
+                          feriados=feriados)
+    if pas > 0 and tot > 0 and pas < tot:
+        return tot / pas
+    return 1.0
+
+
+def factor_proyeccion_ponderado(df, desde, corte, hasta, feriados=None,
+                                col_peso="kilos"):
+    """Factor de proyección único para un conjunto de ventas ya filtrado,
+    ponderado por el peso de cada vendedor.
+
+    Es la versión escalar de _proyeccion_por_nivel(): sirve donde hay que
+    proyectar métricas que no son kilos (facturación, unidades) y no se puede
+    trabajar fila por fila. Equivale a "la proyección total es la suma de las
+    proyecciones de cada vendedor", que es lo mismo que pide el seguimiento de
+    metas, así que los dos números del tablero cierran entre sí.
+
+    Devuelve (factor, proyectar). `proyectar` es False si no hay con qué.
+    """
+    if df is None or len(df) == 0:
+        return 1.0, False
+    if any(c not in df.columns for c in ("dsCanalMkt", "dsVendedor", col_peso)):
+        return 1.0, False
+
+    g = df[["dsCanalMkt", "dsVendedor", col_peso]].copy()
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    g["dsVendedor"] = g["dsVendedor"].astype(str).str.strip()
+    g[col_peso] = pd.to_numeric(g[col_peso], errors="coerce").fillna(0.0)
+    g = g.groupby(["dsCanalMkt", "dsVendedor"], as_index=False)[col_peso].sum()
+    g = g[g[col_peso] > 0]
+    if g.empty:
+        return 1.0, False
+
+    base = float(g[col_peso].sum())
+    proyectado = sum(
+        w * factor_proyeccion(c, v, desde, corte, hasta, feriados=feriados)
+        for c, v, w in g.itertuples(index=False, name=None)
+    )
+    if base <= 0 or proyectado <= 0:
+        return 1.0, False
+    factor = proyectado / base
+    return factor, factor > 1.0
+
+
+def vendedores_sin_dias_facturacion(df_ventas):
+    """Vendedores de Food Service con ventas pero sin días declarados.
+
+    El sistema AVISA, no bloquea: esos vendedores proyectan con días hábiles
+    (lunes a sábado), que es lo que se hacía antes, y quedan listados para
+    pedirle los días a Gaven.
+    """
+    if df_ventas is None or len(df_ventas) == 0:
+        return []
+    if "dsCanalMkt" not in df_ventas.columns or "dsVendedor" not in df_ventas.columns:
+        return []
+    d = df_ventas
+    canal = d["dsCanalMkt"].astype(str).map(_norm_nombre)
+    food = d[canal == _norm_nombre(CANAL_DIAS_FACTURACION)]
+    if food.empty:
+        return []
+    faltan = {
+        str(v).strip() for v in food["dsVendedor"].dropna().unique()
+        if dias_facturacion_vendedor(CANAL_DIAS_FACTURACION, v) is None
+    }
+    return sorted(faltan - {"", "nan", "None"})
+
+
+def etiqueta_dias_facturacion(vendedor, canal=CANAL_DIAS_FACTURACION):
+    """'lunes, miércoles y viernes' — para mostrar en el tablero."""
+    dias = dias_facturacion_vendedor(canal, vendedor)
+    if not dias:
+        return ""
+    nombres = [DIAS_SEMANA_NOMBRE[d] for d in sorted(dias)]
+    if len(nombres) == 1:
+        return nombres[0]
+    return ", ".join(nombres[:-1]) + " y " + nombres[-1]
+
+
+def kilos_por_canal_marca(df_ventas):
+    """Kilos agregados por canal × marca/línea (base del seguimiento)."""
+    cols = pd.DataFrame(columns=["dsCanalMkt", "marca_linea", "kilos"])
+    if df_ventas is None or df_ventas.empty:
+        return cols
+    d = df_ventas if "marca_linea" in df_ventas.columns else agregar_marca_linea(df_ventas)
+    if "dsCanalMkt" not in d.columns:
+        return cols
+    g = d.copy()
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    g["marca_linea"] = g["marca_linea"].astype(str).str.strip()
+    return (
+        g.groupby(["dsCanalMkt", "marca_linea"], as_index=False)["kilos"]
+        .sum()
+    )
+
+
+def kilos_por_canal_vendedor(df_ventas):
+    """Kilos agregados por canal × vendedor (base del seguimiento del nivel
+    'vendedor'). Mismo criterio que kilos_por_canal_marca()."""
+    cols = pd.DataFrame(columns=["dsCanalMkt", "dsVendedor", "kilos"])
+    if df_ventas is None or df_ventas.empty:
+        return cols
+    if "dsCanalMkt" not in df_ventas.columns or "dsVendedor" not in df_ventas.columns:
+        return cols
+    g = df_ventas.copy()
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    g["dsVendedor"] = g["dsVendedor"].astype(str).str.strip()
+    return (
+        g.groupby(["dsCanalMkt", "dsVendedor"], as_index=False)["kilos"]
+        .sum()
+    )
+
+
+def kilos_por_canal(df_ventas):
+    """Kilos totales por canal (base del seguimiento del nivel 'canal')."""
+    cols = pd.DataFrame(columns=["dsCanalMkt", "kilos"])
+    if df_ventas is None or df_ventas.empty or "dsCanalMkt" not in df_ventas.columns:
+        return cols
+    g = df_ventas.copy()
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    return g.groupby(["dsCanalMkt"], as_index=False)["kilos"].sum()
+
+
+def kilos_por_mes_canal(df_ventas):
+    """Kilos por mes (YYYY-MM) × canal. Es la referencia histórica que se
+    muestra al cargar el presupuesto anual: cuánto se vendió realmente en ese
+    mismo mes el año pasado."""
+    cols = pd.DataFrame(columns=["anio_mes", "dsCanalMkt", "kilos"])
+    if df_ventas is None or df_ventas.empty:
+        return cols
+    if "dsCanalMkt" not in df_ventas.columns or "fechaComprobate" not in df_ventas.columns:
+        return cols
+    g = df_ventas.copy()
+    g["anio_mes"] = pd.to_datetime(
+        g["fechaComprobate"], errors="coerce").dt.strftime("%Y-%m")
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    g = g[g["anio_mes"].notna()]
+    return g.groupby(["anio_mes", "dsCanalMkt"], as_index=False)["kilos"].sum()
+
+
+def _kilos_por_nivel(df_ventas, nivel):
+    """Agregación de ventas al grano que corresponde al nivel de la meta."""
+    if nivel == "vendedor":
+        return kilos_por_canal_vendedor(df_ventas)
+    if nivel == "canal":
+        return kilos_por_canal(df_ventas)
+    return kilos_por_canal_marca(df_ventas)
+
+
+def _proyeccion_por_nivel(df_mes, nivel, desde, corte, hasta, feriados=None):
+    """Proyección a fin de mes calculada SIEMPRE al grano de vendedor y recién
+    después agregada al nivel pedido.
+
+    Esto es lo que mantiene consistentes los tres niveles: la proyección de un
+    canal es la suma de la de sus vendedores, y la de un proveedor es la suma
+    de lo que proyectan los vendedores que lo venden. Si cada nivel se
+    proyectara con un único factor global, canal ≠ Σ proveedores ≠ Σ
+    vendedores en cuanto un canal tiene vendedores con distintos días de
+    facturación.
+
+    Devuelve DataFrame vacío si no se puede llegar al grano de vendedor; el
+    que llama se cae a la proyección global de siempre.
+    """
+    etiqueta = METAS_ETIQUETA.get(nivel, "marca_linea")
+    llaves = ["dsCanalMkt"] + ([etiqueta] if etiqueta else [])
+    vacio = pd.DataFrame(columns=llaves + ["proyeccion_kg"])
+
+    if df_mes is None or len(df_mes) == 0:
+        return vacio
+
+    d = df_mes
+    if etiqueta == "marca_linea" and "marca_linea" not in d.columns:
+        d = agregar_marca_linea(d)
+
+    grano = list(dict.fromkeys(llaves + ["dsVendedor"]))
+    if any(c not in d.columns for c in grano + ["kilos"]):
+        return vacio
+
+    g = d[grano + ["kilos"]].copy()
+    for c in grano:
+        g[c] = g[c].astype(str).str.strip()
+    g = g.groupby(grano, as_index=False)["kilos"].sum()
+    if g.empty:
+        return vacio
+
+    # Un factor por (canal, vendedor): son pocos pares, se calculan una vez.
+    pares = g[["dsCanalMkt", "dsVendedor"]].drop_duplicates()
+    factores = {
+        (c, v): factor_proyeccion(c, v, desde, corte, hasta, feriados=feriados)
+        for c, v in pares.itertuples(index=False, name=None)
+    }
+    g["proyeccion_kg"] = [
+        k * factores[(c, v)]
+        for k, c, v in zip(g["kilos"], g["dsCanalMkt"], g["dsVendedor"])
+    ]
+    return g.groupby(llaves, as_index=False)["proyeccion_kg"].sum()
+
+
+def dias_venta_resumen(df_mes, desde, corte, hasta, canales=None,
+                       feriados=None):
+    """Días de venta transcurridos y totales 'promedio' de lo que se está
+    mirando, ponderados por kilos de cada vendedor.
+
+    Sirve solo para los textos del tablero ("día 6 de 13 de venta", "faltan
+    X kg → Y kg/día"). La proyección NO usa esto: se calcula vendedor por
+    vendedor. Con un canal que factura todos los días el promedio da
+    exactamente dias_habiles(), así que no cambia nada fuera de Food.
+
+    Devuelve (pasados, totales, mixto) — `mixto` avisa si en la vista hay
+    vendedores con días de facturación propios.
+    """
+    pas_def = dias_habiles(desde, corte, feriados=feriados)
+    tot_def = max(dias_habiles(desde, hasta, feriados=feriados), 1)
+
+    if df_mes is None or len(df_mes) == 0:
+        return pas_def, tot_def, False
+    if any(c not in df_mes.columns for c in ("dsCanalMkt", "dsVendedor", "kilos")):
+        return pas_def, tot_def, False
+
+    g = df_mes[["dsCanalMkt", "dsVendedor", "kilos"]].copy()
+    g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
+    g["dsVendedor"] = g["dsVendedor"].astype(str).str.strip()
+    if canales:
+        cs = {str(c).strip() for c in canales}
+        g = g[g["dsCanalMkt"].isin(cs)]
+    g = g.groupby(["dsCanalMkt", "dsVendedor"], as_index=False)["kilos"].sum()
+    g = g[g["kilos"] > 0]
+    if g.empty:
+        return pas_def, tot_def, False
+
+    mixto = any(
+        dias_facturacion_vendedor(c, v) is not None
+        for c, v in g[["dsCanalMkt", "dsVendedor"]].itertuples(index=False, name=None)
+    )
+    dias = [dias_venta(c, v, desde, corte, hasta, feriados=feriados)
+            for c, v in g[["dsCanalMkt", "dsVendedor"]].itertuples(index=False, name=None)]
+    peso = g["kilos"].to_numpy(dtype="float64")
+    total_peso = float(peso.sum())
+    if total_peso <= 0:
+        return pas_def, tot_def, mixto
+
+    pas = sum(p * w for (p, _), w in zip(dias, peso)) / total_peso
+    tot = sum(t * w for (_, t), w in zip(dias, peso)) / total_peso
+    return int(round(pas)), max(int(round(tot)), 1), mixto
+
+
+def seguimiento_metas(df_mes, metas, anio_mes, dias_pasados=None,
+                      dias_totales=None, df_mes_anterior=None, canales=None,
+                      nivel="proveedor", tipo="objetivo",
+                      desde=None, corte=None, hasta=None, feriados=None):
+    """Arma la tabla de seguimiento: objetivo vs. avance real, con proyección
+    a fin de mes, alcance % y comparación contra el mes anterior.
+
+    - `df_mes`: ventas del mes de la meta (SIN los filtros globales, para que
+      el seguimiento sea siempre el del canal completo).
+    - `metas`: salida de cargar_metas() (se filtra por anio_mes/tipo/nivel acá).
+    - `nivel`: 'canal', 'proveedor' o 'vendedor'. Define contra qué grano de
+      ventas se compara la meta. El default es 'proveedor' para no romper a
+      quien ya llamaba esta función con la firma vieja.
+    - `desde` / `corte` / `hasta`: primer día del mes, último día CON datos y
+      último día del mes. Si los tres vienen, la proyección se calcula
+      vendedor por vendedor (Food Service contra sus días de facturación, el
+      resto contra días hábiles) y se agrega al nivel pedido. Es la forma
+      correcta y la que usa el tablero.
+    - `dias_pasados` / `dias_totales`: modo viejo, un único factor global
+      (avance / dias_pasados * dias_totales). Se usa solo como respaldo
+      cuando no se pasan las fechas. Si el mes ya cerró la proyección es el
+      avance.
+    - Devuelve TODAS las filas con meta y también las que vendieron sin meta
+      (meta 0), para que no se escape volumen del seguimiento.
+    """
+    etiqueta = METAS_ETIQUETA.get(nivel, "marca_linea")
+    llaves = ["dsCanalMkt"] + ([etiqueta] if etiqueta else [])
+    cols = llaves + ["meta_kg", "avance_kg", "proyeccion_kg", "alcance_pct",
+                     "brecha_kg", "falta_kg", "mes_ant_kg", "var_ant_pct"]
+
+    m = filtrar_metas(metas, anio_mes=anio_mes, tipo=tipo, nivel=nivel)
+    m = (m[llaves + ["meta_kg"]] if not m.empty
+         else pd.DataFrame(columns=llaves + ["meta_kg"]))
+
+    real = _kilos_por_nivel(df_mes, nivel).rename(columns={"kilos": "avance_kg"})
+    prev = _kilos_por_nivel(df_mes_anterior, nivel).rename(
+        columns={"kilos": "mes_ant_kg"})
+
+    t = m.merge(real, on=llaves, how="outer")
+    t = t.merge(prev, on=llaves, how="left")
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+
+    if canales:
+        canales = {str(c).strip() for c in canales}
+        t = t[t["dsCanalMkt"].astype(str).str.strip().isin(canales)]
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+
+    for c in ["meta_kg", "avance_kg", "mes_ant_kg"]:
+        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0.0)
+
+    proy = None
+    if desde is not None and corte is not None and hasta is not None:
+        p = _proyeccion_por_nivel(df_mes, nivel, desde, corte, hasta,
+                                  feriados=feriados)
+        if not p.empty:
+            proy = p
+
+    if proy is not None:
+        for c in llaves:
+            t[c] = t[c].astype(str).str.strip()
+        t = t.merge(proy, on=llaves, how="left")
+        # Las filas con meta pero sin ventas no aparecen en la proyección:
+        # su avance es 0 y proyectan 0.
+        t["proyeccion_kg"] = pd.to_numeric(
+            t["proyeccion_kg"], errors="coerce").fillna(t["avance_kg"])
+    else:
+        dp_ = float(dias_pasados or 0)
+        dt_ = float(dias_totales or 0)
+        if dp_ > 0 and dt_ > 0 and dp_ < dt_:
+            t["proyeccion_kg"] = t["avance_kg"] / dp_ * dt_
+        else:
+            t["proyeccion_kg"] = t["avance_kg"]
+
+    t["alcance_pct"] = np.where(
+        t["meta_kg"] > 0, t["proyeccion_kg"] / t["meta_kg"] * 100, np.nan)
+    t["brecha_kg"] = t["proyeccion_kg"] - t["meta_kg"]
+    t["falta_kg"] = (t["meta_kg"] - t["avance_kg"]).clip(lower=0)
+    t["var_ant_pct"] = np.where(
+        t["mes_ant_kg"] > 0, (t["avance_kg"] / t["mes_ant_kg"] - 1) * 100, np.nan)
+
+    return (t[cols]
+            .sort_values(["meta_kg", "avance_kg"], ascending=False)
+            .reset_index(drop=True))
+
+
+# --- Controles de consistencia entre niveles -------------------------------
+# La idea es que haya una lógica detrás de los números y no campos sueltos:
+# lo que se abre por proveedor y lo que se reparte entre vendedores tiene que
+# cerrar contra el total del canal. El sistema AVISA, no bloquea: hay que
+# poder guardar a medio cargar y seguir mañana.
+
+VALIDACION_COLS = ["control", "esperado_kg", "cargado_kg", "dif_kg", "dif_pct",
+                   "estado", "detalle"]
+
+
+def validar_metas(metas, anio_mes, canal, tipo="objetivo", tolerancia_pct=0.5,
+                  comparar_presupuesto=True):
+    """Chequea que la apertura de un canal cierre contra su total.
+
+    Controles:
+      1. Σ objetivos de proveedores  vs. objetivo del canal.
+      2. Σ objetivos de vendedores   vs. objetivo del canal.
+      3. Objetivo del mes            vs. presupuesto anual de ese mes
+         (informativo: el objetivo mensual PUEDE desviarse del presupuesto,
+         justamente porque se ajusta a la realidad reciente).
+
+    `tolerancia_pct` es sobre el total del canal: diferencias de redondeo por
+    debajo de eso no se marcan. Devuelve un DataFrame con una fila por control.
+    """
+    filas = []
+    m = filtrar_metas(metas, anio_mes=anio_mes, canal=canal)
+
+    tot_canal = total_meta(m, anio_mes, tipo, "canal", canal)
+    tot_prov = total_meta(m, anio_mes, tipo, "proveedor", canal)
+    tot_vend = total_meta(m, anio_mes, tipo, "vendedor", canal)
+
+    tol = max(abs(tot_canal) * float(tolerancia_pct) / 100.0, 1.0)
+
+    def _fila(control, esperado, cargado, detalle_ok, detalle_mal,
+              detalle_falta):
+        if esperado <= 0:
+            return {
+                "control": control, "esperado_kg": esperado,
+                "cargado_kg": cargado, "dif_kg": np.nan, "dif_pct": np.nan,
+                "estado": "falta", "detalle": detalle_falta,
+            }
+        dif = cargado - esperado
+        pct = dif / esperado * 100 if esperado else np.nan
+        ok = abs(dif) <= tol
+        return {
+            "control": control, "esperado_kg": esperado, "cargado_kg": cargado,
+            "dif_kg": dif, "dif_pct": pct,
+            "estado": "ok" if ok else "aviso",
+            "detalle": detalle_ok if ok else detalle_mal.format(
+                dif=abs(dif), pct=abs(pct),
+                signo="de más" if dif > 0 else "de menos"),
+        }
+
+    filas.append(_fila(
+        "Σ proveedores vs. objetivo del canal", tot_canal, tot_prov,
+        "La apertura por proveedor cierra contra el total del canal.",
+        "La apertura por proveedor da {dif:,.0f} kg {signo} ({pct:,.1f}%) "
+        "que el objetivo del canal.",
+        "Todavía no se cargó el objetivo total del canal, así que no hay "
+        "contra qué validar la apertura por proveedor.",
+    ))
+    filas.append(_fila(
+        "Σ vendedores vs. objetivo del canal", tot_canal, tot_vend,
+        "El reparto entre vendedores cierra contra el total del canal.",
+        "El reparto entre vendedores da {dif:,.0f} kg {signo} ({pct:,.1f}%) "
+        "que el objetivo del canal.",
+        "Todavía no se cargó el objetivo total del canal, así que no hay "
+        "contra qué validar el reparto entre vendedores.",
+    ))
+
+    # Aviso extra: hay total de canal pero ninguna apertura cargada.
+    if tot_canal > 0 and tot_prov == 0:
+        filas[0]["estado"] = "falta"
+        filas[0]["detalle"] = ("El canal tiene objetivo pero no está abierto "
+                               "por proveedor.")
+    if tot_canal > 0 and tot_vend == 0:
+        filas[1]["estado"] = "falta"
+        filas[1]["detalle"] = ("El canal tiene objetivo pero no está repartido "
+                               "entre los vendedores.")
+
+    if comparar_presupuesto and tipo == "objetivo":
+        pres = total_meta(m, anio_mes, "presupuesto", "canal", canal)
+        if pres > 0 and tot_canal > 0:
+            dif = tot_canal - pres
+            pct = dif / pres * 100
+            filas.append({
+                "control": "Objetivo del mes vs. presupuesto anual",
+                "esperado_kg": pres, "cargado_kg": tot_canal,
+                "dif_kg": dif, "dif_pct": pct, "estado": "info",
+                "detalle": (
+                    f"El objetivo del mes está {abs(pct):,.1f}% "
+                    f"{'por encima' if dif > 0 else 'por debajo'} del "
+                    "presupuesto. No es un error: el objetivo mensual se "
+                    "ajusta a la realidad del negocio."),
+            })
+        elif tot_canal > 0:
+            filas.append({
+                "control": "Objetivo del mes vs. presupuesto anual",
+                "esperado_kg": 0.0, "cargado_kg": tot_canal,
+                "dif_kg": np.nan, "dif_pct": np.nan, "estado": "falta",
+                "detalle": "No hay presupuesto anual cargado para este mes.",
+            })
+
+    return pd.DataFrame(filas, columns=VALIDACION_COLS)
+
+
+def icono_validacion(estado):
+    """Ícono del panel de controles de consistencia."""
+    return {"ok": "✅", "aviso": "⚠️", "falta": "🔸", "info": "ℹ️"}.get(estado, "·")
+
+
+def semaforo(alcance_pct, verde=100.0, amarillo=90.0):
+    """Color del alcance proyectado: verde si llega a la meta, amarillo si
+    queda cerca, rojo si está lejos. Sin meta cargada -> gris."""
+    if alcance_pct is None or (isinstance(alcance_pct, float) and np.isnan(alcance_pct)):
+        return "⚪"
+    if alcance_pct >= verde:
+        return "🟢"
+    if alcance_pct >= amarillo:
+        return "🟡"
+    return "🔴"
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import time
 import calendar
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -76,6 +77,16 @@ st.markdown(
       }
       /* Subtítulos */
       h3{color:#cbd5e1; font-weight:600; letter-spacing:-.2px;}
+      /* Los objetivos se tipean, no se suben de a pasos: sacamos los botones
+         − / + del number_input (subir 95.000 kg de a 1.000 no tiene sentido).
+         Se cubren los test-id nuevos y las clases viejas por si cambia la
+         versión de Streamlit. El input sigue aceptando las flechas del
+         teclado. */
+      [data-testid="stNumberInputStepUp"],
+      [data-testid="stNumberInputStepDown"],
+      [data-testid="stNumberInput"] button{
+        display:none !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -554,16 +565,69 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
 # números y anchos de columna razonables. Las tablas que reciben ya vienen
 # renombradas y filtradas por rol (sin CM para supervisores).
 
-def _excel_bytes(hojas):
-    """hojas: dict {nombre_hoja: DataFrame} -> bytes de un .xlsx."""
+# Formatos numéricos de Excel (el separador de miles/decimales lo resuelve
+# Excel según la configuración regional del usuario: con locale es-AR queda
+# "$ 1.234.567", "12,5 %" y "1.234.567").
+XL_MONEY = '"$" #,##0'          # plata: signo $ y sin decimales
+XL_PCT = '#,##0.0"%"'           # porcentaje: 1 decimal (valores ya en 0-100)
+XL_KG = '#,##0'                 # kilos: punto de miles, sin decimales
+XL_INT = '#,##0'
+XL_DEC1 = '#,##0.0'
+
+# Columnas de plata que no se detectan por el nombre (no llevan "$").
+_COLS_MONEY = {
+    "Facturación", "Facturación neta", "Contribución",
+    "Contribución marginal", "Ajuste aplicado", "Monetario",
+}
+
+
+def _formato_col(nombre, serie):
+    """Devuelve el number_format de Excel según el nombre de la columna.
+
+    Reglas: todo lo que sea plata va con "$" y sin decimales; todo lo que sea
+    porcentaje con "%" y 1 decimal; los kilos con punto de miles."""
+    n = str(nombre).strip()
+    bajo = n.lower()
+    if "%" in n:
+        return XL_PCT
+    if (n in _COLS_MONEY or "$" in n or bajo.startswith("facturación")
+            or bajo.startswith("contribución") or bajo.startswith("ajuste")
+            or bajo.startswith("precio") or bajo.startswith("ticket")):
+        return XL_MONEY
+    if bajo.startswith("kilos") or "(kg)" in bajo or bajo.endswith(" kg"):
+        return XL_KG
+    if pd.api.types.is_integer_dtype(serie):
+        return XL_INT
+    # Conteos que quedaron como float (clientes, SKUs, compras...): sin
+    # decimales, pero igual con separador de miles.
+    try:
+        s = pd.to_numeric(serie, errors="coerce").dropna()
+        if len(s) and (s % 1 == 0).all():
+            return XL_INT
+    except (TypeError, ValueError):
+        pass
+    return XL_DEC1
+
+
+def _excel_bytes(hojas, formatos=None):
+    """hojas: dict {nombre_hoja: DataFrame} -> bytes de un .xlsx.
+
+    formatos: dict opcional {nombre_hoja: spec} para forzar el formato cuando
+    el nombre de la columna no alcanza para deducirlo. `spec` puede ser un
+    number_format (se aplica a todas las columnas numéricas de la hoja, ej. la
+    pivote por mes) o un dict {columna: number_format}; el valor por columna
+    puede además ser una lista con un formato por fila (ej. la hoja KPIs, que
+    mezcla plata, kilos y % en la misma columna)."""
     from openpyxl.utils import get_column_letter
 
+    formatos = formatos or {}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for nombre, t in hojas.items():
             if t is None or len(t) == 0:
                 continue
             nombre = str(nombre)[:31]  # límite de Excel
+            spec = formatos.get(nombre)
             t.to_excel(w, sheet_name=nombre, index=False)
             ws = w.sheets[nombre]
             for i, c in enumerate(t.columns, 1):
@@ -582,17 +646,39 @@ def _excel_bytes(hojas):
                 ws.column_dimensions[letra].width = (
                     min(max(ancho + 2, 10), 45)
                 )
+                # Números: $ sin decimales / % con 1 decimal / kg con miles.
+                if not pd.api.types.is_numeric_dtype(t[c]):
+                    continue
+                if pd.api.types.is_bool_dtype(t[c]):
+                    continue
+                fmt = spec if isinstance(spec, str) else (
+                    spec.get(c) if isinstance(spec, dict) else None
+                )
+                if fmt is None:
+                    fmt = _formato_col(c, t[c])
+                if isinstance(fmt, (list, tuple)):
+                    # Un formato por fila (columna con métricas mezcladas).
+                    for celda, f in zip(ws[letra][1:], fmt):
+                        if f:
+                            celda.number_format = f
+                else:
+                    for celda in ws[letra][1:]:
+                        celda.number_format = fmt
+                # Con $ y separadores el texto ocupa más: un poco más de ancho.
+                ws.column_dimensions[letra].width = max(
+                    ws.column_dimensions[letra].width, 13
+                )
     return buf.getvalue()
 
 
-def boton_excel(nombre, hojas, key):
+def boton_excel(nombre, hojas, key, formatos=None):
     """Botón de descarga de un .xlsx con las tablas de la solapa."""
     hojas = {n: t for n, t in hojas.items() if t is not None and len(t)}
     if not hojas:
         return
     st.download_button(
         "Descargar Excel",
-        data=_excel_bytes(hojas),
+        data=_excel_bytes(hojas, formatos),
         file_name=f"{nombre}_{desde:%Y-%m-%d}_a_{hasta:%Y-%m-%d}.xlsx",
         mime=("application/vnd.openxmlformats-officedocument"
               ".spreadsheetml.sheet"),
@@ -836,14 +922,14 @@ def render_drill(df_base, niveles, key, root_id=None):
 # La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
 # (los supervisores no ven CM). Se arma la lista de tabs según el rol.
 _labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
-                "Clientes (RFM)", "Vendedores", "Alertas"]
+                "Clientes (RFM)", "Vendedores", "Alertas", "Metas"]
 if mostrar_cm:
     _labels_tabs.append("Acuerdos McCain")
 
 _tabs = st.tabs(_labels_tabs)
 (tab_resumen, tab_lineas, tab_canales, tab_prod, tab_clientes,
- tab_vend, tab_alertas) = _tabs[:7]
-tab_acuerdos = _tabs[7] if mostrar_cm else None
+ tab_vend, tab_alertas, tab_metas) = _tabs[:8]
+tab_acuerdos = _tabs[8] if mostrar_cm else None
 
 
 # --- TAB RESUMEN ----------------------------------------------------------
@@ -851,33 +937,28 @@ with tab_resumen:
     m = dp.metricas_generales(df)
 
     # --- Proyección a fin de mes ------------------------------------------
-    # Run-rate lineal: extrapola lo acumulado hasta hoy al total del mes,
-    # usando el ritmo diario promedio. Cuenta solo días HÁBILES: los domingos
-    # no se trabaja, así que no entran ni en los transcurridos ni en el total.
-    # Tampoco cuentan los feriados listados en FERIADOS (no se factura).
+    # Run-rate lineal: extrapola lo acumulado hasta hoy al total del mes.
+    # El factor NO es único para todos: se calcula por vendedor y se pondera,
+    # porque Food Service factura solo dos a cuatro días fijos por semana
+    # (ver dp.DIAS_FACTURACION) y proyectarlo contra días hábiles lo
+    # distorsiona. Para el resto de los canales cuenta días hábiles: los
+    # domingos no se trabaja y los feriados de FERIADOS tampoco.
+    # Es el mismo criterio que usa el seguimiento de metas, así que los dos
+    # números del tablero cierran entre sí.
     # Solo aplica al mes EN CURSO; los meses cerrados ya están completos.
     # TODO: por ahora sólo el 9 de julio; ampliar con el resto o una API.
     FERIADOS = {dt.date(2026, 7, 9)}
 
-    def _dias_habiles(anio, mes, hasta_dia):
-        """Días hábiles del 1 al hasta_dia (inclusive): no domingos ni feriados."""
-        return sum(
-            1 for d in range(1, hasta_dia + 1)
-            if dt.date(anio, mes, d).weekday() != 6  # 6 = domingo
-            and dt.date(anio, mes, d) not in FERIADOS
-        )
-
     factor = 1.0
     proyectar = False
     if es_mes_actual:
-        total_dias = calendar.monthrange(hasta.year, hasta.month)[1]
-        ult = df["fechaComprobate"].max()
-        dia_ult = ult.day if pd.notna(ult) else hasta.day
-        hab_mes = _dias_habiles(hasta.year, hasta.month, total_dias)
-        hab_trans = _dias_habiles(hasta.year, hasta.month, dia_ult)
-        if hab_trans and hab_trans < hab_mes:
-            factor = hab_mes / hab_trans
-            proyectar = True
+        _ini_mes = dt.date(hasta.year, hasta.month, 1)
+        _fin_mes = dt.date(hasta.year, hasta.month,
+                           calendar.monthrange(hasta.year, hasta.month)[1])
+        _ult = df["fechaComprobate"].max()
+        _corte_res = _ult.date() if pd.notna(_ult) else hasta
+        factor, proyectar = dp.factor_proyeccion_ponderado(
+            df, _ini_mes, _corte_res, _fin_mes, feriados=FERIADOS)
 
     def proy(col, valor, fmt, escala=True):
         """Muestra debajo de la métrica la proyección a fin de mes.
@@ -925,6 +1006,13 @@ with tab_resumen:
         [(lbl, pval) for lbl, _disp, pval, _pf, _e in metricas],
         columns=["Métrica", "Valor"],
     )}
+    # "Valor" mezcla plata, kilos, % y conteos: el formato va fila por fila,
+    # deducido de la función de formato con la que se muestra cada métrica.
+    _XL_POR_FMT = {fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
+                   _int: XL_INT}
+    formatos_resumen = {"KPIs": {"Valor": [
+        _XL_POR_FMT.get(_pf, XL_DEC1) for _l, _d, _v, _pf, _e in metricas
+    ]}}
 
     # Render en filas de 4 columnas.
     for i in range(0, len(metricas), 4):
@@ -1106,9 +1194,16 @@ with tab_resumen:
                     piv.style.format(_fmt), use_container_width=True
                 )
                 hojas_resumen["Evolución mensual"] = piv.reset_index()
+                # Las columnas de la pivote son meses ("2026-01"): el formato
+                # no se puede deducir del nombre, lo define la métrica elegida.
+                fmt_evol = {
+                    fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
+                }.get(_fmt, XL_DEC1)
+                formatos_resumen["Evolución mensual"] = fmt_evol
 
     st.divider()
-    boton_excel("resumen", hojas_resumen, key="xlsx_resumen")
+    boton_excel("resumen", hojas_resumen, key="xlsx_resumen",
+                formatos=formatos_resumen)
 
 
 # --- TAB LÍNEAS (gestión comercial por línea / marca) ----------------------
@@ -1596,6 +1691,818 @@ with tab_alertas:
                 columns={"nivel": "Nivel", "texto": "Alerta"})},
             key="xlsx_alertas",
         )
+
+
+# --- TAB METAS ------------------------------------------------------------
+# Reemplaza los Excel de "Cierre / Meta" que se armaban a mano cada mes.
+#
+# ESTRUCTURA (definida con la gestión comercial): se planifica empezando por
+# el CANAL, porque cada supervisor responde por el rendimiento de su canal.
+# Después se abre por proveedor/línea y se reparte entre vendedores:
+#
+#     canal  →  proveedor / línea  →  vendedor
+#
+# El total del canal se carga a mano (no se deriva de la suma) justamente
+# para poder validar que la apertura cierre contra él. Ver validar_metas().
+#
+# Además se distingue el PRESUPUESTO ANUAL (lo que se estimó a principio de
+# año, línea base fija) del OBJETIVO MENSUAL (meta de corto plazo, que se
+# reajusta según la realidad reciente: si julio vendió de más porque los
+# clientes adelantaron compras, agosto baja). El historial de cargas deja ver
+# ese reajuste en vez de perder el número original.
+#
+# OJO: esta solapa usa el dataset COMPLETO del mes de la meta, NO el `df`
+# filtrado de arriba. Si el seguimiento respetara los filtros globales, el
+# avance se compararía contra un objetivo que sí es del canal entero y los
+# porcentajes darían cualquier cosa.
+with tab_metas:
+    st.subheader("Metas de venta en kilos")
+
+    _df_full_metas = cargar_datos_local(
+        os.path.getmtime(PARQUET_PATH), _mtime_acuerdos()
+    )
+    _fecha_full = _df_full_metas["fechaComprobate"]
+    _canales_todos = sorted(
+        _df_full_metas["dsCanalMkt"].dropna().astype(str).str.strip()
+        .replace({"": None}).dropna().unique().tolist()
+    )
+
+    _msg_metas = st.session_state.pop("_metas_ok", None)
+    if _msg_metas:
+        st.success(_msg_metas)
+
+    # --- Mes de la meta ------------------------------------------------
+    # Se ofrecen los meses con datos + el mes siguiente al último, para poder
+    # dejar cargada la meta del mes que arranca antes de que haya ventas.
+    _hoy = dt.date.today()
+
+    def _mes_siguiente(anio_mes):
+        a, m = map(int, str(anio_mes).split("-"))
+        return f"{a + 1}-01" if m == 12 else f"{a}-{m + 1:02d}"
+
+    def _mes_anterior(anio_mes):
+        a, m = map(int, str(anio_mes).split("-"))
+        return f"{a - 1}-12" if m == 1 else f"{a}-{m - 1:02d}"
+
+    _meses_meta = list(_meses_disp)
+    _prox = _mes_siguiente(_meses_disp[0])
+    if _prox not in _meses_meta:
+        _meses_meta = [_prox] + _meses_meta
+
+    c_mes, c_can = st.columns(2)
+    _idx_mes = _meses_meta.index(mes_sel) if mes_sel in _meses_meta else 0
+    mes_meta = c_mes.selectbox(
+        "Mes de la meta", _meses_meta, index=_idx_mes,
+        format_func=lambda m: etiqueta_mes(m) + (
+            " · a cargar" if m not in _meses_disp else ""),
+        key="metas_mes",
+        help="Podés cargar la meta del mes que viene antes de que empiece.",
+    )
+    canal_meta = c_can.selectbox(
+        "Canal", ["TODOS"] + _canales_todos, key="metas_canal",
+        help="Las metas se cargan por canal: es el punto de partida de la "
+             "planificación y de quién responde por el número.",
+    )
+    _canales_vista = _canales_todos if canal_meta == "TODOS" else [canal_meta]
+
+    # --- Días de venta (base de la proyección) --------------------------
+    _desde_m, _ = rango_mes(mes_meta, _hoy)
+    _ult_dia_m = dt.date(
+        int(mes_meta[:4]), int(mes_meta[5:7]),
+        calendar.monthrange(int(mes_meta[:4]), int(mes_meta[5:7]))[1],
+    )
+    # Corte real: última fecha CON datos del mes (no "hoy"), igual que el
+    # filtro de período de arriba.
+    _mask_mes = (_fecha_full >= pd.Timestamp(_desde_m)) & (
+        _fecha_full < pd.Timestamp(_ult_dia_m) + pd.Timedelta(days=1))
+    _df_mes_meta = _df_full_metas[_mask_mes].copy()
+    _corte = _df_mes_meta["fechaComprobate"].max()
+    _corte = _corte.date() if pd.notna(_corte) else _desde_m
+
+    # Días de venta. Se calculan solos y no se muestran como controles: son el
+    # motor de la proyección a fin de mes, no algo para configurar.
+    #
+    # La proyección real se hace VENDEDOR POR VENDEDOR dentro de
+    # dp.seguimiento_metas(): Food Service factura solo dos a cuatro días fijos
+    # por semana y proyectarlo contra días hábiles lo distorsiona. Los números
+    # de acá son el promedio ponderado por kilos de lo que se está mirando, y
+    # se usan únicamente para los textos ("día 6 de 13 de venta", ritmo diario
+    # necesario). Con canales que facturan todos los días dan exactamente
+    # dias_habiles(), igual que antes.
+    dias_pas, dias_tot, _dias_mixto = dp.dias_venta_resumen(
+        _df_mes_meta, _desde_m, _corte, _ult_dia_m, canales=_canales_vista)
+
+    # Mes anterior (para comparar contra la realidad reciente)
+    _mes_prev = _mes_anterior(mes_meta)
+    _desde_p, _ = rango_mes(_mes_prev, _hoy)
+    _ult_p = dt.date(
+        int(_mes_prev[:4]), int(_mes_prev[5:7]),
+        calendar.monthrange(int(_mes_prev[:4]), int(_mes_prev[5:7]))[1],
+    )
+    _df_mes_prev = _df_full_metas[
+        (_fecha_full >= pd.Timestamp(_desde_p))
+        & (_fecha_full < pd.Timestamp(_ult_p) + pd.Timedelta(days=1))
+    ].copy()
+
+    _metas_all = dp.cargar_metas()
+    _hist_all = dp.cargar_historial_metas()
+    _cerrado = dias_pas >= dias_tot
+
+    st.caption(
+        f"Seguimiento al {_corte:%d/%m/%Y} · "
+        + ("mes cerrado" if _cerrado
+           else f"día {dias_pas} de {dias_tot} de venta")
+        + f" · comparación contra {etiqueta_mes(_mes_prev)}. "
+        "Esta solapa ignora los filtros de arriba: el objetivo es del canal "
+        "completo, así que el avance también."
+        + (" En Food Service cada vendedor se proyecta contra sus días de "
+           "facturación, no contra días hábiles: los días que se muestran "
+           "acá son el promedio ponderado por kilos." if _dias_mixto else "")
+    )
+
+    # Aviso, no bloqueo: los vendedores de Food sin días declarados proyectan
+    # con días hábiles (lunes a sábado), que es el criterio viejo.
+    _sin_dias = dp.vendedores_sin_dias_facturacion(
+        _df_mes_meta[_df_mes_meta["dsCanalMkt"].astype(str).str.strip()
+                     .isin(_canales_vista)]
+        if "dsCanalMkt" in _df_mes_meta.columns else _df_mes_meta)
+    if _sin_dias:
+        st.caption(
+            "🔸 Sin días de facturación declarados (proyectan con días "
+            "hábiles): " + ", ".join(_sin_dias) + "."
+        )
+
+    _NIVEL_LBL = {"Canal": "canal", "Proveedor / línea": "proveedor",
+                  "Vendedor": "vendedor"}
+    _COL_NIVEL = {"canal": None, "proveedor": "marca_linea",
+                  "vendedor": "dsVendedor"}
+
+    sub_seg, sub_carga, sub_pres = st.tabs(
+        ["Seguimiento", "Cargar objetivos", "Presupuesto anual"])
+
+    # =====================================================================
+    # SEGUIMIENTO
+    # =====================================================================
+    with sub_seg:
+        _nivel_lbl = st.radio(
+            "Abrir por", list(_NIVEL_LBL.keys()), horizontal=True,
+            key="metas_nivel_seg",
+            help="El objetivo del canal es el que manda. Proveedor y vendedor "
+                 "son su apertura: los tres deberían cerrar entre sí.",
+        )
+        _nivel = _NIVEL_LBL[_nivel_lbl]
+        _col_niv = _COL_NIVEL[_nivel]
+
+        # El seguimiento del canal se calcula siempre: es la base de los KPIs.
+        # El avance real de un canal es el mismo mire uno el nivel que mire,
+        # así que los KPI de arriba no cambian al cambiar de apertura.
+        _seg_canal = dp.seguimiento_metas(
+            _df_mes_meta, _metas_all, mes_meta,
+            dias_pasados=dias_pas, dias_totales=dias_tot,
+            df_mes_anterior=_df_mes_prev, canales=_canales_vista,
+            nivel="canal",
+            desde=_desde_m, corte=_corte, hasta=_ult_dia_m,
+        )
+        _seg = _seg_canal if _nivel == "canal" else dp.seguimiento_metas(
+            _df_mes_meta, _metas_all, mes_meta,
+            dias_pasados=dias_pas, dias_totales=dias_tot,
+            df_mes_anterior=_df_mes_prev, canales=_canales_vista,
+            nivel=_nivel,
+            desde=_desde_m, corte=_corte, hasta=_ult_dia_m,
+        )
+
+        _obj_canal = float(_seg_canal["meta_kg"].sum()) if not _seg_canal.empty else 0.0
+        _obj_nivel = float(_seg["meta_kg"].sum()) if not _seg.empty else 0.0
+        # Si todavía no se cargó el total del canal, se cae a la suma del nivel
+        # que se está mirando para no dejar la solapa muda.
+        _obj = _obj_canal if _obj_canal > 0 else _obj_nivel
+        _av = float(_seg_canal["avance_kg"].sum()) if not _seg_canal.empty else 0.0
+        _proy = float(_seg_canal["proyeccion_kg"].sum()) if not _seg_canal.empty else 0.0
+        _prev_kg = float(_seg_canal["mes_ant_kg"].sum()) if not _seg_canal.empty else 0.0
+
+        if _obj <= 0:
+            st.info(
+                f"Todavía no hay objetivos cargados para {etiqueta_mes(mes_meta)}"
+                + (f" en {canal_meta}." if canal_meta != "TODOS" else ".")
+                + " Cargalos en la solapa **Cargar objetivos**."
+            )
+        else:
+            _alc = _proy / _obj * 100 if _obj else 0
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric(
+                "Objetivo del mes", fmt_kg(_obj),
+                help=("Total cargado a nivel canal."
+                      if _obj_canal > 0 else
+                      "Todavía no se cargó el total del canal: se está "
+                      f"mostrando la suma del nivel {_nivel_lbl.lower()}."),
+            )
+            k2.metric(
+                "Avance real", fmt_kg(_av),
+                delta=f"{_av / _obj * 100:,.0f}% del objetivo".replace(",", ".")
+                if _obj else None, delta_color="off",
+            )
+            k3.metric(
+                "Proyección a fin de mes", fmt_kg(_proy),
+                delta=fmt_kg(_proy - _obj) + " vs objetivo",
+                delta_color="normal",
+                help=("Cómo va a cerrar el mes si se mantiene el ritmo actual. "
+                      "Se calcula vendedor por vendedor —avance ÷ días de "
+                      "venta transcurridos × días del mes— y se suma: en Food "
+                      "Service cada vendedor cuenta sus días de facturación "
+                      "(factura dos a cuatro días fijos por semana), en el "
+                      "resto de los canales son días hábiles de lunes a "
+                      f"sábado. En promedio, día {dias_pas} de {dias_tot}."
+                      if not _cerrado else
+                      "El mes ya cerró: la proyección es el kilaje real."),
+            )
+            k4.metric(
+                "Alcance proyectado", f"{_alc:,.1f} %".replace(",", "."),
+                delta=(f"{(_av / _prev_kg - 1) * 100:+,.1f}% vs {etiqueta_mes(_mes_prev)}"
+                       .replace(",", ".")) if _prev_kg else None,
+                delta_color="normal",
+            )
+
+            _falta = max(_obj - _av, 0.0)
+            _dias_rest = max(dias_tot - dias_pas, 0)
+            if _falta > 0 and _dias_rest > 0:
+                # En Food el "día" que queda es un día de facturación, que es
+                # el que importa: no sirve saber cuántos kg/día hacen falta si
+                # el vendedor solo factura lunes y jueves.
+                _uni, _unis = (("día de facturación", "días de facturación")
+                               if _dias_mixto else ("día", "días de venta"))
+                st.caption(
+                    f"Faltan **{fmt_kg(_falta)}** para llegar al objetivo: "
+                    f"**{fmt_kg(_falta / _dias_rest)}/{_uni}** en los "
+                    f"{_dias_rest} {_unis} que quedan."
+                )
+            elif _falta <= 0:
+                st.caption("Objetivo del mes ya cubierto con las ventas reales.")
+            else:
+                st.caption(
+                    f"El mes cerró **{fmt_kg(_obj - _av)}** por debajo del objetivo."
+                )
+
+            # --- Controles de consistencia --------------------------------
+            # No bloquean nada: avisan. La idea es que haya una lógica detrás
+            # de los números y no campos sueltos donde cargar valores.
+            _vals = []
+            for _c in _canales_vista:
+                _v = dp.validar_metas(_metas_all, mes_meta, _c)
+                if not _v.empty:
+                    _v.insert(0, "Canal", _c)
+                    _vals.append(_v)
+            _val = pd.concat(_vals, ignore_index=True) if _vals else pd.DataFrame()
+
+            if not _val.empty:
+                st.divider()
+                _n_av = int((_val["estado"] == "aviso").sum())
+                _n_falta = int((_val["estado"] == "falta").sum())
+
+                _vv = _val.copy()
+                _vv.insert(0, "", _vv["estado"].map(dp.icono_validacion))
+                _vv = _vv.drop(columns=["estado"]).rename(columns={
+                    "control": "Control",
+                    "esperado_kg": "Esperado (kg)",
+                    "cargado_kg": "Cargado (kg)",
+                    "dif_kg": "Diferencia (kg)",
+                    "dif_pct": "Dif. %",
+                    "detalle": "Detalle",
+                })
+                if canal_meta != "TODOS":
+                    _vv = _vv.drop(columns=["Canal"])
+
+                _cfg_val = {
+                    "": st.column_config.TextColumn(width="small"),
+                    "Esperado (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Cargado (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Diferencia (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Dif. %": st.column_config.NumberColumn(format="%.1f %%"),
+                    "Detalle": st.column_config.TextColumn(width="large"),
+                }
+
+                if canal_meta == "TODOS":
+                    _resumen = (
+                        f"{_n_av} desvío(s) y {_n_falta} dato(s) faltante(s) "
+                        "entre todos los canales")
+                    with st.expander(f"Controles de consistencia · {_resumen}",
+                                     expanded=_n_av > 0):
+                        st.dataframe(_vv, use_container_width=True,
+                                     hide_index=True, column_config=_cfg_val)
+                else:
+                    st.markdown("#### Controles de consistencia")
+                    if _n_av:
+                        st.warning(
+                            f"{_n_av} control(es) no cierran. Los objetivos "
+                            "están cargados pero no suman lo mismo entre "
+                            "niveles.")
+                    elif _n_falta:
+                        st.info("Falta cargar niveles para poder validar la "
+                                "apertura completa.")
+                    else:
+                        st.success("Los objetivos cierran entre los tres niveles.")
+                    st.dataframe(_vv, use_container_width=True, hide_index=True,
+                                 column_config=_cfg_val)
+
+            st.divider()
+
+            # --- Tabla de seguimiento ----------------------------------------
+            _t = _seg.copy()
+            _t.insert(0, "sem", _t["alcance_pct"].map(dp.semaforo))
+            _vista = _t.rename(columns={
+                "sem": "",
+                "dsCanalMkt": "Canal",
+                "marca_linea": "Marca / Línea",
+                "dsVendedor": "Vendedor",
+                "meta_kg": "Objetivo (kg)",
+                "avance_kg": "Avance (kg)",
+                "proyeccion_kg": "Proyección (kg)",
+                "alcance_pct": "Alcance %",
+                "brecha_kg": "Brecha (kg)",
+                "falta_kg": "Falta (kg)",
+                "mes_ant_kg": "Mes anterior (kg)",
+                "var_ant_pct": "Var. vs mes ant. %",
+            })
+            if canal_meta != "TODOS" and _nivel != "canal":
+                _vista = _vista.drop(columns=["Canal"])
+
+            st.dataframe(
+                _vista,
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "": st.column_config.TextColumn(width="small"),
+                    "Objetivo (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Avance (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Proyección (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Alcance %": st.column_config.NumberColumn(format="%.1f %%"),
+                    "Brecha (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Falta (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Mes anterior (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Var. vs mes ant. %": st.column_config.NumberColumn(format="%.1f %%"),
+                },
+            )
+            st.caption(
+                "🟢 proyecta llegar al objetivo · 🟡 entre 90% y 100% · "
+                "🔴 por debajo del 90% · ⚪ vendió sin meta cargada."
+            )
+
+            # Resumen por canal (solo tiene sentido en la vista consolidada)
+            if (canal_meta == "TODOS" and _nivel != "canal"
+                    and _seg["dsCanalMkt"].nunique() > 1):
+                with st.expander("Resumen por canal"):
+                    _porc = (
+                        _seg.groupby("dsCanalMkt", as_index=False)
+                        .agg(meta_kg=("meta_kg", "sum"),
+                             avance_kg=("avance_kg", "sum"),
+                             proyeccion_kg=("proyeccion_kg", "sum"),
+                             mes_ant_kg=("mes_ant_kg", "sum"))
+                    )
+                    _porc["alcance_pct"] = np.where(
+                        _porc["meta_kg"] > 0,
+                        _porc["proyeccion_kg"] / _porc["meta_kg"] * 100, np.nan)
+                    _porc.insert(0, "sem", _porc["alcance_pct"].map(dp.semaforo))
+                    st.dataframe(
+                        _porc.rename(columns={
+                            "sem": "", "dsCanalMkt": "Canal",
+                            "meta_kg": "Objetivo (kg)", "avance_kg": "Avance (kg)",
+                            "proyeccion_kg": "Proyección (kg)",
+                            "alcance_pct": "Alcance %",
+                            "mes_ant_kg": "Mes anterior (kg)"}),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            _hojas = {"Seguimiento de metas": _vista}
+            if not _val.empty:
+                _hojas["Controles"] = _vv
+            boton_excel("metas", _hojas, key="xlsx_metas")
+
+    # =====================================================================
+    # CARGA DE OBJETIVOS (canal → proveedor → vendedor)
+    # =====================================================================
+    with sub_carga:
+        if canal_meta == "TODOS":
+            st.info(
+                "Elegí un canal arriba para cargar los objetivos. Se editan de "
+                "a un canal por vez para no pisar lo que cargó otro supervisor."
+            )
+        else:
+            st.caption(
+                f"Objetivos de **{canal_meta}** para **{etiqueta_mes(mes_meta)}**, "
+                "en kilos. El orden es: primero el total del canal, después la "
+                "apertura por proveedor y el reparto entre vendedores. Cada "
+                "bloque se guarda por separado y solo pisa su propio nivel."
+            )
+
+            def _ov_caption(nivel, etiqueta):
+                """Muestra el objetivo original vs. el vigente cuando la meta se
+                reajustó durante el mes."""
+                _ov = dp.metas_original_vs_vigente(
+                    mes_meta, "objetivo", nivel, canal_meta, historial=_hist_all)
+                if _ov and _ov["n_cargas"] > 1 and abs(
+                        _ov["vigente_kg"] - _ov["original_kg"]) > 1:
+                    st.caption(
+                        f"{etiqueta}: original {fmt_kg(_ov['original_kg'])} "
+                        f"({_ov['fecha_original']:%d/%m %H:%M}) → vigente "
+                        f"{fmt_kg(_ov['vigente_kg'])} "
+                        f"({_ov['fecha_vigente']:%d/%m %H:%M}, "
+                        f"{_ov['n_cargas']} cargas)."
+                    )
+
+            # ---------------------------------------------------------------
+            # 1. Objetivo total del canal
+            # ---------------------------------------------------------------
+            st.markdown("#### 1. Objetivo total del canal")
+            _obj_canal_act = dp.total_meta(
+                _metas_all, mes_meta, "objetivo", "canal", canal_meta)
+            _pres_mes = dp.total_meta(
+                _metas_all, mes_meta, "presupuesto", "canal", canal_meta)
+            _real_prev_canal = float(
+                dp.kilos_por_canal(_df_mes_prev)
+                .query("dsCanalMkt == @canal_meta")["kilos"].sum())
+
+            cc1, cc2, cc3 = st.columns([1.6, 1, 1])
+            _nuevo_canal = cc1.number_input(
+                f"Kilos a vender en {canal_meta}",
+                min_value=0.0, step=1000.0, format="%.0f",
+                value=float(_obj_canal_act),
+                key=f"meta_canal_{mes_meta}_{canal_meta}",
+                help="Es el número por el que responde el supervisor del canal. "
+                     "La apertura por proveedor y por vendedor se valida contra "
+                     "este total.",
+            )
+            cc2.metric(
+                etiqueta_mes(_mes_prev), fmt_kg(_real_prev_canal),
+                help="Kilos que el canal vendió realmente el mes pasado. "
+                     "Referencia para dimensionar el objetivo.",
+            )
+            cc3.metric(
+                "Presupuesto del mes",
+                fmt_kg(_pres_mes) if _pres_mes > 0 else "—",
+                delta=(f"{(_nuevo_canal / _pres_mes - 1) * 100:+,.1f}%".replace(",", ".")
+                       if _pres_mes > 0 and _nuevo_canal > 0 else None),
+                delta_color="off",
+                help="Lo que se estimó a principio de año para este mes. El "
+                     "objetivo mensual puede desviarse a propósito.",
+            )
+            _ov_caption("canal", "Objetivo del canal")
+
+            if st.button("Guardar objetivo del canal", type="primary",
+                         key="btn_meta_canal"):
+                _fila = pd.DataFrame([{
+                    "anio_mes": mes_meta, "dsCanalMkt": canal_meta,
+                    "marca_linea": "", "dsVendedor": "",
+                    "meta_kg": float(_nuevo_canal),
+                }])
+                dp.upsert_metas(_fila, anio_mes=mes_meta, canales=[canal_meta],
+                                tipo="objetivo", nivel="canal")
+                st.session_state["_metas_ok"] = (
+                    f"Objetivo de {canal_meta} para {etiqueta_mes(mes_meta)}: "
+                    f"{fmt_kg(_nuevo_canal)}."
+                )
+                st.rerun()
+
+            st.divider()
+
+            # ---------------------------------------------------------------
+            # 2. Apertura por proveedor / línea
+            # ---------------------------------------------------------------
+            st.markdown("#### 2. Apertura por proveedor / línea")
+
+            # Filas base: marcas con meta cargada + las que vendieron en el mes o
+            # en el anterior. Así la grilla arranca con el universo real de marcas
+            # del canal y no hay que tipear nombres.
+            _marcas_canal = sorted(set(
+                dp.kilos_por_canal_marca(_df_mes_meta)
+                .query("dsCanalMkt == @canal_meta")["marca_linea"]
+            ) | set(
+                dp.kilos_por_canal_marca(_df_mes_prev)
+                .query("dsCanalMkt == @canal_meta")["marca_linea"]
+            ))
+            _marcas_todas = sorted(set(_marcas_canal) | set(
+                _df_full_metas["marca_linea"].dropna().astype(str).str.strip()
+                .replace({"": None}).dropna().unique().tolist()
+            ))
+
+            _cargadas = dp.filtrar_metas(
+                _metas_all, anio_mes=mes_meta, tipo="objetivo",
+                nivel="proveedor", canal=canal_meta)[["marca_linea", "meta_kg"]]
+
+            _ref = (
+                dp.kilos_por_canal_marca(_df_mes_prev)
+                .query("dsCanalMkt == @canal_meta")[["marca_linea", "kilos"]]
+                .rename(columns={"kilos": "_ref"})
+            )
+            _base = pd.DataFrame({"marca_linea": _marcas_canal})
+            _base = _base.merge(_cargadas, on="marca_linea", how="outer")
+            _base = _base.merge(_ref, on="marca_linea", how="left")
+            _base["meta_kg"] = pd.to_numeric(
+                _base["meta_kg"], errors="coerce").fillna(0.0)
+            _base["_ref"] = pd.to_numeric(_base["_ref"], errors="coerce").fillna(0.0)
+            _base = _base.sort_values(
+                ["meta_kg", "_ref"], ascending=False).reset_index(drop=True)
+
+            _col_ref = f"{etiqueta_mes(_mes_prev)} (kg)"
+            _grilla = _base.rename(columns={
+                "marca_linea": "Marca / Línea",
+                "meta_kg": "Meta (kg)",
+                "_ref": _col_ref,
+            })
+
+            _edit = st.data_editor(
+                _grilla,
+                key=f"metas_editor_prov_{mes_meta}_{canal_meta}",
+                use_container_width=True, hide_index=True, num_rows="dynamic",
+                column_config={
+                    "Marca / Línea": st.column_config.SelectboxColumn(
+                        options=_marcas_todas, required=True, width="large"),
+                    "Meta (kg)": st.column_config.NumberColumn(
+                        min_value=0.0, step=100.0, format="%.0f",
+                        help="Kilos que se quieren vender en el mes. "
+                             "Dejar en 0 borra la meta de esa marca."),
+                    _col_ref: st.column_config.NumberColumn(
+                        format="%.0f", disabled=True,
+                        help="Kilos reales del mes anterior. Referencia, no se "
+                             "guarda."),
+                },
+            )
+
+            _tot_prov = pd.to_numeric(
+                _edit["Meta (kg)"], errors="coerce").fillna(0).sum()
+            _tot_ref = pd.to_numeric(
+                _edit[_col_ref], errors="coerce").fillna(0).sum()
+
+            _p1, _p2, _p3 = st.columns([1.2, 1.2, 2])
+            _p1.metric(
+                etiqueta_mes(mes_meta), fmt_kg(_tot_prov),
+                help="Suma de la meta que estás cargando en la grilla de "
+                     "arriba, para el mes de la meta.",
+            )
+            _p2.metric(
+                etiqueta_mes(_mes_prev), fmt_kg(_tot_ref),
+                delta=(f"{(_tot_prov / _tot_ref - 1) * 100:+,.1f}%".replace(",", ".")
+                       if _tot_ref else None),
+                delta_color="off",
+                help="Kilos que estas marcas vendieron realmente el mes "
+                     "pasado. El % es cuánto más (o menos) estás pidiendo.",
+            )
+            # Control en vivo contra el total del canal, antes de guardar.
+            if _nuevo_canal > 0:
+                _dif_p = _tot_prov - _nuevo_canal
+                _p3.metric(
+                    "Diferencia vs objetivo del canal", fmt_kg(_dif_p),
+                    delta="cierra" if abs(_dif_p) <= max(_nuevo_canal * 0.005, 1)
+                    else "no cierra",
+                    delta_color="off",
+                )
+
+            if st.button("Guardar apertura por proveedor", type="primary",
+                         key="btn_guardar_metas_prov"):
+                _nuevas = _edit.rename(columns={
+                    "Marca / Línea": "marca_linea", "Meta (kg)": "meta_kg"})
+                _nuevas = _nuevas[["marca_linea", "meta_kg"]].copy()
+                _nuevas["anio_mes"] = mes_meta
+                _nuevas["dsCanalMkt"] = canal_meta
+                _nuevas["dsVendedor"] = ""
+                _guardadas = dp.upsert_metas(
+                    _nuevas, anio_mes=mes_meta, canales=[canal_meta],
+                    tipo="objetivo", nivel="proveedor")
+                _n = len(dp.filtrar_metas(
+                    _guardadas, anio_mes=mes_meta, tipo="objetivo",
+                    nivel="proveedor", canal=canal_meta))
+                st.session_state["_metas_ok"] = (
+                    f"Guardadas {_n} metas por proveedor de {canal_meta} para "
+                    f"{etiqueta_mes(mes_meta)} ({fmt_kg(_tot_prov)} en total)."
+                )
+                st.rerun()
+
+            _ov_caption("proveedor", "Apertura por proveedor")
+
+            st.divider()
+
+            # ---------------------------------------------------------------
+            # 3. Reparto entre vendedores
+            # ---------------------------------------------------------------
+            st.markdown("#### 3. Reparto entre vendedores")
+            st.caption(
+                "El objetivo del vendedor es sobre el total del canal, no por "
+                "proveedor: abrir los tres ejes a la vez da una grilla "
+                "inmanejable y el control de que la suma cierre se cumple igual."
+            )
+
+            _vend_canal = sorted(set(
+                dp.kilos_por_canal_vendedor(_df_mes_meta)
+                .query("dsCanalMkt == @canal_meta")["dsVendedor"]
+            ) | set(
+                dp.kilos_por_canal_vendedor(_df_mes_prev)
+                .query("dsCanalMkt == @canal_meta")["dsVendedor"]
+            ))
+            _vend_todos = sorted(set(_vend_canal) | set(
+                _df_full_metas["dsVendedor"].dropna().astype(str).str.strip()
+                .replace({"": None}).dropna().unique().tolist()
+            ))
+
+            _cargados_v = dp.filtrar_metas(
+                _metas_all, anio_mes=mes_meta, tipo="objetivo",
+                nivel="vendedor", canal=canal_meta)[["dsVendedor", "meta_kg"]]
+
+            _ref_v = (
+                dp.kilos_por_canal_vendedor(_df_mes_prev)
+                .query("dsCanalMkt == @canal_meta")[["dsVendedor", "kilos"]]
+                .rename(columns={"kilos": "_ref"})
+            )
+            _base_v = pd.DataFrame({"dsVendedor": _vend_canal})
+            _base_v = _base_v.merge(_cargados_v, on="dsVendedor", how="outer")
+            _base_v = _base_v.merge(_ref_v, on="dsVendedor", how="left")
+            _base_v["meta_kg"] = pd.to_numeric(
+                _base_v["meta_kg"], errors="coerce").fillna(0.0)
+            _base_v["_ref"] = pd.to_numeric(
+                _base_v["_ref"], errors="coerce").fillna(0.0)
+            _base_v = _base_v.sort_values(
+                ["meta_kg", "_ref"], ascending=False).reset_index(drop=True)
+
+            _grilla_v = _base_v.rename(columns={
+                "dsVendedor": "Vendedor",
+                "meta_kg": "Meta (kg)",
+                "_ref": _col_ref,
+            })
+
+            _edit_v = st.data_editor(
+                _grilla_v,
+                key=f"metas_editor_vend_{mes_meta}_{canal_meta}",
+                use_container_width=True, hide_index=True, num_rows="dynamic",
+                column_config={
+                    "Vendedor": st.column_config.SelectboxColumn(
+                        options=_vend_todos, required=True, width="large"),
+                    "Meta (kg)": st.column_config.NumberColumn(
+                        min_value=0.0, step=100.0, format="%.0f",
+                        help="Kilos asignados al vendedor en el mes. "
+                             "Dejar en 0 borra su meta."),
+                    _col_ref: st.column_config.NumberColumn(
+                        format="%.0f", disabled=True,
+                        help="Kilos reales del mes anterior. Referencia, no se "
+                             "guarda."),
+                },
+            )
+
+            _tot_vend = pd.to_numeric(
+                _edit_v["Meta (kg)"], errors="coerce").fillna(0).sum()
+            _tot_ref_v = pd.to_numeric(
+                _edit_v[_col_ref], errors="coerce").fillna(0).sum()
+
+            _v1, _v2, _v3 = st.columns([1.2, 1.2, 2])
+            _v1.metric(
+                etiqueta_mes(mes_meta), fmt_kg(_tot_vend),
+                help="Suma de lo que estás repartiendo entre los vendedores, "
+                     "para el mes de la meta.",
+            )
+            _v2.metric(
+                etiqueta_mes(_mes_prev), fmt_kg(_tot_ref_v),
+                delta=(f"{(_tot_vend / _tot_ref_v - 1) * 100:+,.1f}%".replace(",", ".")
+                       if _tot_ref_v else None),
+                delta_color="off",
+                help="Kilos que estos vendedores facturaron realmente el mes "
+                     "pasado. El % es cuánto más (o menos) estás pidiendo.",
+            )
+            if _nuevo_canal > 0:
+                _dif_v = _tot_vend - _nuevo_canal
+                _v3.metric(
+                    "Diferencia vs objetivo del canal", fmt_kg(_dif_v),
+                    delta="cierra" if abs(_dif_v) <= max(_nuevo_canal * 0.005, 1)
+                    else "no cierra",
+                    delta_color="off",
+                )
+
+            if st.button("Guardar reparto entre vendedores", type="primary",
+                         key="btn_guardar_metas_vend"):
+                _nuevas_v = _edit_v.rename(columns={
+                    "Vendedor": "dsVendedor", "Meta (kg)": "meta_kg"})
+                _nuevas_v = _nuevas_v[["dsVendedor", "meta_kg"]].copy()
+                _nuevas_v["anio_mes"] = mes_meta
+                _nuevas_v["dsCanalMkt"] = canal_meta
+                _nuevas_v["marca_linea"] = ""
+                _guardadas_v = dp.upsert_metas(
+                    _nuevas_v, anio_mes=mes_meta, canales=[canal_meta],
+                    tipo="objetivo", nivel="vendedor")
+                _nv = len(dp.filtrar_metas(
+                    _guardadas_v, anio_mes=mes_meta, tipo="objetivo",
+                    nivel="vendedor", canal=canal_meta))
+                st.session_state["_metas_ok"] = (
+                    f"Guardadas {_nv} metas de vendedores de {canal_meta} para "
+                    f"{etiqueta_mes(mes_meta)} ({fmt_kg(_tot_vend)} en total)."
+                )
+                st.rerun()
+
+            _ov_caption("vendedor", "Reparto entre vendedores")
+
+    # =====================================================================
+    # PRESUPUESTO ANUAL
+    # =====================================================================
+    # Es la línea base que se define a principio de año y NO se toca. El
+    # objetivo mensual se compara contra esto para ver el desvío acumulado.
+    with sub_pres:
+        if canal_meta == "TODOS":
+            st.info(
+                "Elegí un canal arriba para cargar su presupuesto anual."
+            )
+        else:
+            st.caption(
+                "Lo que la empresa estima vender en el año, mes por mes. Es la "
+                "línea base: se carga una vez y queda fija. El objetivo mensual "
+                "se carga aparte y puede desviarse de acá a propósito."
+            )
+
+            _anios_datos = sorted({m[:4] for m in _meses_disp}, reverse=True)
+            _anio_mes_meta = mes_meta[:4]
+            _anios_opts = sorted(
+                set(_anios_datos) | {_anio_mes_meta,
+                                     str(int(_anio_mes_meta) + 1)},
+                reverse=True)
+            anio_pres = st.selectbox(
+                "Año", _anios_opts,
+                index=_anios_opts.index(_anio_mes_meta),
+                key="pres_anio",
+            )
+
+            _meses_anio = [f"{anio_pres}-{m:02d}" for m in range(1, 13)]
+
+            _pres_cargado = dp.filtrar_metas(
+                _metas_all, tipo="presupuesto", nivel="canal", canal=canal_meta)
+            _pres_cargado = _pres_cargado[
+                _pres_cargado["anio_mes"].isin(_meses_anio)
+            ][["anio_mes", "meta_kg"]]
+
+            _real_mes = dp.kilos_por_mes_canal(_df_full_metas)
+            _real_mes = _real_mes[_real_mes["dsCanalMkt"] == canal_meta]
+            _real_map = dict(zip(_real_mes["anio_mes"], _real_mes["kilos"]))
+
+            _bp = pd.DataFrame({"anio_mes": _meses_anio})
+            _bp = _bp.merge(_pres_cargado, on="anio_mes", how="left")
+            _bp["meta_kg"] = pd.to_numeric(
+                _bp["meta_kg"], errors="coerce").fillna(0.0)
+            # Sin columna del año anterior: el parquet arranca en el año en
+            # curso, así que esa referencia daba siempre 0 y solo ocupaba lugar.
+            _bp["_real"] = _bp["anio_mes"].map(
+                lambda am: float(_real_map.get(am, 0.0)))
+            _bp["Mes"] = _bp["anio_mes"].map(etiqueta_mes)
+
+            _col_real = f"Real {anio_pres} (kg)"
+            _grilla_p = _bp[["Mes", "meta_kg", "_real"]].rename(
+                columns={"meta_kg": "Presupuesto (kg)", "_real": _col_real})
+
+            _edit_p = st.data_editor(
+                _grilla_p,
+                key=f"pres_editor_{anio_pres}_{canal_meta}",
+                use_container_width=True, hide_index=True, num_rows="fixed",
+                column_config={
+                    "Mes": st.column_config.TextColumn(disabled=True),
+                    "Presupuesto (kg)": st.column_config.NumberColumn(
+                        min_value=0.0, step=1000.0, format="%.0f",
+                        help="Kilos estimados para ese mes. Dejar en 0 lo borra."),
+                    _col_real: st.column_config.NumberColumn(
+                        format="%.0f", disabled=True,
+                        help="Kilos reales de este año (los meses ya cerrados). "
+                             "Referencia, no se guarda."),
+                },
+            )
+
+            _tot_pres = pd.to_numeric(
+                _edit_p["Presupuesto (kg)"], errors="coerce").fillna(0).sum()
+            _tot_real = pd.to_numeric(
+                _edit_p[_col_real], errors="coerce").fillna(0).sum()
+
+            _q1, _q2 = st.columns(2)
+            _q1.metric(f"Presupuesto {anio_pres}", fmt_kg(_tot_pres))
+            _q2.metric(
+                f"Real acumulado {anio_pres}", fmt_kg(_tot_real),
+                delta=(f"{_tot_real / _tot_pres * 100:,.1f}% del presupuesto"
+                       .replace(",", ".") if _tot_pres else None),
+                delta_color="off",
+                help="Kilos ya facturados en el año, contra el presupuesto "
+                     "de los 12 meses.",
+            )
+
+            if st.button("Guardar presupuesto anual", type="primary",
+                         key="btn_guardar_pres"):
+                # El mes se recupera desde la etiqueta, no por posición: si
+                # Streamlit devolviera las filas reordenadas, el presupuesto
+                # terminaría en el mes equivocado.
+                _mapa_mes = dict(zip(_bp["Mes"], _bp["anio_mes"]))
+                _np_ = _edit_p.rename(
+                    columns={"Presupuesto (kg)": "meta_kg"})[
+                        ["Mes", "meta_kg"]].copy()
+                _np_["anio_mes"] = _np_["Mes"].map(_mapa_mes)
+                _np_ = _np_.drop(columns=["Mes"])
+                _np_["dsCanalMkt"] = canal_meta
+                _np_["marca_linea"] = ""
+                _np_["dsVendedor"] = ""
+                dp.upsert_metas(
+                    _np_, anio_mes=_meses_anio, canales=[canal_meta],
+                    tipo="presupuesto", nivel="canal")
+                st.session_state["_metas_ok"] = (
+                    f"Presupuesto {anio_pres} de {canal_meta} guardado: "
+                    f"{fmt_kg(_tot_pres)} en el año."
+                )
+                st.rerun()
 
 
 # --- TAB ACUERDOS MCCAIN --------------------------------------------------
