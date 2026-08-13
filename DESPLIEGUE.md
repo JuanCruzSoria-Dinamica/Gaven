@@ -142,16 +142,28 @@ env/bin/pip install -r requirements.txt
 nano .streamlit/secrets.toml
 ```
 
-Pegá adentro tus credenciales reales del API de Chess, con este formato:
+Pegá adentro tus credenciales reales, con este formato. Son **dos secciones** y las dos
+son obligatorias:
 
 ```toml
+# 1) API de Chess — la usa data_pipeline.py para bajar las ventas.
 [chess]
 base_url = "https://EL_QUE_USES"
 usuario  = "TU_USUARIO"
 password = "TU_PASSWORD"
+
+# 2) Login del panel — lo usa app.py para la pantalla de acceso.
+#    Sin esta sección la app arranca y se cae apenas alguien entra.
+[acceso]
+usuario_duenos        = "..."
+password_duenos       = "..."
+usuario_supervisores  = "..."
+password_supervisores = "..."
 ```
 
-> Mirá tu `secrets.toml` local (en tu PC) para copiar los valores exactos.
+> Copiá los valores exactos de tu `secrets.toml` local (en tu PC), que ya tiene las dos
+> secciones. **No inventes los nombres de las claves**: `app.py` busca `st.secrets["acceso"]`
+> con esos cuatro nombres tal cual.
 
 Guardá en nano con **Ctrl+O** → Enter, y salí con **Ctrl+X**.
 
@@ -281,6 +293,77 @@ Los errores/registros quedan en `/root/Gaven/pipeline.log` (lo ves con `cat /roo
 
 ---
 
+## Parte 10 bis — Sembrar `data/` y respaldarla (IMPORTANTE)
+
+Esta parte es la que evita que se repita el problema que teníamos en Streamlit Cloud:
+**los objetivos cargados desde la app se perdían solos.**
+
+### Por qué
+
+Los archivos de `data/` ya **no están en GitHub** (los sacamos a propósito, ver `.gitignore`).
+Son *estado*, no código: los escriben el cron y la propia app cuando la mesa chica carga
+objetivos o sube el Excel de acuerdos. Si estuvieran versionados, cada `git pull` chocaría
+contra ellos y tarde o temprano alguien los pisa con un `git reset --hard`.
+
+La contra es que ahora **viven en un solo lugar: el disco del servidor.** Sin git haciendo de
+red de contención, el backup deja de ser opcional.
+
+### 1. Sembrar los archivos la primera vez
+
+Un clon nuevo trae `data/` casi vacío. El pipeline regenera solo las ventas, la serie, el IPC
+y el metadata. Pero **los objetivos y los acuerdos no los puede regenerar nadie**: hay que
+copiarlos a mano una única vez, desde tu PC:
+
+```bash
+scp data/metas.parquet           root@TU_IP:/root/Gaven/data/
+scp data/metas_historial.parquet root@TU_IP:/root/Gaven/data/
+scp data/acuerdos_mccain.parquet root@TU_IP:/root/Gaven/data/
+```
+
+> Copiá la versión **más nueva que tengas**. Ojo: la que está en el repo quedó vieja
+> (última carga real: 6 de agosto), porque Streamlit Cloud venía descartando todo lo que se
+> guardaba. Si alguien cargó objetivos después de esa fecha, esos ya no están en ningún lado
+> y hay que volver a cargarlos desde la app una vez que el panel esté en el servidor.
+
+### 2. Backup diario
+
+```bash
+nano /root/backup_datos.sh
+```
+
+Pegá:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+DEST=/root/backups
+mkdir -p "$DEST"
+tar czf "$DEST/data-$(date +\%Y\%m\%d-\%H\%M).tgz" -C /root/Gaven data
+# Conserva los últimos 30 respaldos y borra los más viejos
+ls -1t "$DEST"/data-*.tgz | tail -n +31 | xargs -r rm --
+```
+
+```bash
+chmod +x /root/backup_datos.sh
+crontab -e
+```
+
+Agregá esta línea (todos los días a las 03:00, antes de la corrida del pipeline):
+
+```
+0 3 * * * /root/backup_datos.sh >> /root/backup.log 2>&1
+```
+
+Para restaurar un respaldo:
+
+```bash
+systemctl stop gaven
+tar xzf /root/backups/data-20260813-0300.tgz -C /root/Gaven
+systemctl start gaven
+```
+
+---
+
 ## Parte 11 — Firewall (seguridad básica)
 
 ```bash
@@ -291,9 +374,13 @@ ufw --force enable
 
 Esto deja pasar solo SSH y web (80/443) y bloquea el resto.
 
-> **Nota sobre el acceso:** elegiste dejar el panel abierto (sin login). Como muestra
-> ventas, cualquiera con el link puede verlo. Si más adelante querés ponerle usuario y
-> contraseña, se puede agregar fácil con Nginx (basic auth) — pedímelo y te paso los pasos.
+> **Nota sobre el acceso:** el panel **ya tiene login propio**, con dos roles (dueños ven
+> Contribución marginal y CM %; supervisores no). Las credenciales salen de la sección
+> `[acceso]` del `secrets.toml` que creaste en la Parte 6.2. No hace falta agregar nada en
+> Nginx.
+>
+> Justamente por eso el HTTPS de la Parte 9 **no es opcional**: sin él, esas contraseñas
+> viajan en texto plano por internet.
 
 ---
 
@@ -340,10 +427,30 @@ Pegá:
 
 ```bash
 #!/bin/bash
+# set -e: si algún comando falla, el script CORTA acá y no sigue.
+# Sin esto, un `git pull` que falla igual te imprimía "Panel actualizado ✅"
+# y vos te quedabas pensando que la versión nueva ya estaba arriba.
+set -euo pipefail
+
 cd /root/Gaven
+
+echo "→ Bajando cambios de GitHub..."
 git pull
+
+echo "→ Actualizando librerías (si cambió requirements.txt)..."
+env/bin/pip install -q -r requirements.txt
+
+echo "→ Reiniciando el panel..."
 systemctl restart gaven
-echo "Panel actualizado ✅"
+
+sleep 3
+if systemctl is-active --quiet gaven; then
+    echo "Panel actualizado ✅"
+else
+    echo "⚠️  El panel NO levantó. Mirá el error con:"
+    echo "    journalctl -u gaven -n 50 --no-pager"
+    exit 1
+fi
 ```
 
 Guardá y dale permiso de ejecución:
@@ -365,6 +472,12 @@ Desde ahí, cada vez que quieras actualizar, después de hacer `git push` en tu 
 - **Si cambiás `requirements.txt`** (agregás una librería): después del `git pull` corré también
   `env/bin/pip install -r requirements.txt` antes de reiniciar.
 - **El `secrets.toml` vive solo en el servidor** (no está en GitHub), así que un `git pull` nunca lo pisa. Tranquilo.
+- **Lo mismo vale ahora para todo `data/`**: los objetivos, los acuerdos y los parquets de
+  ventas están fuera de git, así que actualizar el código nunca los toca. Es justamente lo
+  que hacía falta para que las metas dejaran de perderse.
+- **Si `git pull` se queja de "local changes"**, NO uses `git reset --hard` ni `git checkout .`
+  sin mirar qué archivo es. Fijate primero con `git status`. Si aparece algo de `data/`,
+  avisame antes de tocar nada: ahí viven los objetivos cargados.
 
 > *Más adelante*, si querés que se actualice automático con solo hacer `git push` (sin entrar
 > al servidor), se puede con GitHub Actions o un webhook. Es un paso más avanzado; cuando

@@ -168,7 +168,11 @@ def _mtime_metas():
         return 0
 
 
-@st.cache_data(show_spinner="Leyendo datos...")
+# max_entries: tope de versiones vivas en caché. Sin esto, cada vez que el
+# pipeline reescribe el parquet cambia el mtime -> nueva entrada, y la vieja
+# NUNCA se libera. Eso es lo que hacía que la app se cayera sola después de un
+# rato en el servidor (se queda sin RAM y Streamlit Cloud mata el proceso).
+@st.cache_data(show_spinner="Leyendo datos...", max_entries=2)
 def cargar_datos_local(mtime, mtime_acuerdos=0):
     df = pd.read_parquet(PARQUET_PATH)
     # 'marca_linea' es una columna DERIVADA del lookup por código
@@ -184,7 +188,7 @@ def cargar_datos_local(mtime, mtime_acuerdos=0):
     return df
 
 
-@st.cache_data(show_spinner="Leyendo serie histórica...")
+@st.cache_data(show_spinner="Leyendo serie histórica...", max_entries=2)
 def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     """Lee la serie mensual agregada (data/serie_mensual.parquet).
     La clave de caché es el mtime: si el pipeline reescribe la serie, se
@@ -209,7 +213,10 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     )
 
 
-@st.cache_data(show_spinner="Armando el evolutivo...")
+# max_entries chico a propósito: la clave combina nivel × canales elegidos ×
+# mtimes × fecha. Sin tope, cada combinación que toca el usuario deja un
+# DataFrame en memoria para siempre.
+@st.cache_data(show_spinner="Armando el evolutivo...", max_entries=8)
 def cargar_evolutivo(nivel, canales, mtime, mtime_acuerdos=0, mtime_metas=0,
                      hoy=None):
     """Evolutivo de objetivo vs. real mes a mes (ver dp.evolutivo_metas()).
@@ -1714,7 +1721,13 @@ with tab_clientes:
     # Los filtros de dimensión (canal, vendedor, etc.) sí aplican.
     st.subheader("Altas y bajas de clientes")
 
-    _df_ab = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
+    # Reusa `df_anio` (el detalle completo que se guardó en la línea 447, antes
+    # de que `df` se pise con el período elegido). NO volver a llamar a
+    # cargar_datos_local() acá: st.cache_data devuelve una COPIA nueva en cada
+    # llamada (deserializa lo que tiene guardado), así que cada llamada de más
+    # son ~200 MB extra de RAM en CADA re-ejecución de la app. Eso era lo que
+    # hacía que el proceso se quedara sin memoria y Streamlit lo matara.
+    _df_ab = df_anio
     for _c_ab, _v_ab in seleccion.items():
         if _v_ab:
             _df_ab = _df_ab[_df_ab[_c_ab].astype(str).str.strip().isin(_v_ab)]
@@ -1907,7 +1920,7 @@ with tab_vend:
 with tab_alertas:
     st.subheader("Lecturas por canal")
 
-    _df_ins = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
+    _df_ins = df_anio   # ver nota en "Altas y bajas": reusar, no recargar
     for _c_ins, _v_ins in seleccion.items():
         if _v_ins:
             _df_ins = _df_ins[_df_ins[_c_ins].astype(str).str.strip().isin(_v_ins)]
@@ -2004,9 +2017,7 @@ with tab_alertas:
 with tab_metas:
     st.subheader("Metas de venta en kilos")
 
-    _df_full_metas = cargar_datos_local(
-        os.path.getmtime(PARQUET_PATH), _mtime_acuerdos()
-    )
+    _df_full_metas = df_anio   # ver nota en "Altas y bajas": reusar, no recargar
     _fecha_full = _df_full_metas["fechaComprobate"]
     _canales_todos = sorted(
         _df_full_metas["dsCanalMkt"].dropna().astype(str).str.strip()
@@ -3025,9 +3036,7 @@ if tab_acuerdos is not None:
         if _ac.empty:
             st.info("Todavía no hay acuerdos cargados.")
         else:
-            _df_full = cargar_datos_local(
-                os.path.getmtime(PARQUET_PATH), _mtime_acuerdos()
-            )
+            _df_full = df_anio   # ver nota en "Altas y bajas": reusar, no recargar
             _aud = _df_full[_df_full["ajuste_mccain"] != 0].copy()
             _aud["Mes"] = _aud["fechaComprobate"].dt.to_period("M").astype(str)
             _por_mes = (

@@ -30,3 +30,31 @@ Thumbs.db
 
 # Logs
 *.log
+
+# ---------------------------------------------------------------------------
+# Datos: NO van a git. Son ESTADO, no código.
+# ---------------------------------------------------------------------------
+# En el servidor estos archivos los escriben el cron (el pipeline) y la propia
+# app (metas y acuerdos que carga la mesa chica). Si además estuvieran
+# versionados, cada `git pull` chocaría contra los cambios locales: git aborta
+# el merge y, si uno lo "destraba" con `git checkout .` o `git reset --hard`,
+# se borran los objetivos cargados. Fuera de git, un pull nunca los toca.
+#
+# Se siembran una sola vez a mano (scp), igual que secrets.toml, y se respaldan
+# con el cron de backup. Ver DESPLIEGUE.md, "Parte 12".
+data/ventas_actualizadas.parquet
+data/serie_mensual.parquet
+data/metadata.json
+data/ipc_indec.parquet
+data/metas.parquet
+data/metas_historial.parquet
+data/acuerdos_mccain.parquet
+
+# Respaldos y copias sueltas del parquet
+data/*.bak-*
+data/backups/
+*.tmp
+
+# OJO: data/proveedor_objetivo_lookup.csv SÍ queda en git a propósito.
+# Ese no es estado: es una tabla de configuración que editás vos y de la que
+# depende la clasificación por marca/línea. Tiene que viajar con el código.
