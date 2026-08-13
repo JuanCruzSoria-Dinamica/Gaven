@@ -33,6 +33,7 @@ import os
 import re
 import json
 import time
+import calendar
 import warnings
 import datetime as dt
 
@@ -546,6 +547,82 @@ def por_proveedor(df_ventas):
     return agrupar_dim(d, "marca_linea")
 
 
+# --- Cobertura -------------------------------------------------------------
+# "De todo lo que se le podía vender, cuánto se le vendió."
+#
+# El denominador (el UNIVERSO) es la cantidad de clientes distintos y de SKUs
+# distintos que tuvo cada canal / vendedor / marca en TODO EL AÑO. No hay un
+# maestro de clientes ni un catálogo confiable, así que el año oficia de
+# universo: si un cliente le compró alguna vez en 2026, es una oportunidad
+# real; si nunca compró, no está en la cartera.
+#
+# Ojo con el numerador: sale del df del PERÍODO elegido (un mes), mientras el
+# universo sale del año entero. Los dos tienen que venir con los MISMOS
+# filtros de dimensión aplicados (canal, vendedor, etc.), lo único que cambia
+# entre ellos es la ventana de fechas. De eso se encarga app.py.
+#
+# No se guarda en ningún parquet: es un nunique sobre el detalle que ya está
+# en memoria, así que se recalcula solo y nunca queda desactualizado.
+
+def universo_dim(df_universo, col):
+    """Clientes y SKUs distintos por valor de `col` en TODO el df recibido."""
+    cols_out = [col, "universo_clientes", "universo_skus"]
+    if df_universo is None or len(df_universo) == 0 or col not in df_universo.columns:
+        return pd.DataFrame(columns=cols_out)
+    return (
+        df_universo.groupby(col)
+        .agg(universo_clientes=("idCliente", "nunique"),
+             universo_skus=("idArticulo", "nunique"))
+        .reset_index()
+    )
+
+
+def agregar_cobertura(g, col, df_universo):
+    """Suma al resumen de agrupar_dim las columnas de cobertura.
+
+    `g` es la salida de agrupar_dim (trae `clientes` y `skus` del período).
+    `df_universo` es el detalle del año COMPLETO, con los mismos filtros de
+    dimensión que `g` pero sin recortar por fecha.
+
+    Devuelve `g` con cuatro columnas más: universo_clientes, universo_skus,
+    cob_clientes y cob_skus (estas dos en % de 0 a 100). Si no se puede
+    calcular el universo devuelve `g` intacto, así el tablero nunca se rompe
+    por falta de datos: simplemente no aparecen las columnas.
+    """
+    u = universo_dim(df_universo, col)
+    if u.empty or col not in g.columns:
+        return g
+
+    out = g.merge(u, on=col, how="left")
+    for num, den, dest in [("clientes", "universo_clientes", "cob_clientes"),
+                           ("skus", "universo_skus", "cob_skus")]:
+        if num not in out.columns:
+            continue
+        d = pd.to_numeric(out[den], errors="coerce")
+        out[dest] = np.where(d > 0, out[num] / d * 100, np.nan)
+    return out
+
+
+def cobertura_total(df_periodo, df_universo):
+    """Cobertura a nivel empresa (sin abrir por dimensión).
+
+    Devuelve un dict con el universo del año, lo tocado en el período y el %.
+    Sirve para las tarjetas del Resumen."""
+    def _n(d, c):
+        return int(d[c].nunique()) if d is not None and len(d) and c in d else 0
+
+    uc, us = _n(df_universo, "idCliente"), _n(df_universo, "idArticulo")
+    pc, ps = _n(df_periodo, "idCliente"), _n(df_periodo, "idArticulo")
+    return {
+        "universo_clientes": uc,
+        "universo_skus": us,
+        "clientes": pc,
+        "skus": ps,
+        "cob_clientes": (pc / uc * 100) if uc else 0.0,
+        "cob_skus": (ps / us * 100) if us else 0.0,
+    }
+
+
 # --- Línea de producto "estricta" (para la solapa Líneas) ------------------
 # A diferencia de marca_linea (que cae al proveedor cuando el código no está
 # en el lookup), acá los SKUs sin regla caen a SIN_ASIGNAR. Así la solapa de
@@ -727,8 +804,12 @@ def altas_bajas(df_ventas, hoy=None):
     - Bajas: compraron el mes pasado y NO este mes.
 
     Recibe el df SIN filtrar por período (necesita ver ambos meses).
-    Devuelve (altas, bajas): un df por lado con compras, kilos, facturación
-    y fecha de última compra por cliente.
+    Devuelve (altas, bajas): un df por lado con canal, vendedor, compras,
+    kilos, facturación y fecha de última compra por cliente.
+
+    Canal y vendedor son los DOMINANTES del cliente en ese mes (el de mayor
+    facturación), porque un mismo cliente puede tener comprobantes con más de
+    un vendedor o canal y para altas/bajas necesitamos una sola etiqueta.
     """
     hoy = hoy or dt.date.today()
     base = df_ventas.copy()
@@ -743,21 +824,40 @@ def altas_bajas(df_ventas, hoy=None):
     m_act = base[(f >= ini_act) & (f < fin_act)]
     m_ant = base[(f >= ini_ant) & (f < ini_act)]
 
+    def _dominante(d, col):
+        """Valor de `col` con más facturación por cliente (Serie indexada por
+        idCliente). Si la columna no existe en el parquet, devuelve None."""
+        if col not in d.columns:
+            return None
+        g = (d.assign(**{col: d[col].astype(str).str.strip()})
+               .groupby(["idCliente", col])["subtotalNeto"].sum()
+               .reset_index()
+               .sort_values("subtotalNeto", ascending=False)
+               .drop_duplicates("idCliente"))
+        return g.set_index("idCliente")[col]
+
     def _resumen(d):
         if d.empty:
             return pd.DataFrame(columns=[
-                "idCliente", "nombreCliente", "compras",
-                "kilos", "facturacion", "ultima_compra",
+                "idCliente", "nombreCliente", "dsCanalMkt", "dsVendedor",
+                "compras", "kilos", "facturacion", "ultima_compra",
             ])
         d = d.copy()
         d["_comp_id"] = comprobante_id(d)
-        return d.groupby("idCliente").agg(
+        res = d.groupby("idCliente").agg(
             nombreCliente=("nombreCliente", "first"),
             compras=("_comp_id", "nunique"),
             kilos=("kilos", "sum"),
             facturacion=("subtotalNeto", "sum"),
             ultima_compra=("fechaComprobate", "max"),
         ).reset_index()
+        for _col in ("dsCanalMkt", "dsVendedor"):
+            dom = _dominante(d, _col)
+            res[_col] = (res["idCliente"].map(dom).fillna("(sin dato)")
+                         if dom is not None else "(sin dato)")
+        cols = ["idCliente", "nombreCliente", "dsCanalMkt", "dsVendedor",
+                "compras", "kilos", "facturacion", "ultima_compra"]
+        return res[cols]
 
     res_act = _resumen(m_act)
     res_ant = _resumen(m_ant)
@@ -817,6 +917,307 @@ def alertas(df_ventas):
         })
 
     return avisos
+
+
+# ---------------------------------------------------------------------------
+# 2bis) Insights de mesa chica (las 6 lecturas por canal)
+# ---------------------------------------------------------------------------
+# Seis preguntas fijas que se responden POR CANAL, pensadas para la reunión
+# de mesa chica. No son "alertas" (no hay umbral que se dispara): son la
+# foto del mes, siempre las mismas seis filas por canal, así la lectura es
+# comparable mes a mes.
+#
+#   1. Vendedor estrella  - quién factura más, su share del canal y SKUs/PDV
+#   2. Producto estrella  - el SKU que más factura y su performance
+#   3. Producto caído     - el SKU que más facturación perdió mes vs mes
+#   4. Producto con más clientes - el SKU de mayor penetración (≠ el nº 2)
+#   5. Cliente estrella   - el cliente que más factura
+#   6. Cliente caído      - el cliente que más facturación perdió mes vs mes
+#
+# Criterios (decididos con comercial, no cambiar sin avisar):
+#   - La métrica base es subtotalNeto (sin IVA), la misma que usan por_canal,
+#     rfm y ranking_productos. Así los números cierran con el resto del panel.
+#   - Las comparaciones mes vs mes se hacen A IGUAL DÍA DEL MES: si el mes en
+#     curso va hasta el 10, el anterior se corta el 10. Si no, el mes en curso
+#     siempre parecería "caído" solo por estar incompleto.
+
+INSIGHTS_ORDEN = [
+    "Vendedor estrella",
+    "Producto estrella",
+    "Producto caído",
+    "Producto con más clientes",
+    "Cliente estrella",
+    "Cliente caído",
+]
+
+# Separador entre los datos de la leyenda de cada tarjeta. La app parte el
+# texto por acá y pone cada dato en su propio renglón; en el Excel el detalle
+# viaja en una sola celda con los datos separados por " · ".
+SEP_DETALLE = " · "
+
+
+def _detalle(*partes):
+    """Une los datos de una leyenda descartando los vacíos. Sin punto final:
+    cada parte es un dato suelto, no una oración."""
+    return SEP_DETALLE.join(str(p) for p in partes if p)
+
+
+def _num(fmt, valor):
+    """Formatea con separador de miles a la argentina (1.234,5)."""
+    try:
+        return fmt.format(valor).replace(",", "@").replace(".", ",").replace("@", ".")
+    except (TypeError, ValueError):
+        return str(valor)
+
+
+def _pesos(x):
+    return _num("$ {:,.0f}", x)
+
+
+def ventana_anterior(desde, hasta):
+    """(ini, fin) del mes anterior recortado al MISMO día del mes que `hasta`.
+
+    Ej.: período 01/08 → 10/08 devuelve 01/07 → 10/07. Si el mes anterior es
+    más corto que el día de corte (31/03 → febrero), corta en su último día.
+    """
+    ini_ant = (desde.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
+    ult_dia = calendar.monthrange(ini_ant.year, ini_ant.month)[1]
+    return ini_ant, ini_ant.replace(day=min(hasta.day, ult_dia))
+
+
+def _recortar(df_ventas, desde, hasta):
+    """Filas con fechaComprobate dentro de [desde, hasta] (ambos inclusive)."""
+    f = df_ventas["fechaComprobate"]
+    return df_ventas[
+        (f >= pd.Timestamp(desde))
+        & (f < pd.Timestamp(hasta) + pd.Timedelta(days=1))
+    ]
+
+
+def _tabla_vendedores(d):
+    """Facturación y SKUs por PDV de cada vendedor (base de la lectura nº 1)."""
+    g = d.groupby("dsVendedor").agg(fact=("subtotalNeto", "sum"))
+    # SKUs por PDV: promedio real de SKUs distintos que compra cada cliente,
+    # NO SKUs totales / clientes (mismo criterio que agrupar_dim).
+    g["skus_x_pdv"] = (
+        d.groupby(["dsVendedor", "idCliente"])["idArticulo"].nunique()
+        .groupby("dsVendedor").mean()
+    )
+    return g.reset_index()
+
+
+def _por_clave(d, col, nombre=None):
+    """Facturación, kilos y clientes por dimensión (producto o cliente)."""
+    agg = {"fact": ("subtotalNeto", "sum"),
+           "kilos": ("kilos", "sum"),
+           "clientes": ("idCliente", "nunique"),
+           "skus": ("idArticulo", "nunique")}
+    if nombre:
+        agg["nombre"] = (nombre, "first")
+    return d.groupby(col).agg(**agg).reset_index()
+
+
+def _var_pct(act, ant):
+    """Variación % con texto listo. Si no había base, avisa que es nuevo."""
+    if ant == 0:
+        return "sin venta el mes anterior" if act else "sin movimiento"
+    return f"{(act - ant) / abs(ant) * 100:+.0f}%".replace("+", "+")
+
+
+def _fila(canal, insight, protagonista, valor, detalle, nivel="info"):
+    return {"Canal": canal, "Insight": insight, "Protagonista": protagonista,
+            "Valor": valor, "Detalle": detalle, "nivel": nivel}
+
+
+def _vendedor_estrella(canal, act, fact_canal):
+    """El vendedor de mayor facturación del canal.
+
+    La leyenda queda deliberadamente en dos datos y nada más: cuánto del canal
+    concentra y cuántos SKUs le vende en promedio a cada PDV. Antes comparaba
+    cinco métricas contra el promedio de los otros vendedores y narraba la
+    ventaja y el punto flojo; se sacó a pedido de comercial porque en la
+    reunión alcanzaba con la cifra desnuda.
+    """
+    g = _tabla_vendedores(act)
+    if g.empty:
+        return None
+    top = g.sort_values("fact", ascending=False).iloc[0]
+    share = top["fact"] / fact_canal * 100 if fact_canal else 0
+    skus = 0 if pd.isna(top["skus_x_pdv"]) else top["skus_x_pdv"]
+    return _fila(
+        canal, "Vendedor estrella", str(top["dsVendedor"]), _pesos(top["fact"]),
+        _detalle(
+            f"Concentra el {share:.0f}% de la facturación del canal",
+            f"{_num('{:,.1f}', skus)} SKUs por PDV",
+        ),
+    )
+
+
+def insights_mesa_chica(df_ventas, desde, hasta, canales=None):
+    """Las 6 lecturas de mesa chica, por canal.
+
+    Parámetros
+    ----------
+    df_ventas : detalle SIN recortar por período (necesita ver también el mes
+                anterior para las lecturas de "caído"). Los filtros de
+                dimensión sí se pueden aplicar antes.
+    desde, hasta : date. Período elegido en la app.
+    canales : lista opcional; si no se pasa, usa todos los del período.
+
+    Devuelve un DataFrame con una fila por (canal × insight) y columnas
+    Canal, Insight, Protagonista, Valor, Detalle, nivel. `nivel` es 'riesgo'
+    para las lecturas de caída y 'ok' para las de estrella; la app lo usa
+    para pintar la tarjeta.
+    """
+    vacio = pd.DataFrame(columns=["Canal", "Insight", "Protagonista",
+                                  "Valor", "Detalle", "nivel"])
+    if df_ventas is None or df_ventas.empty:
+        return vacio
+
+    base = df_ventas.copy()
+    base["fechaComprobate"] = pd.to_datetime(base["fechaComprobate"], errors="coerce")
+    base = base.dropna(subset=["fechaComprobate"])
+
+    ini_ant, fin_ant = ventana_anterior(desde, hasta)
+    actual = _recortar(base, desde, hasta)
+    previo = _recortar(base, ini_ant, fin_ant)
+    if actual.empty:
+        return vacio
+
+    if canales is None:
+        canales = sorted(
+            actual["dsCanalMkt"].dropna().astype(str).str.strip()
+            .replace({"": None}).dropna().unique().tolist()
+        )
+
+    filas = []
+    for canal in canales:
+        act = actual[actual["dsCanalMkt"].astype(str).str.strip() == canal]
+        ant = previo[previo["dsCanalMkt"].astype(str).str.strip() == canal]
+        if act.empty:
+            continue
+        fact_canal = act["subtotalNeto"].sum()
+        clientes_canal = act["idCliente"].nunique()
+
+        # 1) Vendedor estrella -------------------------------------------
+        fila = _vendedor_estrella(canal, act, fact_canal)
+        if fila:
+            fila["nivel"] = "ok"
+            filas.append(fila)
+
+        # 2) Producto estrella -------------------------------------------
+        prods = _por_clave(act, "dsArticulo")
+        prods_ant = _por_clave(ant, "dsArticulo") if not ant.empty else None
+        if not prods.empty:
+            p = prods.sort_values("fact", ascending=False).iloc[0]
+            share = p["fact"] / fact_canal * 100 if fact_canal else 0
+            cob = p["clientes"] / clientes_canal * 100 if clientes_canal else 0
+            f_ant = 0.0
+            if prods_ant is not None:
+                m = prods_ant[prods_ant["dsArticulo"] == p["dsArticulo"]]
+                f_ant = float(m["fact"].iloc[0]) if len(m) else 0.0
+            filas.append(_fila(
+                canal, "Producto estrella", str(p["dsArticulo"]),
+                _pesos(p["fact"]),
+                _detalle(
+                    f"{share:.0f}% de la facturación del canal",
+                    _num("{:,.0f} kg", p["kilos"]),
+                    f"Lo compran {int(p['clientes'])} clientes "
+                    f"({cob:.0f}% del canal)",
+                    f"Mes vs mes {_var_pct(p['fact'], f_ant)}",
+                ),
+                nivel="ok",
+            ))
+
+        # 3) Producto caído ----------------------------------------------
+        if prods_ant is not None and not prods_ant.empty:
+            comp = prods_ant.merge(prods, on="dsArticulo", how="left",
+                                   suffixes=("_ant", "_act")).fillna(0)
+            comp["dif"] = comp["fact_act"] - comp["fact_ant"]
+            peor = comp.sort_values("dif").iloc[0]
+            if peor["dif"] < 0:
+                filas.append(_fila(
+                    canal, "Producto caído", str(peor["dsArticulo"]),
+                    _pesos(peor["dif"]),
+                    _detalle(
+                        f"Pasó de {_pesos(peor['fact_ant'])} a "
+                        f"{_pesos(peor['fact_act'])} "
+                        f"({_var_pct(peor['fact_act'], peor['fact_ant'])})",
+                        f"Clientes {int(peor['clientes_ant'])} → "
+                        f"{int(peor['clientes_act'])}",
+                    ),
+                    nivel="riesgo",
+                ))
+
+        # 4) Producto con más clientes -----------------------------------
+        if not prods.empty:
+            # Desempate por facturación: si dos SKUs llegan a la misma
+            # cantidad de clientes, gana el que más pesa en el canal.
+            pc = prods.sort_values(["clientes", "fact"], ascending=False).iloc[0]
+            cob = pc["clientes"] / clientes_canal * 100 if clientes_canal else 0
+            filas.append(_fila(
+                canal, "Producto con más clientes", str(pc["dsArticulo"]),
+                f"{int(pc['clientes'])} clientes",
+                _detalle(
+                    f"Cobertura del {cob:.0f}% de los {clientes_canal} "
+                    f"clientes del canal",
+                    f"Factura {_pesos(pc['fact'])}",
+                ),
+                nivel="ok",
+            ))
+
+        # 5) Cliente estrella --------------------------------------------
+        clis = _por_clave(act, "idCliente", nombre="nombreCliente")
+        clis_ant = (_por_clave(ant, "idCliente", nombre="nombreCliente")
+                    if not ant.empty else None)
+        if not clis.empty:
+            c = clis.sort_values("fact", ascending=False).iloc[0]
+            share = c["fact"] / fact_canal * 100 if fact_canal else 0
+            f_ant = 0.0
+            if clis_ant is not None:
+                m = clis_ant[clis_ant["idCliente"] == c["idCliente"]]
+                f_ant = float(m["fact"].iloc[0]) if len(m) else 0.0
+            filas.append(_fila(
+                canal, "Cliente estrella", str(c["nombre"]),
+                _pesos(c["fact"]),
+                _detalle(
+                    f"{share:.0f}% de la facturación del canal",
+                    f"Compra {int(c['skus'])} SKUs",
+                    f"Mes vs mes {_var_pct(c['fact'], f_ant)}",
+                ),
+                nivel="ok",
+            ))
+
+        # 6) Cliente caído -----------------------------------------------
+        if clis_ant is not None and not clis_ant.empty:
+            comp = clis_ant.merge(clis, on="idCliente", how="left",
+                                  suffixes=("_ant", "_act"))
+            comp["nombre"] = comp["nombre_ant"]
+            comp[["fact_act", "skus_act"]] = comp[["fact_act", "skus_act"]].fillna(0)
+            comp["dif"] = comp["fact_act"] - comp["fact_ant"]
+            peor = comp.sort_values("dif").iloc[0]
+            if peor["dif"] < 0:
+                dejo = "Dejó de comprar" if peor["fact_act"] == 0 else ""
+                filas.append(_fila(
+                    canal, "Cliente caído", str(peor["nombre"]),
+                    _pesos(peor["dif"]),
+                    _detalle(
+                        f"Pasó de {_pesos(peor['fact_ant'])} a "
+                        f"{_pesos(peor['fact_act'])} "
+                        f"({_var_pct(peor['fact_act'], peor['fact_ant'])})",
+                        f"SKUs {int(peor['skus_ant'])} → "
+                        f"{int(peor['skus_act'])}",
+                        dejo,
+                    ),
+                    nivel="riesgo",
+                ))
+
+    if not filas:
+        return vacio
+    out = pd.DataFrame(filas)
+    out["_o"] = out["Insight"].map({n: i for i, n in enumerate(INSIGHTS_ORDEN)})
+    return (out.sort_values(["Canal", "_o"]).drop(columns="_o")
+            .reset_index(drop=True))
 
 
 # ---------------------------------------------------------------------------
@@ -1393,17 +1794,67 @@ def metas_original_vs_vigente(anio_mes, tipo, nivel, canal, historial=None,
     }
 
 
+# --- Feriados ---------------------------------------------------------------
+# Los feriados nacionales NO se facturan: verificado contra el parquet, los 11
+# feriados transcurridos de 2026 tienen 0 kg sin excepción. Contarlos como día
+# de venta infla la proyección, y el daño es peor en Food Service porque casi
+# todos los feriados trasladables caen lunes, que es el día más pesado de ese
+# canal (28% a 84% de los kilos de cada vendedor).
+#
+# NO se incluyen los tres días no laborables con fines turísticos de 2026
+# (lunes 23/3, viernes 10/7 y lunes 7/12): son optativos para el empleador y
+# Gaven facturó normalmente en los dos que ya pasaron (7.773 kg y 15.995 kg).
+#
+# Al cambiar de año hay que agregar el calendario nuevo acá y nada más.
+FERIADOS_POR_ANIO = {
+    2026: (
+        (1, 1),    # Año Nuevo (jue)
+        (2, 16),   # Carnaval (lun)
+        (2, 17),   # Carnaval (mar)
+        (3, 24),   # Memoria por la Verdad y la Justicia (mar)
+        (4, 2),    # Malvinas (jue)
+        (4, 3),    # Viernes Santo (vie)
+        (5, 1),    # Día del Trabajador (vie)
+        (5, 25),   # Revolución de Mayo (lun)
+        (6, 15),   # Güemes, trasladado (lun)
+        (6, 20),   # Belgrano (sáb)
+        (7, 9),    # Independencia (jue)
+        (8, 17),   # San Martín (lun)
+        (10, 12),  # Diversidad Cultural (lun)
+        (11, 23),  # Soberanía Nacional, trasladado (lun)
+        (12, 8),   # Inmaculada Concepción (mar)
+        (12, 25),  # Navidad (vie)
+    ),
+}
+
+FERIADOS = frozenset(
+    dt.date(a, m, d) for a, fechas in FERIADOS_POR_ANIO.items() for m, d in fechas
+)
+
+
+def _feriados(feriados=None):
+    """Resuelve el set de feriados a usar.
+
+    `None` (el default de todas las funciones de proyección) significa "el
+    calendario nacional", NO "sin feriados": omitir el argumento en un punto
+    del tablero y en otro no es exactamente el bug que hacía que la solapa
+    Resumen y la solapa Metas devolvieran proyecciones distintas.
+
+    Para calcular sin feriados hay que pedirlo explícito: `feriados=()`.
+    """
+    return FERIADOS if feriados is None else set(feriados)
+
+
 def dias_habiles(desde, hasta, con_sabado=True, feriados=None):
     """Cantidad de días de venta entre dos fechas (ambas inclusive).
-    Por defecto cuenta lunes a sábado (no se factura los domingos). Es la base
-    de la proyección a fin de mes; en el tablero el número se puede pisar a
-    mano si el mes tuvo feriados o cierres.
+    Por defecto cuenta lunes a sábado (no se factura los domingos) y descuenta
+    los feriados nacionales. Es la base de la proyección a fin de mes.
 
-    `feriados`: colección de dt.date que no se cuentan (no se factura)."""
+    `feriados`: colección de dt.date que no se cuentan. None = FERIADOS."""
     if desde is None or hasta is None or hasta < desde:
         return 0
     tope = 5 if con_sabado else 4  # weekday(): lunes=0 ... domingo=6
-    fer = set(feriados or ())
+    fer = _feriados(feriados)
     dias = 0
     d = desde
     while d <= hasta:
@@ -1469,7 +1920,7 @@ def contar_dias_facturacion(desde, hasta, dias_semana, feriados=None):
     dias = {int(d) for d in (dias_semana or ())}
     if not dias:
         return 0
-    fer = set(feriados or ())
+    fer = _feriados(feriados)
     n = 0
     d = desde
     while d <= hasta:
@@ -1827,6 +2278,203 @@ def seguimiento_metas(df_mes, metas, anio_mes, dias_pasados=None,
     return (t[cols]
             .sort_values(["meta_kg", "avance_kg"], ascending=False)
             .reset_index(drop=True))
+
+
+# --- Evolutivo: cómo viene el cumplimiento a lo largo del año --------------
+# seguimiento_metas() mira UN mes. Acá se recorre mes por mes para ver la
+# curva: cuánto se pidió, cuánto se vendió y —en el mes que está abierto—
+# cuánto va a cerrar si se mantiene el ritmo. Es la lectura que se pidió para
+# la mesa chica ("el proyectado contra la meta, cómo viene de cumplimiento").
+#
+# El mes en curso es el único que se proyecta: los meses cerrados ya son
+# definitivos y su proyección es el kilaje real, así que la curva no cambia
+# hacia atrás. La proyección se calcula con la misma función que el
+# seguimiento (vendedor por vendedor), así que los dos números coinciden.
+#
+# Se compara SOLO contra el objetivo cargado: un mes sin objetivo queda con
+# meta 0 y cumplimiento vacío. NO se completa con el presupuesto anual —es
+# otra cosa (la línea base de principio de año) y mezclarlos haría que la
+# curva no se pueda leer.
+
+EVOLUTIVO_COLS = ["meta_kg", "real_kg", "proyeccion_kg", "cumplimiento_pct",
+                  "avance_pct", "brecha_kg", "cerrado"]
+
+
+def meses_con_ventas(df_ventas, anio=None):
+    """Meses 'YYYY-MM' con ventas en el detalle, del más viejo al más nuevo."""
+    if df_ventas is None or len(df_ventas) == 0:
+        return []
+    if "fechaComprobate" not in df_ventas.columns:
+        return []
+    f = pd.to_datetime(df_ventas["fechaComprobate"], errors="coerce").dropna()
+    if anio is not None:
+        f = f[f.dt.year == int(anio)]
+    if f.empty:
+        return []
+    return sorted(f.dt.strftime("%Y-%m").unique().tolist())
+
+
+def evolutivo_metas(df_ventas, metas, meses=None, nivel="canal", canales=None,
+                    tipo="objetivo", anio=None, feriados=None, hoy=None):
+    """Objetivo vs. real mes a mes, con la proyección del mes abierto.
+
+    - `df_ventas`: parquet de detalle COMPLETO (sin los filtros globales): el
+      objetivo es del canal entero, así que el real también.
+    - `metas`: salida de cargar_metas().
+    - `meses`: lista de 'YYYY-MM'. Si no viene, se arma con los meses que
+      tienen ventas más los que tienen objetivo cargado (así un mes con meta
+      pero todavía sin ventas aparece igual, en cero).
+    - `nivel`: 'canal', 'proveedor' o 'vendedor' (el grano de la meta).
+    - `canales`: recorte de canales; None es todos.
+
+    Devuelve una fila por mes y por ítem del nivel:
+      anio_mes · <llaves del nivel> · meta_kg · real_kg · proyeccion_kg ·
+      cumplimiento_pct (proyección ÷ meta) · avance_pct (real ÷ meta) ·
+      brecha_kg (proyección − meta) · cerrado (bool)
+
+    Los meses sin objetivo vienen con meta_kg = 0 y los porcentajes en NaN:
+    la venta real se muestra igual, sin línea de meta.
+    """
+    etiqueta = METAS_ETIQUETA.get(nivel, "marca_linea")
+    llaves = ["dsCanalMkt"] + ([etiqueta] if etiqueta else [])
+    cols = ["anio_mes"] + llaves + EVOLUTIVO_COLS
+
+    if meses is None:
+        meses = meses_con_ventas(df_ventas, anio=anio)
+        con_meta = filtrar_metas(metas, tipo=tipo, nivel=nivel)
+        if not con_meta.empty:
+            extra = [str(m) for m in con_meta["anio_mes"].unique()]
+            if anio is not None:
+                extra = [m for m in extra if m[:4] == str(anio)]
+            meses = sorted(set(meses) | set(extra))
+    meses = [str(m) for m in (meses or []) if str(m)[:7]]
+    if not meses:
+        return pd.DataFrame(columns=cols)
+
+    _hoy = hoy or dt.date.today()
+    tiene_fechas = (df_ventas is not None and len(df_ventas) > 0
+                    and "fechaComprobate" in df_ventas.columns)
+    fechas = (pd.to_datetime(df_ventas["fechaComprobate"], errors="coerce")
+              if tiene_fechas else None)
+
+    partes = []
+    for mes in sorted(meses):
+        try:
+            anio_m, mes_m = int(str(mes)[:4]), int(str(mes)[5:7])
+        except ValueError:
+            continue
+        desde = dt.date(anio_m, mes_m, 1)
+        hasta = dt.date(anio_m, mes_m, calendar.monthrange(anio_m, mes_m)[1])
+
+        df_mes = None
+        if fechas is not None:
+            mask = ((fechas >= pd.Timestamp(desde))
+                    & (fechas < pd.Timestamp(hasta) + pd.Timedelta(days=1)))
+            df_mes = df_ventas[mask.fillna(False)]
+
+        real = _kilos_por_nivel(df_mes, nivel).rename(
+            columns={"kilos": "real_kg"})
+        m = filtrar_metas(metas, anio_mes=mes, tipo=tipo, nivel=nivel)
+        m = (m[llaves + ["meta_kg"]] if not m.empty
+             else pd.DataFrame(columns=llaves + ["meta_kg"]))
+
+        for d in (m, real):
+            for c in llaves:
+                d[c] = d[c].astype(str).str.strip()
+
+        t = m.merge(real, on=llaves, how="outer")
+        if t.empty:
+            continue
+
+        for c in ["meta_kg", "real_kg"]:
+            t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0.0)
+
+        # Corte real del mes: la última fecha CON datos, no "hoy". Un mes sin
+        # ventas se toma como cerrado: no hay ritmo que extrapolar.
+        corte = None
+        if df_mes is not None and len(df_mes):
+            _c = pd.to_datetime(df_mes["fechaComprobate"], errors="coerce").max()
+            corte = _c.date() if pd.notna(_c) else None
+
+        # Un mes se proyecta solo si sigue abierto. Los meses que ya pasaron
+        # son definitivos aunque el último comprobante no caiga el día 31 (si
+        # el mes termina domingo el corte es el viernes o el sábado): sin este
+        # chequeo el evolutivo "proyectaría" meses viejos y la curva de atrás
+        # se movería sola.
+        cerrado = (
+            corte is None
+            or corte >= hasta
+            or hasta < _hoy
+            or dias_habiles(desde, corte, feriados=feriados)
+            >= dias_habiles(desde, hasta, feriados=feriados)
+        )
+
+        t["proyeccion_kg"] = t["real_kg"]
+        if not cerrado:
+            p = _proyeccion_por_nivel(df_mes, nivel, desde, corte, hasta,
+                                      feriados=feriados)
+            if not p.empty:
+                t = t.drop(columns=["proyeccion_kg"]).merge(
+                    p, on=llaves, how="left")
+                # Las filas con meta pero sin ventas no están en la
+                # proyección: proyectan lo que vendieron (cero).
+                t["proyeccion_kg"] = pd.to_numeric(
+                    t["proyeccion_kg"], errors="coerce").fillna(t["real_kg"])
+
+        t.insert(0, "anio_mes", mes)
+        t["cerrado"] = bool(cerrado)
+        partes.append(t)
+
+    if not partes:
+        return pd.DataFrame(columns=cols)
+
+    t = pd.concat(partes, ignore_index=True)
+
+    if canales:
+        cs = {str(c).strip() for c in canales}
+        t = t[t["dsCanalMkt"].astype(str).str.strip().isin(cs)]
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+
+    con_meta = t["meta_kg"] > 0
+    t["cumplimiento_pct"] = np.where(
+        con_meta, t["proyeccion_kg"] / t["meta_kg"].replace(0, np.nan) * 100,
+        np.nan)
+    t["avance_pct"] = np.where(
+        con_meta, t["real_kg"] / t["meta_kg"].replace(0, np.nan) * 100, np.nan)
+    t["brecha_kg"] = np.where(con_meta, t["proyeccion_kg"] - t["meta_kg"],
+                              np.nan)
+
+    return (t[cols]
+            .sort_values(["anio_mes", "meta_kg", "real_kg"],
+                         ascending=[True, False, False])
+            .reset_index(drop=True))
+
+
+def evolutivo_total(t):
+    """Colapsa el evolutivo a una fila por mes (suma de todos los ítems).
+
+    Los kilos se suman y los porcentajes se RECALCULAN sobre esos totales: un
+    promedio de porcentajes daría mal en cuanto los ítems tienen distinto
+    tamaño. Un mes queda con cumplimiento vacío si no tiene ningún objetivo
+    cargado.
+    """
+    cols = ["anio_mes"] + EVOLUTIVO_COLS
+    if t is None or len(t) == 0:
+        return pd.DataFrame(columns=cols)
+    g = (t.groupby("anio_mes", as_index=False)
+         .agg(meta_kg=("meta_kg", "sum"),
+              real_kg=("real_kg", "sum"),
+              proyeccion_kg=("proyeccion_kg", "sum"),
+              cerrado=("cerrado", "all")))
+    con_meta = g["meta_kg"] > 0
+    den = g["meta_kg"].replace(0, np.nan)
+    g["cumplimiento_pct"] = np.where(con_meta, g["proyeccion_kg"] / den * 100,
+                                     np.nan)
+    g["avance_pct"] = np.where(con_meta, g["real_kg"] / den * 100, np.nan)
+    g["brecha_kg"] = np.where(con_meta, g["proyeccion_kg"] - g["meta_kg"],
+                              np.nan)
+    return g[cols].sort_values("anio_mes").reset_index(drop=True)
 
 
 # --- Controles de consistencia entre niveles -------------------------------

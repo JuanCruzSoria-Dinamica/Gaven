@@ -318,10 +318,25 @@ print("\n[9] Días de facturación de Food Service")
 # Agosto 2026 arranca sábado. Corte al viernes 7.
 _D, _C, _H = dt.date(2026, 8, 1), dt.date(2026, 8, 7), dt.date(2026, 8, 31)
 
-chk(dp.dias_habiles(_D, _H) == 26 and dp.dias_habiles(_D, _C) == 6,
-    "días hábiles de agosto 2026 (lunes a sábado)")
-chk(dp.dias_habiles(_D, _H, feriados={dt.date(2026, 8, 17)}) == 25,
-    "los feriados no cuentan como día hábil")
+# Agosto 2026 tiene 26 días lunes a sábado, menos el feriado del lunes 17.
+chk(dp.dias_habiles(_D, _H) == 25 and dp.dias_habiles(_D, _C) == 6,
+    "días hábiles de agosto 2026 (lunes a sábado, sin el feriado del 17)")
+chk(dp.dias_habiles(_D, _H, feriados=()) == 26,
+    "feriados=() calcula sin feriados (hay que pedirlo explícito)")
+chk(dp.dias_habiles(_D, _H, feriados={dt.date(2026, 8, 3)}) == 25,
+    "se puede pasar un calendario propio")
+chk(dt.date(2026, 8, 17) in dp.FERIADOS and dt.date(2026, 7, 9) in dp.FERIADOS,
+    "el calendario nacional está cargado")
+chk(dt.date(2026, 7, 10) not in dp.FERIADOS,
+    "los días no laborables turísticos NO son feriados: Gaven factura igual")
+
+# El default es el calendario nacional en TODA la cadena de proyección: que una
+# solapa lo pasara y otra no es lo que hacía que Resumen y Metas no cerraran.
+chk(dp.contar_dias_facturacion(_D, _H, (0, 3)) == 8
+    and dp.contar_dias_facturacion(_D, _H, (0, 3), feriados=()) == 9,
+    "contar_dias_facturacion también descuenta feriados por default")
+chk(dp.dias_venta("FOOD SERVICE", "COLOMBO, CARLOS", _D, _H, _H)[1] == 8,
+    "y llega hasta dias_venta() sin que haya que pasar nada")
 
 chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "COLOMBO, CARLOS") == (0, 3),
     "lee los días declarados del vendedor")
@@ -332,15 +347,14 @@ chk(dp.dias_facturacion_vendedor("GRANJAS", "MORENO GERMAN") is None,
 chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "FOOD CABA") is None,
     "vendedor sin días declarados devuelve None (cae a días hábiles)")
 
-# Colombo factura lunes y jueves: en agosto son 9, y al 7 pasaron 2 (3 y 6).
-chk(dp.contar_dias_facturacion(_D, _H, (0, 3)) == 9,
-    "cuenta los lunes y jueves del mes")
-chk(dp.dias_venta("FOOD SERVICE", "COLOMBO, CARLOS", _D, _C, _H) == (2, 9),
+# Colombo factura lunes y jueves: en agosto hay 9, pero el lunes 17 es feriado,
+# así que le quedan 8. Al 7 pasaron 2 (3 y 6).
+chk(dp.dias_venta("FOOD SERVICE", "COLOMBO, CARLOS", _D, _C, _H) == (2, 8),
     "días de venta de un vendedor de Food: sus días de facturación")
-chk(dp.dias_venta("RETAIL", "AHMED, GISELA", _D, _C, _H) == (6, 26),
+chk(dp.dias_venta("RETAIL", "AHMED, GISELA", _D, _C, _H) == (6, 25),
     "un canal que factura todos los días sigue con días hábiles")
 chk(casi(dp.factor_proyeccion("FOOD SERVICE", "COLOMBO, CARLOS", _D, _C, _H),
-         9 / 2, tol=0.001),
+         8 / 2, tol=0.001),
     "el factor de proyección es días totales ÷ transcurridos")
 chk(dp.factor_proyeccion("FOOD SERVICE", "COLOMBO, CARLOS", _D, _H, _H) == 1.0,
     "mes cerrado: factor 1, la proyección es el kilaje real")
@@ -358,7 +372,9 @@ vf = pd.DataFrame({
     "kilos": [100.0, 100.0, 100.0],
 })
 
-_esperado = 100 * (9 / 2) + 100 * (13 / 3) + 100 * (26 / 6)
+# Totales de agosto 2026 ya descontado el feriado del lunes 17: Colombo
+# (lun, jue) 8; Avetta (lun, mié, vie) 12; Retail, días hábiles 25.
+_esperado = 100 * (8 / 2) + 100 * (12 / 3) + 100 * (25 / 6)
 
 s_can = dp.seguimiento_metas(vf, dp._metas_vacio(), "2026-08", nivel="canal",
                              desde=_D, corte=_C, hasta=_H)
@@ -374,10 +390,10 @@ chk(casi(s_can["proyeccion_kg"].sum(), s_prov["proyeccion_kg"].sum(), tol=0.01)
     "canal = Σ proveedores = Σ vendedores (los tres niveles cierran)")
 
 _food = s_can[s_can["dsCanalMkt"] == "FOOD SERVICE"]["proyeccion_kg"].iloc[0]
-chk(casi(_food, 100 * (9 / 2) + 100 * (13 / 3), tol=0.01),
+chk(casi(_food, 100 * (8 / 2) + 100 * (12 / 3), tol=0.01),
     "Food Service proyecta contra días de facturación")
 _retail = s_can[s_can["dsCanalMkt"] == "RETAIL"]["proyeccion_kg"].iloc[0]
-chk(casi(_retail, 100 * (26 / 6), tol=0.01),
+chk(casi(_retail, 100 * (25 / 6), tol=0.01),
     "Retail sigue proyectando contra días hábiles: no cambió nada")
 
 # Sin fechas se mantiene el modo viejo (compatibilidad hacia atrás).
@@ -398,14 +414,14 @@ chk(dp.vendedores_sin_dias_facturacion(vsd) == ["FOOD CABA"],
 s_sd = dp.seguimiento_metas(vsd, dp._metas_vacio(), "2026-08", nivel="vendedor",
                             desde=_D, corte=_C, hasta=_H)
 _caba = s_sd[s_sd["dsVendedor"] == "FOOD CABA"]["proyeccion_kg"].iloc[0]
-chk(casi(_caba, 100 * (26 / 6), tol=0.01),
+chk(casi(_caba, 100 * (25 / 6), tol=0.01),
     "el vendedor sin días declarados cae a días hábiles (criterio viejo)")
 
 # Resumen de días para los textos del tablero.
 _pas, _tot, _mixto = dp.dias_venta_resumen(vf, _D, _C, _H)
 chk(_mixto is True, "avisa que la vista mezcla días de facturación")
 _pr, _tr, _mr = dp.dias_venta_resumen(vf, _D, _C, _H, canales=["RETAIL"])
-chk((_pr, _tr, _mr) == (6, 26, False),
+chk((_pr, _tr, _mr) == (6, 25, False),
     "un canal sin días de facturación devuelve exactamente días hábiles")
 
 # Factor ponderado (el que usa el tab Resumen).
@@ -417,6 +433,118 @@ chk(_p2 is False and _f2 == 1.0,
     "mes cerrado: el tab Resumen no proyecta")
 chk(dp.factor_proyeccion_ponderado(pd.DataFrame(), _D, _C, _H) == (1.0, False),
     "sin ventas no proyecta y no explota")
+
+
+print("\n[10] Evolutivo de proyectado vs. meta")
+
+# Tres meses: dos cerrados y uno abierto. El canal se llama "FOOD" (no "FOOD
+# SERVICE") a propósito: así no entra en dp.DIAS_FACTURACION y la proyección
+# es contra días hábiles, que es determinista.
+_HOY_EV = dt.date(2026, 9, 6)
+ventas_ev = pd.DataFrame(
+    [("FOOD", "AHMED", "MCCAIN", 1000, "2026-07-10"),
+     ("FOOD", "AHMED", "MCCAIN", 1200, "2026-08-11"),
+     ("FOOD", "ROJAS", "GARCIA", 800, "2026-08-12"),
+     ("FOOD", "AHMED", "MCCAIN", 900, "2026-09-02"),
+     ("FOOD", "ROJAS", "GARCIA", 600, "2026-09-05"),
+     ("GRANJAS", "LUGONES", "MCCAIN", 500, "2026-09-03")],
+    columns=["dsCanalMkt", "dsVendedor", "marca_linea", "kilos",
+             "fechaComprobate"])
+ventas_ev["fechaComprobate"] = pd.to_datetime(ventas_ev["fechaComprobate"])
+
+metas_ev = dp.normalizar_metas(pd.DataFrame([
+    {"anio_mes": "2026-08", "tipo": "objetivo", "nivel": "canal",
+     "dsCanalMkt": "FOOD", "meta_kg": 2500.0},
+    {"anio_mes": "2026-09", "tipo": "objetivo", "nivel": "canal",
+     "dsCanalMkt": "FOOD", "meta_kg": 10000.0},
+    # Presupuesto de un mes SIN objetivo: no tiene que completar la meta.
+    {"anio_mes": "2026-07", "tipo": "presupuesto", "nivel": "canal",
+     "dsCanalMkt": "FOOD", "meta_kg": 9999.0},
+]))
+
+ev = dp.evolutivo_metas(ventas_ev, metas_ev, nivel="canal", canales=["FOOD"],
+                        anio=2026, hoy=_HOY_EV)
+chk(list(ev.columns) == ["anio_mes", "dsCanalMkt"] + dp.EVOLUTIVO_COLS,
+    "evolutivo: columnas correctas")
+chk(ev["anio_mes"].tolist() == ["2026-07", "2026-08", "2026-09"],
+    "evolutivo: una fila por mes, en orden cronológico")
+
+_jul = ev[ev["anio_mes"] == "2026-07"].iloc[0]
+chk(casi(_jul["meta_kg"], 0) and bool(np.isnan(_jul["cumplimiento_pct"])),
+    "mes sin objetivo: meta 0 y cumplimiento NaN (no se completa con el "
+    "presupuesto)")
+chk(casi(_jul["real_kg"], 1000) and casi(_jul["proyeccion_kg"], 1000),
+    "mes viejo cerrado: la proyección es el kilaje real, no se extrapola")
+
+_ago = ev[ev["anio_mes"] == "2026-08"].iloc[0]
+chk(casi(_ago["real_kg"], 2000) and casi(_ago["proyeccion_kg"], 2000),
+    "mes cerrado: real y proyección coinciden")
+chk(casi(_ago["cumplimiento_pct"], 80) and casi(_ago["brecha_kg"], -500),
+    "mes cerrado: cumplimiento = real ÷ objetivo (2.000 / 2.500 = 80 %)")
+chk(bool(_ago["cerrado"]) and not bool(
+    ev[ev["anio_mes"] == "2026-09"].iloc[0]["cerrado"]),
+    "marca cerrado/abierto según el mes en curso")
+
+_sep = ev[ev["anio_mes"] == "2026-09"].iloc[0]
+_esp_sep = 1500 * (dp.dias_habiles(dt.date(2026, 9, 1), dt.date(2026, 9, 30))
+                   / dp.dias_habiles(dt.date(2026, 9, 1), dt.date(2026, 9, 5)))
+chk(casi(_sep["real_kg"], 1500) and casi(_sep["proyeccion_kg"], _esp_sep, tol=1),
+    "mes abierto: proyecta a fin de mes con los días de venta")
+chk(casi(_sep["cumplimiento_pct"], _esp_sep / 10000 * 100, tol=0.1)
+    and casi(_sep["avance_pct"], 15),
+    "cumplimiento usa la proyección y avance_pct el real")
+
+# La proyección del mes abierto tiene que dar lo mismo mire uno el nivel que
+# mire (es la misma cuenta por vendedor, agregada distinto).
+_proys = []
+for _niv in ("canal", "proveedor", "vendedor"):
+    _e = dp.evolutivo_metas(ventas_ev, metas_ev, nivel=_niv, canales=["FOOD"],
+                            anio=2026, hoy=_HOY_EV)
+    _proys.append(float(_e[_e["anio_mes"] == "2026-09"]["proyeccion_kg"].sum()))
+chk(all(casi(p, _proys[0]) for p in _proys),
+    "canal, proveedor y vendedor proyectan lo mismo en total")
+
+# Contra el seguimiento del mismo mes: los dos números tienen que coincidir.
+_v_sep = ventas_ev[ventas_ev["fechaComprobate"].dt.month == 9]
+_seg_sep = dp.seguimiento_metas(
+    _v_sep, metas_ev, "2026-09", canales=["FOOD"], nivel="canal",
+    desde=dt.date(2026, 9, 1), corte=dt.date(2026, 9, 5),
+    hasta=dt.date(2026, 9, 30))
+chk(casi(_seg_sep["proyeccion_kg"].sum(), _sep["proyeccion_kg"]),
+    "el evolutivo y el seguimiento muestran la misma proyección")
+
+chk(set(dp.evolutivo_metas(ventas_ev, metas_ev, nivel="canal", anio=2026,
+                           hoy=_HOY_EV)["dsCanalMkt"]) == {"FOOD", "GRANJAS"},
+    "sin recorte de canales trae todos")
+
+tot_ev = dp.evolutivo_total(ev)
+chk(list(tot_ev.columns) == ["anio_mes"] + dp.EVOLUTIVO_COLS
+    and len(tot_ev) == 3, "evolutivo_total: una fila por mes")
+chk(casi(tot_ev[tot_ev["anio_mes"] == "2026-08"]["cumplimiento_pct"].iloc[0], 80),
+    "evolutivo_total recalcula el % sobre los totales")
+
+# Dos ítems de distinto tamaño: el % del total NO puede ser el promedio de los
+# porcentajes de cada uno.
+_dos = pd.DataFrame([
+    {"anio_mes": "2026-08", "dsCanalMkt": "A", "meta_kg": 1000.0,
+     "real_kg": 1000.0, "proyeccion_kg": 1000.0, "cumplimiento_pct": 100.0,
+     "avance_pct": 100.0, "brecha_kg": 0.0, "cerrado": True},
+    {"anio_mes": "2026-08", "dsCanalMkt": "B", "meta_kg": 9000.0,
+     "real_kg": 4500.0, "proyeccion_kg": 4500.0, "cumplimiento_pct": 50.0,
+     "avance_pct": 50.0, "brecha_kg": -4500.0, "cerrado": True},
+])
+chk(casi(dp.evolutivo_total(_dos)["cumplimiento_pct"].iloc[0], 55),
+    "el cumplimiento del total es ponderado, no un promedio de porcentajes")
+
+chk(dp.evolutivo_metas(pd.DataFrame(), dp._metas_vacio(), nivel="canal",
+                       anio=2026).empty,
+    "evolutivo sin ventas ni metas devuelve vacío (no explota)")
+chk(list(dp.evolutivo_total(pd.DataFrame()).columns)
+    == ["anio_mes"] + dp.EVOLUTIVO_COLS,
+    "evolutivo_total vacío conserva las columnas")
+chk(dp.meses_con_ventas(ventas_ev, anio=2026) == ["2026-07", "2026-08",
+                                                  "2026-09"],
+    "meses_con_ventas ordena de más viejo a más nuevo")
 
 
 print("\n[8] Íconos y semáforo")

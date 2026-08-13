@@ -11,6 +11,7 @@ Correr local:   streamlit run app.py
 
 import io
 import os
+import html
 import json
 import time
 import calendar
@@ -87,6 +88,34 @@ st.markdown(
       [data-testid="stNumberInput"] button{
         display:none !important;
       }
+      /* Tarjetas de las lecturas de mesa chica (solapa Alertas) */
+      .ins-card{
+        background:var(--sf); border:1px solid var(--border);
+        border-left:4px solid var(--azul);
+        border-radius:12px; padding:12px 14px; height:100%;
+        margin-bottom:12px;
+      }
+      .ins-card.ok{border-left-color:var(--verde);}
+      .ins-card.riesgo{border-left-color:var(--rojo);}
+      .ins-card .ins-tit{
+        color:var(--tx2); font-size:.72rem; text-transform:uppercase;
+        letter-spacing:.5px; font-weight:600; margin-bottom:2px;
+      }
+      .ins-card .ins-prot{
+        font-size:.98rem; font-weight:700; line-height:1.25; margin-bottom:2px;
+      }
+      .ins-card .ins-val{font-size:1.15rem; font-weight:700; color:var(--verde);}
+      .ins-card.riesgo .ins-val{color:var(--rojo);}
+      .ins-card .ins-det{
+        color:#cbd5e1; font-size:.8rem; line-height:1.4; margin-top:8px;
+      }
+      /* Un renglón por dato, con una línea divisoria tenue entre ellos para
+         que se lean de un vistazo sin buscar los separadores. */
+      .ins-card .ins-det > div{
+        padding:4px 0; border-top:1px solid var(--border);
+      }
+      .ins-card .ins-det > div:first-child{border-top:none; padding-top:0;}
+      .ins-card .ins-det > div:last-child{padding-bottom:0;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -129,6 +158,16 @@ def _mtime_acuerdos():
         return 0
 
 
+def _mtime_metas():
+    """mtime del parquet de metas (0 si aún no existe). Mismo criterio que
+    _mtime_acuerdos(): al guardar objetivos nuevos, todo lo que se cachea a
+    partir de las metas se invalida solo."""
+    try:
+        return os.path.getmtime(dp.METAS_PATH)
+    except OSError:
+        return 0
+
+
 @st.cache_data(show_spinner="Leyendo datos...")
 def cargar_datos_local(mtime, mtime_acuerdos=0):
     df = pd.read_parquet(PARQUET_PATH)
@@ -167,6 +206,29 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
         pd.concat([serie, nuevos], ignore_index=True)
         .sort_values(["anio_mes"] + dp.SERIE_GRANO[1:])
         .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner="Armando el evolutivo...")
+def cargar_evolutivo(nivel, canales, mtime, mtime_acuerdos=0, mtime_metas=0,
+                     hoy=None):
+    """Evolutivo de objetivo vs. real mes a mes (ver dp.evolutivo_metas()).
+
+    Se cachea porque recorre TODOS los meses del detalle y proyecta el mes
+    abierto vendedor por vendedor: es la cuenta más cara de la solapa y no
+    cambia hasta que entran ventas nuevas o se guarda un objetivo. Los mtime
+    entran en la clave para que se invalide sola en los dos casos.
+
+    `canales` llega como tupla porque la clave de caché tiene que ser
+    hasheable.
+    """
+    df = cargar_datos_local(mtime, mtime_acuerdos)
+    return dp.evolutivo_metas(
+        df, dp.cargar_metas(),
+        nivel=nivel,
+        canales=list(canales) if canales else None,
+        anio=dp.ANIO,
+        hoy=hoy,
     )
 
 
@@ -372,6 +434,11 @@ if not os.path.exists(PARQUET_PATH):
 
 df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
 
+# Copia del detalle del AÑO COMPLETO antes de recortarlo por período. Es la
+# base del universo con el que se calcula la cobertura (ver más abajo):
+# `df` se pisa enseguida con el mes elegido y después ya no se puede recuperar.
+df_anio = df
+
 
 # ---------------------------------------------------------------------------
 # Barra de filtros (arriba). Todos los filtros son selectores y aplican a
@@ -502,6 +569,16 @@ if df.empty:
     st.warning("No hay datos que cumplan con los filtros seleccionados.")
     st.stop()
 
+# --- Universo del año (denominador de la cobertura) ------------------------
+# Mismos filtros de dimensión que `df`, pero SIN recortar por período: todo
+# 2026. Contra este universo se mide qué porción de la cartera y del surtido
+# se tocó en el mes elegido (dp.agregar_cobertura / dp.cobertura_total).
+df_universo = df_anio[df_anio["fechaComprobate"].dt.year == dp.ANIO]
+for col, valores in seleccion.items():
+    if valores:
+        df_universo = df_universo[
+            df_universo[col].astype(str).str.strip().isin(valores)
+        ]
 
 # ---------------------------------------------------------------------------
 # Formatos de tablas reutilizables
@@ -521,12 +598,17 @@ COLS_DIM = {
     "skus": "SKUs", "skus_por_cliente": "SKUs/Cliente",
     "share_fc": "Share FC %", "share_kg": "Share Kg %",
     "share_cm": "Share CM %",
+    # Cobertura: % de la cartera / del surtido del año que se tocó en el
+    # período. Las columnas solo existen si se pasó por dp.agregar_cobertura.
+    "universo_clientes": "Cartera", "universo_skus": "Surtido",
+    "cob_clientes": "Cob. clientes %", "cob_skus": "Cob. SKUs %",
 }
 FMT_DIM = {
     "Kilos": fmt_kg, "Facturación": fmt_money, "Contribución": fmt_money,
     "CM %": fmt_pct, "$/kg": fmt_money, "Share FC %": fmt_pct, "Share Kg %": fmt_pct,
     "Share CM %": fmt_pct,
     "SKUs/Cliente": lambda x: f"{x:,.1f}".replace(",", "."),
+    "Cob. clientes %": fmt_pct, "Cob. SKUs %": fmt_pct,
 }
 
 
@@ -537,11 +619,16 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
     mostrar_skus=True agrega la columna 'SKUs' (cantidad de productos únicos
     que maneja cada fila de la dimensión).
     mostrar_skus_cliente=True agrega 'SKUs/Cliente' (productos únicos
-    promedio por cliente)."""
+    promedio por cliente).
+
+    Las columnas de cobertura (cartera / surtido del año y sus %) se muestran
+    solas si `g` viene de dp.agregar_cobertura; si no, no aparecen. Van
+    pegadas a su numerador: Clientes → Cartera → Cob. clientes %."""
     cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "share_cm",
-            "cm_pct", "precio_kg", "clientes"]
+            "cm_pct", "precio_kg", "clientes", "universo_clientes",
+            "cob_clientes"]
     if mostrar_skus:
-        cols.append("skus")
+        cols += ["skus", "universo_skus", "cob_skus"]
     if mostrar_skus_cliente:
         cols.append("skus_por_cliente")
     # Supervisores no ven Contribución ni CM %: se quitan las columnas.
@@ -922,7 +1009,7 @@ def render_drill(df_base, niveles, key, root_id=None):
 # La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
 # (los supervisores no ven CM). Se arma la lista de tabs según el rol.
 _labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
-                "Clientes (RFM)", "Vendedores", "Alertas", "Metas"]
+                "Altas y Bajas", "Vendedores", "Alertas", "Metas"]
 if mostrar_cm:
     _labels_tabs.append("Acuerdos McCain")
 
@@ -946,9 +1033,11 @@ with tab_resumen:
     # Es el mismo criterio que usa el seguimiento de metas, así que los dos
     # números del tablero cierran entre sí.
     # Solo aplica al mes EN CURSO; los meses cerrados ya están completos.
-    # TODO: por ahora sólo el 9 de julio; ampliar con el resto o una API.
-    FERIADOS = {dt.date(2026, 7, 9)}
-
+    #
+    # Los feriados salen de dp.FERIADOS (calendario nacional, ver
+    # data_pipeline.py) y se aplican SOLOS: no hace falta pasarlos. Antes esta
+    # solapa tenía su propia lista con un único feriado y la solapa Metas no
+    # pasaba ninguno, así que las dos proyecciones no coincidían.
     factor = 1.0
     proyectar = False
     if es_mes_actual:
@@ -958,7 +1047,7 @@ with tab_resumen:
         _ult = df["fechaComprobate"].max()
         _corte_res = _ult.date() if pd.notna(_ult) else hasta
         factor, proyectar = dp.factor_proyeccion_ponderado(
-            df, _ini_mes, _corte_res, _fin_mes, feriados=FERIADOS)
+            df, _ini_mes, _corte_res, _fin_mes)
 
     def proy(col, valor, fmt, escala=True):
         """Muestra debajo de la métrica la proyección a fin de mes.
@@ -974,9 +1063,19 @@ with tab_resumen:
     def _int(x):
         return f"{round(x):,}".replace(",", ".")
 
+    # Solo se proyectan las métricas aditivas que se leen como volumen del mes.
+    # Las de tasa (CM %, precio medio, ticket) no se pueden extrapolar por run
+    # rate —el número proyectado da igual al actual y no aporta nada— y las de
+    # conteo (clientes, SKUs) tampoco, porque se repiten entre días en vez de
+    # sumarse. Antes se mostraban igual y confundían más de lo que ayudaban.
+    _METRICAS_PROYECTADAS = {
+        "Facturación neta", "Kilos vendidos", "Contribución marginal",
+    }
+
     # Cada métrica: (etiqueta, valor a mostrar, valor para proyectar,
-    # formato de proyección o None, escala). Las de CM solo se agregan para
-    # el rol dueño, así supervisores nunca las reciben.
+    # formato o None, escala). El formato se usa para la proyección y para el
+    # Excel, por eso se mantiene aunque la métrica no se proyecte. Las de CM
+    # solo se agregan para el rol dueño, así supervisores nunca las reciben.
     metricas = [
         ("Facturación neta", fmt_money(m["subtotal_neto"]),
          m["subtotal_neto"], fmt_money, True),
@@ -1001,6 +1100,18 @@ with tab_resumen:
          m["n_skus"], _int, True),
     ]
 
+    # --- Cobertura --------------------------------------------------------
+    # Qué porción de la cartera y del surtido del año se tocó en el período.
+    # Van sin proyección: el % no se puede extrapolar por regla de tres porque
+    # los clientes se repiten, no se suman.
+    _cob = dp.cobertura_total(df, df_universo)
+    metricas += [
+        ("Cobertura de clientes", fmt_pct(_cob["cob_clientes"]),
+         _cob["cob_clientes"], None, False),
+        ("Cobertura de SKUs", fmt_pct(_cob["cob_skus"]),
+         _cob["cob_skus"], None, False),
+    ]
+
     # Tablas que junta esta solapa para el Excel descargable.
     hojas_resumen = {"KPIs": pd.DataFrame(
         [(lbl, pval) for lbl, _disp, pval, _pf, _e in metricas],
@@ -1019,12 +1130,18 @@ with tab_resumen:
         cols = st.columns(4)
         for col, (lbl, disp, pval, pfmt, escala) in zip(cols, metricas[i:i + 4]):
             col.metric(lbl, disp)
-            if pfmt is not None:
+            if pfmt is not None and lbl in _METRICAS_PROYECTADAS:
                 proy(col, pval, pfmt, escala)
 
     st.caption(
         f"{m['n_comprobantes']:,}".replace(",", ".") + " comprobantes  ·  "
         + fmt_kg(m["kg_por_cliente"]) + " por cliente (promedio)"
+    )
+    st.caption(
+        f"Cobertura: se le vendió a {_cob['clientes']} de los "
+        f"{_cob['universo_clientes']} clientes y se movieron "
+        f"{_cob['skus']} de los {_cob['universo_skus']} SKUs que tuvieron "
+        f"movimiento en {dp.ANIO}."
     )
 
     st.divider()
@@ -1315,8 +1432,9 @@ with tab_lineas:
 # --- TAB CANALES ----------------------------------------------------------
 with tab_canales:
     st.subheader("Detalle por canal")
-    t_canales = tabla_dim(dp.por_canal(df), "Canal", "dsCanalMkt",
-                          mostrar_skus=True)
+    t_canales = tabla_dim(
+        dp.agregar_cobertura(dp.por_canal(df), "dsCanalMkt", df_universo),
+        "Canal", "dsCanalMkt", mostrar_skus=True)
 
     # Para dueños: torta de share + CM % por canal lado a lado.
     # Para supervisores: solo la torta (a ancho completo), sin CM %.
@@ -1344,11 +1462,17 @@ with tab_canales:
 
     st.divider()
     st.subheader("Detalle por subcanal")
-    t_subcanales = tabla_dim(dp.por_subcanal(df), "Subcanal", "dsSubcanalMKT",
-                             mostrar_skus=True)
+    t_subcanales = tabla_dim(
+        dp.agregar_cobertura(dp.por_subcanal(df), "dsSubcanalMKT", df_universo),
+        "Subcanal", "dsSubcanalMKT", mostrar_skus=True)
 
     st.subheader("Detalle por marca / línea")
-    t_marcas = tabla_dim(dp.por_proveedor(df), "Marca / Línea", "marca_linea")
+    # Acá la cobertura se lee como penetración de la marca: de los clientes
+    # que compraron esa marca alguna vez en el año, cuántos la compraron en
+    # el mes.
+    t_marcas = tabla_dim(
+        dp.agregar_cobertura(dp.por_proveedor(df), "marca_linea", df_universo),
+        "Marca / Línea", "marca_linea")
 
     st.divider()
     boton_excel("canales", {
@@ -1430,16 +1554,16 @@ with tab_prod:
             # producto a partir de la fila que el usuario seleccione (la
             # selección devuelve la posición de la fila en este mismo orden).
             prod_top = prod_f[cols].head(top_n).reset_index(drop=True)
-            # "clientes" = a cuántos clientes distintos se le vende el producto
-            # (cobertura). COLS_DIM lo llama "Clientes"; acá lo mostramos como
-            # "Cobertura" para dejar claro el sentido.
-            t = prod_top.rename(columns={
-                "dsArticulo": "Producto", **COLS_DIM, "clientes": "Cobertura",
-            })
+            # "clientes" = a cuántos clientes distintos se le vende el
+            # producto. Antes esta columna se mostraba como "Cobertura", pero
+            # es un CONTEO, no un porcentaje: chocaba con la cobertura real
+            # (Cob. clientes % / Cob. SKUs %) de Canales y Vendedores. Se
+            # renombró a "Clientes que lo compran" para sacar la ambigüedad.
+            _REN_PROD = {"dsArticulo": "Producto", **COLS_DIM,
+                         "clientes": "Clientes que lo compran"}
+            t = prod_top.rename(columns=_REN_PROD)
             # Al Excel va el ranking COMPLETO filtrado (no solo el Top N).
-            hojas_prod["Ranking ABC"] = prod_f[cols].rename(columns={
-                "dsArticulo": "Producto", **COLS_DIM, "clientes": "Cobertura",
-            })
+            hojas_prod["Ranking ABC"] = prod_f[cols].rename(columns=_REN_PROD)
             sel_evt = st.dataframe(
                 t.style.format(FMT_DIM), use_container_width=True,
                 hide_index=True, on_select="rerun",
@@ -1472,7 +1596,8 @@ with tab_prod:
                     k2.metric("Kilos", fmt_kg(m_prod["kilos"]))
                     k3.metric("Precio medio",
                               fmt_money(m_prod["precio_kg"]) + " /kg")
-                    k4.metric("Cobertura", f"{int(m_prod['clientes'])} clientes")
+                    k4.metric("Lo compran",
+                              f"{int(m_prod['clientes'])} clientes")
 
                     st.caption(
                         "Bajá nivel por nivel: Canal → Vendedor → Cliente. "
@@ -1497,89 +1622,96 @@ with tab_prod:
     boton_excel("productos", hojas_prod, key="xlsx_prod")
 
 
-# --- TAB CLIENTES (RFM) ---------------------------------------------------
+# --- TAB ALTAS Y BAJAS ----------------------------------------------------
+# NOTA: el bloque de RFM (segmentos + top clientes por facturación/frecuencia)
+# quedó COMENTADO a pedido, para que la solapa muestre solo altas y bajas.
+# No se borró nada: las funciones dp.rfm() y dp.resumen_segmentos() siguen
+# vivas en data_pipeline.py, así que para reactivarlo alcanza con descomentar
+# el bloque de abajo (y volver a poner "Clientes (RFM)" en _labels_tabs).
 with tab_clientes:
-    r = dp.rfm(df)
     hojas_cli = {}  # tablas para el Excel descargable de la solapa
 
-    if r.empty:
-        st.info("No hay datos suficientes para el RFM.")
-    else:
-        st.subheader("Segmentos de clientes (RFM)")
-        seg = dp.resumen_segmentos(r)
-        t_seg = seg.rename(columns={
-            "segmento": "Segmento", "clientes": "Clientes",
-            "facturacion": "Facturación",
-        })
-        st.dataframe(
-            t_seg.style.format({"Facturación": fmt_money}),
-            use_container_width=True, hide_index=True,
-        )
-        hojas_cli["Segmentos"] = t_seg
-
-        st.divider()
-        # Filtro por segmento: si elegís "Campeones" (o varios), las tablas de
-        # abajo muestran el top SOLO de ese/esos segmento(s). Vacío = todos.
-        ORDEN_SEG = ["Campeones", "Leales", "Nuevos / Prometedores",
-                     "En riesgo", "Hibernando / Perdidos"]
-        segs_disp = [s for s in ORDEN_SEG if s in set(r["segmento"])]
-        c_seg, c_top = st.columns([3, 1])
-        seg_sel = c_seg.multiselect(
-            "Segmento", segs_disp, default=[],
-            placeholder="Todos los segmentos", key="seg_rfm",
-        )
-        top_n = c_top.select_slider(
-            "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_rfm"
-        )
-        r_f = r[r["segmento"].isin(seg_sel)] if seg_sel else r
-        # Al Excel va la lista COMPLETA de clientes del filtro (no el Top N).
-        if not r_f.empty:
-            hojas_cli["Clientes RFM"] = (
-                r_f.sort_values("monetario", ascending=False)
-                [["nombreCliente", "segmento", "monetario", "frecuencia",
-                  "recencia"]]
-                .rename(columns={
-                    "nombreCliente": "Cliente", "segmento": "Segmento",
-                    "monetario": "Facturación", "frecuencia": "Frecuencia",
-                    "recencia": "Recencia (días)",
-                })
-            )
-        if r_f.empty:
-            st.info("No hay clientes en el segmento seleccionado.")
-        else:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("Top clientes por facturación")
-                st.dataframe(
-                    r_f.sort_values("monetario", ascending=False).head(top_n)
-                    [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
-                    .rename(columns={
-                        "nombreCliente": "Cliente", "segmento": "Segmento",
-                        "monetario": "Facturación", "frecuencia": "Frecuencia",
-                        "recencia": "Recencia (días)",
-                    })
-                    .style.format({"Facturación": fmt_money}),
-                    use_container_width=True, hide_index=True,
-                )
-            with col_b:
-                st.subheader("Top clientes por frecuencia")
-                st.dataframe(
-                    r_f.sort_values("frecuencia", ascending=False).head(top_n)
-                    [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
-                    .rename(columns={
-                        "nombreCliente": "Cliente", "segmento": "Segmento",
-                        "frecuencia": "Frecuencia", "monetario": "Facturación",
-                        "recencia": "Recencia (días)",
-                    })
-                    .style.format({"Facturación": fmt_money}),
-                    use_container_width=True, hide_index=True,
-                )
+    # ----- INICIO BLOQUE RFM COMENTADO --------------------------------------
+    # r = dp.rfm(df)
+    #
+    # if r.empty:
+    #     st.info("No hay datos suficientes para el RFM.")
+    # else:
+    #     st.subheader("Segmentos de clientes (RFM)")
+    #     seg = dp.resumen_segmentos(r)
+    #     t_seg = seg.rename(columns={
+    #         "segmento": "Segmento", "clientes": "Clientes",
+    #         "facturacion": "Facturación",
+    #     })
+    #     st.dataframe(
+    #         t_seg.style.format({"Facturación": fmt_money}),
+    #         use_container_width=True, hide_index=True,
+    #     )
+    #     hojas_cli["Segmentos"] = t_seg
+    #
+    #     st.divider()
+    #     # Filtro por segmento: si elegís "Campeones" (o varios), las tablas de
+    #     # abajo muestran el top SOLO de ese/esos segmento(s). Vacío = todos.
+    #     ORDEN_SEG = ["Campeones", "Leales", "Nuevos / Prometedores",
+    #                  "En riesgo", "Hibernando / Perdidos"]
+    #     segs_disp = [s for s in ORDEN_SEG if s in set(r["segmento"])]
+    #     c_seg, c_top = st.columns([3, 1])
+    #     seg_sel = c_seg.multiselect(
+    #         "Segmento", segs_disp, default=[],
+    #         placeholder="Todos los segmentos", key="seg_rfm",
+    #     )
+    #     top_n = c_top.select_slider(
+    #         "Top N", options=[5, 10, 15, 25, 50], value=10, key="top_n_rfm"
+    #     )
+    #     r_f = r[r["segmento"].isin(seg_sel)] if seg_sel else r
+    #     # Al Excel va la lista COMPLETA de clientes del filtro (no el Top N).
+    #     if not r_f.empty:
+    #         hojas_cli["Clientes RFM"] = (
+    #             r_f.sort_values("monetario", ascending=False)
+    #             [["nombreCliente", "segmento", "monetario", "frecuencia",
+    #               "recencia"]]
+    #             .rename(columns={
+    #                 "nombreCliente": "Cliente", "segmento": "Segmento",
+    #                 "monetario": "Facturación", "frecuencia": "Frecuencia",
+    #                 "recencia": "Recencia (días)",
+    #             })
+    #         )
+    #     if r_f.empty:
+    #         st.info("No hay clientes en el segmento seleccionado.")
+    #     else:
+    #         col_a, col_b = st.columns(2)
+    #         with col_a:
+    #             st.subheader("Top clientes por facturación")
+    #             st.dataframe(
+    #                 r_f.sort_values("monetario", ascending=False).head(top_n)
+    #                 [["nombreCliente", "segmento", "monetario", "frecuencia", "recencia"]]
+    #                 .rename(columns={
+    #                     "nombreCliente": "Cliente", "segmento": "Segmento",
+    #                     "monetario": "Facturación", "frecuencia": "Frecuencia",
+    #                     "recencia": "Recencia (días)",
+    #                 })
+    #                 .style.format({"Facturación": fmt_money}),
+    #                 use_container_width=True, hide_index=True,
+    #             )
+    #         with col_b:
+    #             st.subheader("Top clientes por frecuencia")
+    #             st.dataframe(
+    #                 r_f.sort_values("frecuencia", ascending=False).head(top_n)
+    #                 [["nombreCliente", "segmento", "frecuencia", "monetario", "recencia"]]
+    #                 .rename(columns={
+    #                     "nombreCliente": "Cliente", "segmento": "Segmento",
+    #                     "frecuencia": "Frecuencia", "monetario": "Facturación",
+    #                     "recencia": "Recencia (días)",
+    #                 })
+    #                 .style.format({"Facturación": fmt_money}),
+    #                 use_container_width=True, hide_index=True,
+    #             )
+    # ----- FIN BLOQUE RFM COMENTADO -----------------------------------------
 
     # --- Altas y bajas de clientes ------------------------------------------
     # Compara el MES ELEGIDO arriba contra SU mes anterior (necesita ver los
     # dos meses a la vez, por eso usa el parquet completo y no df_periodo).
     # Los filtros de dimensión (canal, vendedor, etc.) sí aplican.
-    st.divider()
     st.subheader("Altas y bajas de clientes")
 
     _df_ab = cargar_datos_local(os.path.getmtime(PARQUET_PATH))
@@ -1614,16 +1746,80 @@ with tab_clientes:
             f"{hasta:%m/%Y}{_nota_curso}."
         )
 
-        _cols_ab = ["nombreCliente", "compras", "kilos", "facturacion",
-                    "ultima_compra"]
+        _cols_ab = ["nombreCliente", "dsCanalMkt", "dsVendedor", "compras",
+                    "kilos", "facturacion", "ultima_compra"]
         _ren_ab = {
-            "nombreCliente": "Cliente", "compras": "Compras", "kilos": "Kilos",
+            "nombreCliente": "Cliente", "dsCanalMkt": "Canal",
+            "dsVendedor": "Vendedor", "compras": "Compras", "kilos": "Kilos",
             "facturacion": "Facturación", "ultima_compra": "Última compra",
         }
         _fmt_ab = {
             "Kilos": fmt_kg, "Facturación": fmt_money,
             "Última compra": lambda x: f"{x:%d/%m/%Y}",
         }
+
+        # --- Corte por canal / vendedor -------------------------------------
+        # Un mismo cliente puede facturar por más de un canal o vendedor: acá
+        # se lo cuenta en el DOMINANTE del mes (el de mayor facturación), para
+        # que la suma de las filas cierre con el total de altas y bajas.
+        _dim_ab = st.radio(
+            "Abrir altas y bajas por", ["Canal", "Vendedor"],
+            horizontal=True, key="ab_dim",
+        )
+        _col_dim_ab = {"Canal": "dsCanalMkt", "Vendedor": "dsVendedor"}[_dim_ab]
+
+        def _resumen_ab(d, etiqueta):
+            """Cantidad de clientes y facturación por canal/vendedor."""
+            if d.empty:
+                return pd.DataFrame(columns=[_dim_ab, etiqueta,
+                                             f"Facturación {etiqueta.lower()}"])
+            g = (d.groupby(_col_dim_ab)
+                   .agg(**{etiqueta: ("idCliente", "nunique"),
+                           f"Facturación {etiqueta.lower()}": ("facturacion", "sum")})
+                   .reset_index()
+                   .rename(columns={_col_dim_ab: _dim_ab}))
+            return g
+
+        _res_alt = _resumen_ab(altas, "Altas")
+        _res_baj = _resumen_ab(bajas, "Bajas")
+        t_resumen_ab = (
+            _res_alt.merge(_res_baj, on=_dim_ab, how="outer")
+            .fillna({"Altas": 0, "Bajas": 0,
+                     "Facturación altas": 0, "Facturación bajas": 0})
+        )
+        if not t_resumen_ab.empty:
+            t_resumen_ab["Altas"] = t_resumen_ab["Altas"].astype(int)
+            t_resumen_ab["Bajas"] = t_resumen_ab["Bajas"].astype(int)
+            t_resumen_ab["Neto"] = t_resumen_ab["Altas"] - t_resumen_ab["Bajas"]
+            t_resumen_ab = t_resumen_ab[
+                [_dim_ab, "Altas", "Bajas", "Neto",
+                 "Facturación altas", "Facturación bajas"]
+            ].sort_values("Neto").reset_index(drop=True)
+            st.dataframe(
+                t_resumen_ab.style.format({
+                    "Facturación altas": fmt_money,
+                    "Facturación bajas": fmt_money,
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            hojas_cli[f"Altas y bajas por {_dim_ab.lower()}"] = t_resumen_ab
+            st.caption(
+                f"Neto = altas − bajas. Ordenado de peor a mejor {_dim_ab.lower()}."
+            )
+
+        # Filtro opcional: recorta el detalle de abajo al canal/vendedor elegido.
+        _vals_dim_ab = sorted(
+            set(altas[_col_dim_ab].astype(str)) | set(bajas[_col_dim_ab].astype(str))
+        )
+        _sel_dim_ab = st.multiselect(
+            _dim_ab, _vals_dim_ab, default=[],
+            placeholder=f"Todos los {_dim_ab.lower()}es", key="ab_dim_sel",
+        )
+        if _sel_dim_ab:
+            altas = altas[altas[_col_dim_ab].astype(str).isin(_sel_dim_ab)]
+            bajas = bajas[bajas[_col_dim_ab].astype(str).isin(_sel_dim_ab)]
+
+        st.divider()
 
         col_alta, col_baja = st.columns(2)
         with col_alta:
@@ -1655,15 +1851,40 @@ with tab_clientes:
         )
 
     st.divider()
-    boton_excel("clientes", hojas_cli, key="xlsx_clientes")
+    boton_excel("altas_bajas", hojas_cli, key="xlsx_clientes")
 
 
 # --- TAB VENDEDORES -------------------------------------------------------
 with tab_vend:
     st.subheader("Detalle por vendedor")
-    t_vend = tabla_dim(dp.por_vendedor(df), "Vendedor", "dsVendedor",
+    _g_vend = dp.agregar_cobertura(dp.por_vendedor(df), "dsVendedor",
+                                   df_universo)
+    t_vend = tabla_dim(_g_vend, "Vendedor", "dsVendedor",
                        mostrar_skus=True, mostrar_skus_cliente=True)
 
+    # --- Cobertura de cartera por vendedor ---------------------------------
+    # El gráfico ordena de menor a mayor: arriba de todo queda el que dejó
+    # más clientes sin visitar, que es la lectura accionable de la reunión.
+    if "cob_clientes" in _g_vend.columns and _g_vend["cob_clientes"].notna().any():
+        st.divider()
+        st.caption("Cobertura de cartera por vendedor (% de sus clientes del "
+                   "año a los que le vendió en el período)")
+        _cob_v = (
+            _g_vend.dropna(subset=["cob_clientes"])
+            .sort_values("cob_clientes")
+            .set_index("dsVendedor")["cob_clientes"]
+        )
+        st.bar_chart(_cob_v)
+        _flojos = _cob_v[_cob_v < 50]
+        if not _flojos.empty:
+            st.caption(
+                "Debajo del 50 %: "
+                + "  ·  ".join(f"{v} ({p:.0f} %)" for v, p in _flojos.items())
+                + ".  Revisá si son carteras reales o vendedores dados de "
+                  "baja que siguen con clientes asignados."
+            )
+
+    st.divider()
     st.caption("Facturación por vendedor")
     st.bar_chart(dp.por_vendedor(df).set_index("dsVendedor")["subtotalNeto"])
 
@@ -1672,25 +1893,90 @@ with tab_vend:
 
 
 # --- TAB ALERTAS ----------------------------------------------------------
+# Seis preguntas fijas por canal, siempre las mismas, para leer la reunión de
+# mesa chica sin tener que armar el Excel a mano.
+#
+# Antes esta solapa mostraba además los avisos por umbral de dp.alertas()
+# (margen negativo, concentración del top 10, Pareto de SKUs). Se sacaron a
+# pedido: la mesa chica se lee con las tarjetas y los avisos sueltos arriba
+# distraían. La función sigue en data_pipeline.py por si se reactivan.
+#
+# Usa el parquet COMPLETO y no `df`, porque las lecturas de "caído" necesitan
+# ver también el mes anterior. Los filtros de dimensión de arriba sí se
+# aplican (mismo criterio que Altas y bajas de clientes).
 with tab_alertas:
-    st.subheader("Alertas e insights automáticos")
-    avisos = dp.alertas(df)
-    if not avisos:
-        st.success("Sin alertas para el período seleccionado.")
-    else:
-        for a in avisos:
-            if a["nivel"] == "riesgo":
-                st.error(a["texto"])
-            else:
-                st.info(a["texto"])
+    st.subheader("Lecturas por canal")
 
-        st.divider()
-        boton_excel(
-            "alertas",
-            {"Alertas": pd.DataFrame(avisos).rename(
-                columns={"nivel": "Nivel", "texto": "Alerta"})},
-            key="xlsx_alertas",
+    _df_ins = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
+    for _c_ins, _v_ins in seleccion.items():
+        if _v_ins:
+            _df_ins = _df_ins[_df_ins[_c_ins].astype(str).str.strip().isin(_v_ins)]
+
+    _ini_prev, _fin_prev = dp.ventana_anterior(desde, hasta)
+    _hab_act = dp.dias_habiles(desde, hasta)
+    _hab_prev = dp.dias_habiles(_ini_prev, _fin_prev)
+
+    st.caption(
+        f"Comparación mes vs mes **a igual día**: "
+        f"{desde:%d/%m} → {hasta:%d/%m} contra {_ini_prev:%d/%m} → "
+        f"{_fin_prev:%d/%m}  ·  {_hab_act} vs {_hab_prev} días hábiles  ·  "
+        f"base: facturación neta (sin IVA)."
+    )
+    # Antes acá salía un st.warning cuando los dos tramos no tenían la misma
+    # cantidad de días hábiles. Se sacó a pedido: el dato ya está en la
+    # leyenda de arriba ("10 vs 9 días hábiles") y el cartel amarillo aparecía
+    # casi todos los meses, así que ensuciaba la solapa sin agregar nada.
+
+    _ins = dp.insights_mesa_chica(_df_ins, desde, hasta)
+
+    if _ins.empty:
+        st.info(
+            "No hay datos suficientes para armar las lecturas por canal "
+            "(hace falta el mes anterior para las comparaciones)."
         )
+    else:
+        _canales_ins = _ins["Canal"].unique().tolist()
+        _sel_ins = st.radio(
+            "Canal", _canales_ins, horizontal=True, key="ins_canal",
+            label_visibility="collapsed",
+        )
+        _bloque = _ins[_ins["Canal"] == _sel_ins]
+
+        # Tres tarjetas por fila: entran las 6 en dos filas sin scroll.
+        _tarjetas = _bloque.to_dict("records")
+        for _i in range(0, len(_tarjetas), 3):
+            _cols_ins = st.columns(3)
+            for _col_ins, _t in zip(_cols_ins, _tarjetas[_i:_i + 3]):
+                # Cada dato de la leyenda va en su propio renglón: en una sola
+                # línea corrida los " · " se pierden y no se distingue dónde
+                # termina un dato y empieza el otro.
+                _det = "".join(
+                    f"<div>{html.escape(_p.strip())}</div>"
+                    for _p in str(_t["Detalle"]).split(dp.SEP_DETALLE) if _p.strip()
+                )
+                _col_ins.markdown(
+                    f"<div class='ins-card {_t['nivel']}'>"
+                    f"<div class='ins-tit'>{html.escape(_t['Insight'])}</div>"
+                    f"<div class='ins-prot'>{html.escape(str(_t['Protagonista']))}</div>"
+                    f"<div class='ins-val'>{html.escape(str(_t['Valor']))}</div>"
+                    f"<div class='ins-det'>{_det}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        with st.expander("Ver las lecturas de todos los canales en tabla"):
+            st.dataframe(
+                _ins.drop(columns="nivel"),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    boton_excel(
+        "lecturas_por_canal",
+        {"Lecturas por canal": (_ins.drop(columns="nivel")
+                                if not _ins.empty else None)},
+        key="xlsx_alertas",
+    )
 
 
 # --- TAB METAS ------------------------------------------------------------
@@ -1789,6 +2075,9 @@ with tab_metas:
     # se usan únicamente para los textos ("día 6 de 13 de venta", ritmo diario
     # necesario). Con canales que facturan todos los días dan exactamente
     # dias_habiles(), igual que antes.
+    #
+    # Los feriados nacionales (dp.FERIADOS) se descuentan solos, acá y en la
+    # proyección: es el mismo calendario que usa la solapa Resumen.
     dias_pas, dias_tot, _dias_mixto = dp.dias_venta_resumen(
         _df_mes_meta, _desde_m, _corte, _ult_dia_m, canales=_canales_vista)
 
@@ -1837,8 +2126,8 @@ with tab_metas:
     _COL_NIVEL = {"canal": None, "proveedor": "marca_linea",
                   "vendedor": "dsVendedor"}
 
-    sub_seg, sub_carga, sub_pres = st.tabs(
-        ["Seguimiento", "Cargar objetivos", "Presupuesto anual"])
+    sub_seg, sub_evol, sub_carga, sub_pres = st.tabs(
+        ["Seguimiento", "Evolutivo", "Cargar objetivos", "Presupuesto anual"])
 
     # =====================================================================
     # SEGUIMIENTO
@@ -2075,6 +2364,210 @@ with tab_metas:
             if not _val.empty:
                 _hojas["Controles"] = _vv
             boton_excel("metas", _hojas, key="xlsx_metas")
+
+    # =====================================================================
+    # EVOLUTIVO (proyectado vs. meta a lo largo del año)
+    # =====================================================================
+    # El Seguimiento de arriba mira UN mes. Acá se ve la curva del año:
+    # objetivo vs. vendido mes a mes, con el mes abierto proyectado a fin de
+    # mes. Es la lectura que se pidió para la mesa chica ("el proyectado
+    # contra la meta, cómo viene de cumplimiento").
+    #
+    # No depende del selector de mes de arriba (muestra el año entero) pero sí
+    # del de canal, igual que el resto de la solapa. Solo se compara contra el
+    # OBJETIVO cargado: los meses sin objetivo muestran la venta real y no
+    # calculan cumplimiento (no se los completa con el presupuesto anual).
+    with sub_evol:
+        # etiqueta -> (nivel de la meta, columna del ítem, nombre corto). El
+        # nombre corto es para la hoja del Excel: openpyxl no acepta "/" en el
+        # título de una hoja y "Proveedor / línea" la rompía.
+        _NIVEL_EVOL = {
+            "Total empresa": ("canal", None, "total"),
+            "Canal": ("canal", "dsCanalMkt", "canal"),
+            "Proveedor / línea": ("proveedor", "marca_linea", "proveedor"),
+            "Vendedor": ("vendedor", "dsVendedor", "vendedor"),
+        }
+        _lbl_evol = st.radio(
+            "Abrir por", list(_NIVEL_EVOL.keys()), horizontal=True,
+            key="metas_nivel_evol",
+            help="El gráfico de barras es siempre el total de lo que estés "
+                 "mirando. La apertura cambia el detalle de abajo.",
+        )
+        _niv_evol, _col_evol, _corto_evol = _NIVEL_EVOL[_lbl_evol]
+
+        _ev = cargar_evolutivo(
+            _niv_evol, tuple(_canales_vista),
+            os.path.getmtime(PARQUET_PATH), _mtime_acuerdos(), _mtime_metas(),
+            _hoy,
+        )
+        _ev_tot = dp.evolutivo_total(_ev)
+
+        if _ev_tot.empty:
+            st.info(
+                "Todavía no hay meses con ventas para armar el evolutivo."
+            )
+        else:
+            _mes_lbl = {m: MESES_ES[int(m[5:7]) - 1][:3] for m in _ev_tot["anio_mes"]}
+            _orden_mes = list(_ev_tot["anio_mes"])
+            _abierto = _ev_tot[~_ev_tot["cerrado"]]["anio_mes"].tolist()
+
+            # --- Acumulado del año -------------------------------------------
+            # Solo entran los meses CON objetivo cargado: sumar el real de un
+            # mes sin meta contra un objetivo que no existe daría un
+            # cumplimiento inflado.
+            _con_meta = _ev_tot[_ev_tot["meta_kg"] > 0]
+            _meta_ac = float(_con_meta["meta_kg"].sum())
+            _proy_ac = float(_con_meta["proyeccion_kg"].sum())
+            _real_ac = float(_con_meta["real_kg"].sum())
+
+            if _con_meta.empty:
+                st.warning(
+                    "No hay ningún objetivo cargado en "
+                    f"{dp.ANIO}: el evolutivo muestra la venta real, pero sin "
+                    "línea de meta ni cumplimiento. Cargalos en "
+                    "**Cargar objetivos**."
+                )
+            else:
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric(
+                    "Meses con objetivo", f"{len(_con_meta)}",
+                    help="Meses del año que tienen objetivo cargado. El "
+                         "acumulado de al lado se calcula solo sobre estos.",
+                )
+                e2.metric("Objetivo acumulado", fmt_kg(_meta_ac))
+                e3.metric(
+                    "Vendido + proyectado", fmt_kg(_proy_ac),
+                    delta=fmt_kg(_proy_ac - _meta_ac) + " vs objetivo",
+                    help=f"Real acumulado: {fmt_kg(_real_ac)}. El mes abierto "
+                         "entra proyectado a fin de mes.",
+                )
+                e4.metric(
+                    "Cumplimiento acumulado",
+                    f"{_proy_ac / _meta_ac * 100:,.1f} %".replace(",", ".")
+                    if _meta_ac else "—",
+                )
+
+            # --- Gráfico: barras vendido + proyectado, línea de objetivo -----
+            _b = _ev_tot.copy()
+            _b["Vendido"] = _b["real_kg"]
+            _b["Proyectado"] = (_b["proyeccion_kg"] - _b["real_kg"]).clip(lower=0)
+            _b["mes"] = _b["anio_mes"].map(_mes_lbl)
+            _long = _b.melt(
+                id_vars=["anio_mes", "mes"], value_vars=["Vendido", "Proyectado"],
+                var_name="Tramo", value_name="kg",
+            )
+
+            fig_ev = px.bar(
+                _long, x="mes", y="kg", color="Tramo",
+                category_orders={"mes": [_mes_lbl[m] for m in _orden_mes],
+                                 "Tramo": ["Vendido", "Proyectado"]},
+                color_discrete_map={"Vendido": "#2a8ed4",
+                                    "Proyectado": "#3f5b7a"},
+            )
+            # Los meses sin objetivo quedan como hueco en la línea
+            # (connectgaps=False): no se inventa una meta que no se cargó.
+            _meta_y = _ev_tot["meta_kg"].where(_ev_tot["meta_kg"] > 0)
+            if _meta_y.notna().any():
+                fig_ev.add_scatter(
+                    x=[_mes_lbl[m] for m in _orden_mes], y=_meta_y,
+                    mode="lines+markers", name="Objetivo", connectgaps=False,
+                    line=dict(color="#f59e0b", width=3, dash="dash"),
+                    marker=dict(size=9),
+                )
+            fig_ev.update_layout(
+                barmode="stack",
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(title="", orientation="h", y=-0.2),
+                xaxis_title="Mes",
+                yaxis_title="Kilos",
+                height=420,
+            )
+            st.plotly_chart(fig_ev, use_container_width=True)
+            st.caption(
+                ("Mes abierto: **" + etiqueta_mes(_abierto[0]) + "** — la "
+                 "parte clara de la barra es lo que falta para cerrar el mes "
+                 "al ritmo actual (misma proyección que el Seguimiento). "
+                 if _abierto else "Todos los meses están cerrados. ")
+                + "Los meses sin objetivo cargado no cortan la línea naranja: "
+                "muestran la venta real y no calculan cumplimiento."
+            )
+
+            # NOTA: acá iba un gráfico de líneas con el % de cumplimiento mes
+            # a mes (una línea por canal / proveedor / vendedor). Se sacó a
+            # pedido: el cumplimiento ya se lee en la tabla de abajo y en la
+            # grilla ítem × mes, y con varias líneas encimadas el gráfico
+            # aportaba poco. El dato sigue estando en dp.evolutivo_metas().
+
+            # --- Tablas ------------------------------------------------------
+            st.divider()
+            _t_ev = _ev_tot.copy()
+            _t_ev.insert(0, "sem", _t_ev["cumplimiento_pct"].map(dp.semaforo))
+            _t_ev["Mes"] = [
+                etiqueta_mes(m) + ("" if cer else " · abierto")
+                for m, cer in zip(_t_ev["anio_mes"], _t_ev["cerrado"])
+            ]
+            _t_ev = _t_ev[["sem", "Mes", "meta_kg", "real_kg", "proyeccion_kg",
+                           "cumplimiento_pct", "brecha_kg"]].rename(columns={
+                "sem": "",
+                "meta_kg": "Objetivo (kg)",
+                "real_kg": "Vendido (kg)",
+                "proyeccion_kg": "Proyección (kg)",
+                "cumplimiento_pct": "Cumplimiento %",
+                "brecha_kg": "Desvío (kg)",
+            })
+            st.dataframe(
+                _t_ev, use_container_width=True, hide_index=True,
+                column_config={
+                    "": st.column_config.TextColumn(width="small"),
+                    "Objetivo (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Vendido (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Proyección (kg)": st.column_config.NumberColumn(format="%.0f"),
+                    "Cumplimiento %": st.column_config.NumberColumn(format="%.1f %%"),
+                    "Desvío (kg)": st.column_config.NumberColumn(format="%.0f"),
+                },
+            )
+            st.caption(
+                "🟢 proyecta llegar al objetivo · 🟡 entre 90% y 100% · "
+                "🔴 por debajo del 90% · ⚪ sin objetivo cargado ese mes."
+            )
+
+            _hojas_ev = {"Evolutivo (total)": _t_ev}
+
+            # Detalle ítem × mes: la grilla que se mira en la reunión.
+            _piv = None
+            if _col_evol is not None:
+                _d = _ev[_ev["meta_kg"] > 0]
+                if not _d.empty:
+                    _d = (_d.groupby(["anio_mes", _col_evol], as_index=False)
+                          .agg(meta_kg=("meta_kg", "sum"),
+                               proyeccion_kg=("proyeccion_kg", "sum")))
+                    _d["cumplimiento_pct"] = (_d["proyeccion_kg"]
+                                              / _d["meta_kg"] * 100)
+                    _piv = (_d.pivot(index=_col_evol, columns="anio_mes",
+                                     values="cumplimiento_pct")
+                            .rename(columns=_mes_lbl))
+                    _piv = _piv[[c for c in
+                                 [_mes_lbl[m] for m in _orden_mes]
+                                 if c in _piv.columns]]
+                    _piv.index.name = _lbl_evol
+                    with st.expander(
+                            f"Cumplimiento % por {_lbl_evol.lower()} y mes",
+                            expanded=True):
+                        st.dataframe(
+                            _piv.style.format("{:.0f} %", na_rep="—"),
+                            use_container_width=True,
+                        )
+                        st.caption(
+                            "Vacío = ese mes no tenía objetivo cargado para "
+                            f"ese {_lbl_evol.lower()}."
+                        )
+                    _hojas_ev[f"Cumplimiento por {_corto_evol}"] = (
+                        _piv.reset_index())
+
+            boton_excel("evolutivo_metas", _hojas_ev, key="xlsx_evolutivo")
 
     # =====================================================================
     # CARGA DE OBJETIVOS (canal → proveedor → vendedor)

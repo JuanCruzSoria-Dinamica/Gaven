@@ -90,6 +90,12 @@ try:
         at.run()
         excepciones(at, f"vista TODOS abierta por {nivel}")
 
+    # En la vista consolidada el evolutivo agrega el mismo proveedor entre
+    # canales: es otro camino que el de un canal solo.
+    at.radio(key="metas_nivel_evol").set_value("Proveedor / línea")
+    at.run()
+    excepciones(at, "evolutivo TODOS abierto por proveedor / línea")
+
     # --- Un canal concreto --------------------------------------------------
     at.selectbox(key="metas_canal").select(CANAL)
     at.run()
@@ -102,6 +108,14 @@ try:
         at.radio(key="metas_nivel_seg").set_value(nivel)
         at.run()
         excepciones(at, f"seguimiento de {CANAL} abierto por {nivel}")
+
+    # --- Evolutivo (año completo, los cuatro cortes) -------------------------
+    # Recorre todos los meses del detalle y proyecta el mes abierto, así que
+    # es la vista más pesada de la solapa: vale la pena verla renderizar.
+    for nivel in ["Total empresa", "Canal", "Proveedor / línea", "Vendedor"]:
+        at.radio(key="metas_nivel_evol").set_value(nivel)
+        at.run()
+        excepciones(at, f"evolutivo de {CANAL} abierto por {nivel}")
 
     # --- 1. Objetivo total del canal ---------------------------------------
     ni = [n for n in at.number_input
