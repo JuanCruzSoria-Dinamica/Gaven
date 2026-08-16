@@ -441,8 +441,9 @@ if not os.path.exists(PARQUET_PATH):
 
 df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
 
-# Copia del detalle del AÑO COMPLETO antes de recortarlo por período. Es la
-# base del universo con el que se calcula la cobertura (ver más abajo):
+# Copia del detalle COMPLETO (todo el parquet) antes de recortarlo por
+# período. De acá salen el universo de la cobertura (ver más abajo) y las
+# solapas que necesitan varios meses (Altas y bajas, Insights, Metas):
 # `df` se pisa enseguida con el mes elegido y después ya no se puede recuperar.
 df_anio = df
 
@@ -576,16 +577,53 @@ if df.empty:
     st.warning("No hay datos que cumplan con los filtros seleccionados.")
     st.stop()
 
-# --- Universo del año (denominador de la cobertura) ------------------------
-# Mismos filtros de dimensión que `df`, pero SIN recortar por período: todo
-# 2026. Contra este universo se mide qué porción de la cartera y del surtido
-# se tocó en el mes elegido (dp.agregar_cobertura / dp.cobertura_total).
-df_universo = df_anio[df_anio["fechaComprobate"].dt.year == dp.ANIO]
+# --- Universo (denominador de la cobertura) --------------------------------
+# Ventana MÓVIL de dp.VENTANA_UNIVERSO_MESES meses que TERMINA en el período
+# elegido: el mes seleccionado + los 2 anteriores. Antes era el año entero,
+# que arrastraba clientes y SKUs muertos al denominador.
+#
+# Lleva los MISMOS filtros de dimensión que `df` (canal, vendedor, etc.); lo
+# único que cambia es la ventana de fechas. Contra este universo se mide qué
+# porción de la cartera y del surtido se tocó en el mes elegido
+# (dp.agregar_cobertura / dp.cobertura_total).
+#
+# El corte superior es `hasta`, el mismo del período: así el numerador queda
+# SIEMPRE contenido en el denominador y la cobertura no puede pasar el 100 %.
+univ_desde = dp.inicio_universo(desde)
+_f_univ = df_anio["fechaComprobate"]
+df_universo = df_anio[
+    (_f_univ >= pd.Timestamp(univ_desde))
+    & (_f_univ < pd.Timestamp(hasta) + pd.Timedelta(days=1))
+]
 for col, valores in seleccion.items():
     if valores:
         df_universo = df_universo[
             df_universo[col].astype(str).str.strip().isin(valores)
         ]
+
+# Etiqueta para los textos del tablero: "los últimos 3 meses (Abr–Jun 2026)".
+# Incluye el artículo a propósito, para poder pegarla después de un "en".
+#
+# Se arma con el primer mes CON DATOS de la ventana, no con univ_desde a secas:
+# si el parquet todavía no tiene los meses previos (mirando enero, por
+# ejemplo, que necesitaría noviembre y diciembre del año anterior), la ventana
+# real es más corta y el cartel tiene que decirlo en vez de mentir "3 meses".
+def _etiqueta_universo():
+    if df_universo.empty:
+        return "la ventana seleccionada (sin datos)"
+
+    def _ab(d):
+        return f"{MESES_ES[d.month - 1][:3]} {d.year}"
+
+    ini_real = df_universo["fechaComprobate"].min().date()
+    n_meses = ((hasta.year * 12 + hasta.month)
+               - (ini_real.year * 12 + ini_real.month) + 1)
+    if n_meses <= 1:
+        return f"el mes de {_ab(ini_real)}"
+    return f"los últimos {n_meses} meses ({_ab(ini_real)}–{_ab(hasta)})"
+
+
+ETQ_UNIVERSO = _etiqueta_universo()
 
 # ---------------------------------------------------------------------------
 # Formatos de tablas reutilizables
@@ -605,8 +643,9 @@ COLS_DIM = {
     "skus": "SKUs", "skus_por_cliente": "SKUs/Cliente",
     "share_fc": "Share FC %", "share_kg": "Share Kg %",
     "share_cm": "Share CM %",
-    # Cobertura: % de la cartera / del surtido del año que se tocó en el
-    # período. Las columnas solo existen si se pasó por dp.agregar_cobertura.
+    # Cobertura: % de la cartera / del surtido de los últimos 3 meses que se
+    # tocó en el período. Las columnas solo existen si se pasó por
+    # dp.agregar_cobertura.
     "universo_clientes": "Cartera", "universo_skus": "Surtido",
     "cob_clientes": "Cob. clientes %", "cob_skus": "Cob. SKUs %",
 }
@@ -628,9 +667,10 @@ def tabla_dim(g, dim_label, dim_col, mostrar_skus=False,
     mostrar_skus_cliente=True agrega 'SKUs/Cliente' (productos únicos
     promedio por cliente).
 
-    Las columnas de cobertura (cartera / surtido del año y sus %) se muestran
-    solas si `g` viene de dp.agregar_cobertura; si no, no aparecen. Van
-    pegadas a su numerador: Clientes → Cartera → Cob. clientes %."""
+    Las columnas de cobertura (cartera / surtido de los últimos 3 meses y sus
+    %) se muestran solas si `g` viene de dp.agregar_cobertura; si no, no
+    aparecen. Van pegadas a su numerador: Clientes → Cartera → Cob.
+    clientes %."""
     cols = [dim_col, "kilos", "subtotalNeto", "share_fc", "cm", "share_cm",
             "cm_pct", "precio_kg", "clientes", "universo_clientes",
             "cob_clientes"]
@@ -1108,7 +1148,8 @@ with tab_resumen:
     ]
 
     # --- Cobertura --------------------------------------------------------
-    # Qué porción de la cartera y del surtido del año se tocó en el período.
+    # Qué porción de la cartera y del surtido de los últimos 3 meses se tocó
+    # en el período.
     # Van sin proyección: el % no se puede extrapolar por regla de tres porque
     # los clientes se repiten, no se suman.
     _cob = dp.cobertura_total(df, df_universo)
@@ -1148,7 +1189,9 @@ with tab_resumen:
         f"Cobertura: se le vendió a {_cob['clientes']} de los "
         f"{_cob['universo_clientes']} clientes y se movieron "
         f"{_cob['skus']} de los {_cob['universo_skus']} SKUs que tuvieron "
-        f"movimiento en {dp.ANIO}."
+        f"movimiento en {ETQ_UNIVERSO}. "
+        "La cartera y el surtido se miden sobre esa ventana móvil, no sobre "
+        "todo el año: el que hace más de 3 meses que no compra deja de contar."
     )
 
     st.divider()
@@ -1880,8 +1923,9 @@ with tab_vend:
     # más clientes sin visitar, que es la lectura accionable de la reunión.
     if "cob_clientes" in _g_vend.columns and _g_vend["cob_clientes"].notna().any():
         st.divider()
-        st.caption("Cobertura de cartera por vendedor (% de sus clientes del "
-                   "año a los que le vendió en el período)")
+        st.caption(f"Cobertura de cartera por vendedor (% de los clientes que "
+                   f"le compraron en {ETQ_UNIVERSO} a los que le volvió a "
+                   f"vender en el período)")
         _cob_v = (
             _g_vend.dropna(subset=["cob_clientes"])
             .sort_values("cob_clientes")
@@ -1893,8 +1937,9 @@ with tab_vend:
             st.caption(
                 "Debajo del 50 %: "
                 + "  ·  ".join(f"{v} ({p:.0f} %)" for v, p in _flojos.items())
-                + ".  Revisá si son carteras reales o vendedores dados de "
-                  "baja que siguen con clientes asignados."
+                + ".  Con la cartera medida a 3 meses, quedarse abajo del "
+                  "50 % ya es un dato duro: son clientes que compraron hace "
+                  "poco y este mes no se tocaron."
             )
 
     st.divider()

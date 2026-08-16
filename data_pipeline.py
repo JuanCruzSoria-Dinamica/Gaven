@@ -551,21 +551,59 @@ def por_proveedor(df_ventas):
 # "De todo lo que se le podía vender, cuánto se le vendió."
 #
 # El denominador (el UNIVERSO) es la cantidad de clientes distintos y de SKUs
-# distintos que tuvo cada canal / vendedor / marca en TODO EL AÑO. No hay un
-# maestro de clientes ni un catálogo confiable, así que el año oficia de
-# universo: si un cliente le compró alguna vez en 2026, es una oportunidad
-# real; si nunca compró, no está en la cartera.
+# distintos que tuvo cada canal / vendedor / marca en los últimos
+# VENTANA_UNIVERSO_MESES meses. No hay un maestro de clientes ni un catálogo
+# confiable, así que la actividad RECIENTE oficia de universo: si un cliente
+# compró en los últimos 3 meses es una oportunidad real; si hace más de 3
+# meses que no compra, ya no cuenta como cartera vigente.
+#
+# Antes el universo era el AÑO ENTERO. Se acortó a 3 meses porque el año
+# arrastraba clientes y SKUs muertos (el que compró una sola vez en enero
+# seguía inflando el denominador en agosto) y eso hundía la cobertura de todos
+# por igual, sin decir nada accionable.
 #
 # Ojo con el numerador: sale del df del PERÍODO elegido (un mes), mientras el
-# universo sale del año entero. Los dos tienen que venir con los MISMOS
-# filtros de dimensión aplicados (canal, vendedor, etc.), lo único que cambia
-# entre ellos es la ventana de fechas. De eso se encarga app.py.
+# universo sale de la ventana de 3 meses que TERMINA en ese mismo mes. Los dos
+# tienen que venir con los MISMOS filtros de dimensión aplicados (canal,
+# vendedor, etc.); lo único que cambia entre ellos es la ventana de fechas. De
+# eso se encarga app.py. Como el período queda contenido en la ventana, la
+# cobertura nunca puede pasar del 100 %.
 #
 # No se guarda en ningún parquet: es un nunique sobre el detalle que ya está
 # en memoria, así que se recalcula solo y nunca queda desactualizado.
 
+# Meses que abarca el universo, CONTANDO el mes elegido: 3 = mes elegido + los
+# 2 anteriores. Cambiando este número cambia el criterio en todo el tablero.
+VENTANA_UNIVERSO_MESES = 3
+
+
+def inicio_universo(desde, meses=VENTANA_UNIVERSO_MESES):
+    """Primer día de la ventana móvil del universo.
+
+    `desde` es el primer día del período elegido. Devuelve el primer día del
+    mes que está (meses - 1) meses antes, para que la ventana incluya el mes
+    elegido y los anteriores hasta completar `meses`.
+
+    Ej: inicio_universo(date(2026, 6, 1)) -> date(2026, 4, 1)
+        (abril + mayo + junio = 3 meses).
+
+    Ojo: la ventana puede arrancar antes de lo que hay cargado en el parquet
+    (si mirás enero, noviembre y diciembre del año anterior seguramente no
+    estén). En ese caso el universo se recorta solo a los datos disponibles:
+    queda más chico, nunca inventa nada.
+    """
+    if desde is None:
+        return None
+    meses = max(int(meses), 1)
+    idx = desde.year * 12 + (desde.month - 1) - (meses - 1)
+    return dt.date(idx // 12, idx % 12 + 1, 1)
+
+
 def universo_dim(df_universo, col):
-    """Clientes y SKUs distintos por valor de `col` en TODO el df recibido."""
+    """Clientes y SKUs distintos por valor de `col` en TODO el df recibido.
+
+    Quien llama es responsable de mandar el df ya recortado a la ventana del
+    universo (en app.py, los últimos VENTANA_UNIVERSO_MESES meses)."""
     cols_out = [col, "universo_clientes", "universo_skus"]
     if df_universo is None or len(df_universo) == 0 or col not in df_universo.columns:
         return pd.DataFrame(columns=cols_out)
@@ -581,8 +619,9 @@ def agregar_cobertura(g, col, df_universo):
     """Suma al resumen de agrupar_dim las columnas de cobertura.
 
     `g` es la salida de agrupar_dim (trae `clientes` y `skus` del período).
-    `df_universo` es el detalle del año COMPLETO, con los mismos filtros de
-    dimensión que `g` pero sin recortar por fecha.
+    `df_universo` es el detalle de los últimos VENTANA_UNIVERSO_MESES meses
+    (el mes del período + los 2 anteriores), con los mismos filtros de
+    dimensión que `g` pero con la ventana de fechas más ancha.
 
     Devuelve `g` con cuatro columnas más: universo_clientes, universo_skus,
     cob_clientes y cob_skus (estas dos en % de 0 a 100). Si no se puede
@@ -606,8 +645,9 @@ def agregar_cobertura(g, col, df_universo):
 def cobertura_total(df_periodo, df_universo):
     """Cobertura a nivel empresa (sin abrir por dimensión).
 
-    Devuelve un dict con el universo del año, lo tocado en el período y el %.
-    Sirve para las tarjetas del Resumen."""
+    Devuelve un dict con el universo de los últimos VENTANA_UNIVERSO_MESES
+    meses, lo tocado en el período y el %. Sirve para las tarjetas del
+    Resumen."""
     def _n(d, c):
         return int(d[c].nunique()) if d is not None and len(d) and c in d else 0
 
