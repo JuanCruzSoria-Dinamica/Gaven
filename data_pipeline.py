@@ -510,14 +510,22 @@ def agrupar_dim(df_ventas, col):
     # y luego se promedia entre los clientes de cada grupo. (Antes se hacía
     # SKUs totales del grupo / clientes del grupo, que subestima el valor
     # cuando los clientes comparten productos entre sí.)
-    skus_cliente = (
-        df_ventas.groupby([col, "idCliente"])["idArticulo"]
-        .nunique()
-        .reset_index(name="_skus_cliente")
-        .groupby(col)["_skus_cliente"]
-        .mean()
-    )
-    g["skus_por_cliente"] = g[col].map(skus_cliente).fillna(0)
+    if col == "idCliente":
+        # Caso degenerado: si la dimensión YA es el cliente, el "promedio de
+        # SKUs por cliente" de cada fila es su propio conteo de SKUs. Además
+        # hay que cortocircuitarlo sí o sí: groupby(["idCliente",
+        # "idCliente"]) tira "cannot insert idCliente, already exists" al
+        # hacer reset_index. Lo usa dp.por_cliente() (solapa Clientes).
+        g["skus_por_cliente"] = g["skus"].astype(float)
+    else:
+        skus_cliente = (
+            df_ventas.groupby([col, "idCliente"])["idArticulo"]
+            .nunique()
+            .reset_index(name="_skus_cliente")
+            .groupby(col)["_skus_cliente"]
+            .mean()
+        )
+        g["skus_por_cliente"] = g[col].map(skus_cliente).fillna(0)
     total_fc = g["subtotalNeto"].sum()
     total_kg = g["kilos"].sum()
     total_cm = g["cm"].sum()
@@ -545,6 +553,107 @@ def por_proveedor(df_ventas):
     (lookup por artículo); si el df todavía no la tiene, se calcula al vuelo."""
     d = df_ventas if "marca_linea" in df_ventas.columns else agregar_marca_linea(df_ventas)
     return agrupar_dim(d, "marca_linea")
+
+
+# --- Dominante por cliente -------------------------------------------------
+# Un mismo cliente puede facturar en el mes con más de un vendedor (y, en
+# teoría, con más de un canal o región). Para las vistas que necesitan UNA
+# fila por cliente hay que elegir una sola etiqueta: se usa la de MAYOR
+# facturación en el período. Es el criterio de altas_bajas() y de la solapa
+# Clientes; tenerlo en un solo lugar evita que las dos vistas contesten
+# distinto a la misma pregunta.
+
+def dominante(d, col, por="subtotalNeto", clave="idCliente"):
+    """Valor de `col` con más facturación por cliente.
+
+    Devuelve una Serie indexada por `clave` (idCliente) con el valor
+    dominante, o None si la columna no está en el df (parquets viejos sin
+    'region', por ejemplo). Los valores se comparan ya recortados
+    (str.strip()), igual que los filtros de la app.
+    """
+    if col not in d.columns or clave not in d.columns:
+        return None
+    g = (d.assign(**{col: d[col].astype(str).str.strip()})
+           .groupby([clave, col])[por].sum()
+           .reset_index()
+           .sort_values(por, ascending=False)
+           .drop_duplicates(clave))
+    return g.set_index(clave)[col]
+
+
+# Atributos que describen al cliente en la tabla bruta de la solapa Clientes.
+CLIENTE_ATRIBUTOS = ["region", "dsCanalMkt", "dsSubcanalMKT", "dsVendedor"]
+
+# De esos, los que se marcan con "(+n)" cuando el cliente tuvo más de un
+# valor en el mes. Sobre el histórico 2026, canal / subcanal / región nunca
+# se parten (0 casos en 175.631 filas); vendedor sí, en un 0-5 % de los
+# clientes según el mes. Marcarlo evita leer la etiqueta como si fuera toda
+# la historia del cliente.
+CLIENTE_ATRIB_MULTI = ["dsVendedor"]
+
+CLIENTE_SIN_DATO = "(sin dato)"
+
+
+def por_cliente(df_ventas, atributos=None, marcar_multiples=True):
+    """Tabla bruta a nivel CLIENTE del df recibido (ya filtrado por período
+    y por los filtros de la barra superior).
+
+    Una fila por cliente con: sus atributos dominantes (región, canal,
+    subcanal, vendedor), kilos, facturación, contribución, CM %, precio/kg,
+    SKUs distintos, cantidad de COMPRAS (comprobantes únicos, no filas) y
+    fecha de la última compra dentro del período.
+
+    Las métricas salen de agrupar_dim(), o sea de la MISMA fórmula que el
+    resto del tablero: la solapa no puede dar distinto al Resumen.
+
+    Se saca la columna 'clientes' de agrupar_dim (a nivel cliente vale
+    siempre 1, y de paso hace que agregar_cobertura() calcule solo la
+    cobertura de SKUs, que es la única que significa algo acá).
+    """
+    atributos = list(CLIENTE_ATRIBUTOS if atributos is None else atributos)
+    cols_out = (["idCliente", "nombreCliente"] + atributos
+                + ["kilos", "subtotalNeto", "share_fc", "cm", "share_cm",
+                   "cm_pct", "precio_kg", "skus", "compras", "ultima_compra"])
+
+    if df_ventas is None or len(df_ventas) == 0:
+        return pd.DataFrame(columns=cols_out)
+
+    d = df_ventas.copy()
+    d["fechaComprobate"] = pd.to_datetime(d["fechaComprobate"], errors="coerce")
+    d = d.dropna(subset=["idCliente"])
+    if d.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    g = agrupar_dim(d, "idCliente").drop(
+        columns=["skus_por_cliente", "clientes"], errors="ignore")
+
+    # Compras = comprobantes únicos (empresa + tipo doc + nº doc), el mismo
+    # criterio del ticket promedio y de altas_bajas. Contar filas contaría
+    # renglones de artículo, no compras.
+    d["_comp_id"] = comprobante_id(d)
+    extra = d.groupby("idCliente").agg(
+        nombreCliente=("nombreCliente", "first"),
+        compras=("_comp_id", "nunique"),
+        ultima_compra=("fechaComprobate", "max"),
+    ).reset_index()
+    g = g.merge(extra, on="idCliente", how="left")
+
+    for col in atributos:
+        if col not in d.columns:
+            g[col] = CLIENTE_SIN_DATO
+            continue
+        dom = dominante(d, col)
+        etiqueta = g["idCliente"].map(dom).fillna(CLIENTE_SIN_DATO).astype(str)
+        if marcar_multiples and col in CLIENTE_ATRIB_MULTI:
+            n = (d[col].astype(str).str.strip()
+                 .groupby(d["idCliente"]).nunique())
+            extras = (g["idCliente"].map(n).fillna(1).astype(int) - 1)
+            etiqueta = etiqueta.where(
+                extras <= 0, etiqueta + " (+" + extras.astype(str) + ")")
+        g[col] = etiqueta
+
+    g = g.sort_values("subtotalNeto", ascending=False).reset_index(drop=True)
+    return g[[c for c in cols_out if c in g.columns]]
 
 
 # --- Cobertura -------------------------------------------------------------
@@ -864,18 +973,6 @@ def altas_bajas(df_ventas, hoy=None):
     m_act = base[(f >= ini_act) & (f < fin_act)]
     m_ant = base[(f >= ini_ant) & (f < ini_act)]
 
-    def _dominante(d, col):
-        """Valor de `col` con más facturación por cliente (Serie indexada por
-        idCliente). Si la columna no existe en el parquet, devuelve None."""
-        if col not in d.columns:
-            return None
-        g = (d.assign(**{col: d[col].astype(str).str.strip()})
-               .groupby(["idCliente", col])["subtotalNeto"].sum()
-               .reset_index()
-               .sort_values("subtotalNeto", ascending=False)
-               .drop_duplicates("idCliente"))
-        return g.set_index("idCliente")[col]
-
     def _resumen(d):
         if d.empty:
             return pd.DataFrame(columns=[
@@ -892,7 +989,7 @@ def altas_bajas(df_ventas, hoy=None):
             ultima_compra=("fechaComprobate", "max"),
         ).reset_index()
         for _col in ("dsCanalMkt", "dsVendedor"):
-            dom = _dominante(d, _col)
+            dom = dominante(d, _col)
             res[_col] = (res["idCliente"].map(dom).fillna("(sin dato)")
                          if dom is not None else "(sin dato)")
         cols = ["idCliente", "nombreCliente", "dsCanalMkt", "dsVendedor",
@@ -1267,21 +1364,54 @@ def insights_mesa_chica(df_ventas, desde, hasta, canales=None):
 # Grano de la serie histórica. Guardamos a este nivel; en la app se puede
 # "subir" a canal, subcanal o vendedor sumando el resto de las dimensiones
 # (las sumas se re-agregan sin problema porque son crudas, no porcentajes).
-SERIE_GRANO = ["anio_mes", "dsCanalMkt", "dsSubcanalMKT", "dsVendedor"]
+#
+# El grano incluye TODAS las dimensiones por las que se puede filtrar en la
+# barra de arriba del panel, menos Cliente (~900 por mes: el grano quedaría
+# casi al nivel del detalle y la serie dejaría de ser una serie agregada).
+# Si algún día se agrega un filtro global nuevo, sumarlo acá y el gráfico de
+# evolución lo hereda solo (la app filtra recorriendo las columnas que existen).
+SERIE_GRANO = [
+    "anio_mes", "dsCanalMkt", "dsSubcanalMKT", "dsVendedor",
+    "region", "marca_linea",
+]
 SERIE_COLS = SERIE_GRANO + [
     "kilos", "subtotalNeto", "costo", "cm", "clientes", "comprobantes"
 ]
 
+# Valor con el que se rellenan las dimensiones que una serie vieja no tiene
+# (guardada antes de que existieran 'region' / 'marca_linea'). Esas filas
+# quedan fuera cuando se filtra por esa dimensión, que es lo correcto: no
+# sabemos a qué región/marca pertenecen. Se arreglan rehaciendo el backfill.
+SERIE_SIN_DATO = "SIN CLASIFICAR"
+
+
+def alinear_serie(serie):
+    """Deja una serie leída de disco con TODAS las columnas de SERIE_COLS.
+
+    Una serie generada por una versión anterior no tiene las dimensiones
+    nuevas; en vez de romper (o de mezclar NaN con texto en los filtros), se
+    rellenan con SERIE_SIN_DATO. Devuelve (serie_alineada, faltantes).
+    """
+    if serie is None or serie.empty:
+        return serie, []
+    faltantes = [c for c in SERIE_GRANO if c not in serie.columns]
+    if faltantes:
+        serie = serie.copy()
+        for c in faltantes:
+            serie[c] = SERIE_SIN_DATO
+    return serie, faltantes
+
 
 def agregar_serie(df_ventas):
-    """Agrega el detalle a nivel mes × canal × subcanal × vendedor, guardando
+    """Agrega el detalle a nivel mes × canal × subcanal × vendedor × región ×
+    marca/línea, guardando
     SOLO sumas crudas. NUNCA guardamos porcentajes (CM %, share, $/kg): esos
     se derivan al leer, porque un promedio de porcentajes no se puede
     re-agregar bien.
 
     Columnas de salida (SERIE_COLS):
-      anio_mes (YYYY-MM), dsCanalMkt, dsSubcanalMKT, dsVendedor,
-      kilos, subtotalNeto, costo, cm, clientes, comprobantes
+      anio_mes (YYYY-MM), dsCanalMkt, dsSubcanalMKT, dsVendedor, region,
+      marca_linea, kilos, subtotalNeto, costo, cm, clientes, comprobantes
 
     Nota: 'clientes' y 'comprobantes' son conteos únicos POR FILA (mes×canal×
     subcanal×vendedor). Sirven para graficar por mes, pero no se deben sumar
@@ -1295,6 +1425,17 @@ def agregar_serie(df_ventas):
     d = df_ventas.copy()
     d["anio_mes"] = d["fechaComprobate"].dt.to_period("M").astype(str)
     d["_comp"] = comprobante_id(d)
+
+    # 'region' y 'marca_linea' las agrega preparar(), pero agregar_serie()
+    # también se llama sobre df sueltos (backfill, app): si faltan, se
+    # recalculan/rellenan acá para no romper el groupby.
+    if "marca_linea" not in d.columns:
+        d = agregar_marca_linea(d)
+    if "region" not in d.columns:
+        d["region"] = (d["dsLocalidad"].map(MAPA_REGION).fillna("A DEFINIR")
+                       if "dsLocalidad" in d.columns else "A DEFINIR")
+    for c in SERIE_GRANO[1:]:
+        d[c] = d[c].astype(str).str.strip().replace({"": SERIE_SIN_DATO})
 
     g = (
         d.groupby(SERIE_GRANO, dropna=False)
@@ -1311,6 +1452,35 @@ def agregar_serie(df_ventas):
     return g[SERIE_COLS].sort_values(
         ["anio_mes"] + SERIE_GRANO[1:]
     ).reset_index(drop=True)
+
+
+def filtrar_serie(serie, seleccion=None, hasta_mes=None):
+    """Aplica a la serie histórica los filtros globales de la barra del panel.
+
+    `seleccion` es el dict {columna: [valores]} que arma la app (los vacíos no
+    filtran nada). Se aplica TODA columna del dict que exista en la serie; las
+    que no existen (ej. Cliente, que no está en SERIE_GRANO) se devuelven en
+    `sin_aplicar` para que la app las avise en pantalla en vez de mentir con un
+    gráfico sin filtrar.
+
+    `hasta_mes` ('YYYY-MM') corta la serie hasta ese mes inclusive: el filtro
+    de Período del panel recorta el gráfico, no lo reduce a un solo mes (la
+    gracia es ver la evolución que desemboca en el mes elegido).
+
+    Devuelve (serie_filtrada, sin_aplicar). No modifica la serie original.
+    """
+    s = serie
+    sin_aplicar = []
+    for col, valores in (seleccion or {}).items():
+        if not valores:
+            continue
+        if col in s.columns:
+            s = s[s[col].astype(str).str.strip().isin(valores)]
+        else:
+            sin_aplicar.append(col)
+    if hasta_mes:
+        s = s[s["anio_mes"].astype(str) <= str(hasta_mes)]
+    return s.copy(), sin_aplicar
 
 
 def upsert_serie(df_detalle, serie_path=SERIE_PATH):
@@ -1331,6 +1501,11 @@ def upsert_serie(df_detalle, serie_path=SERIE_PATH):
 
     if os.path.exists(serie_path):
         actual = pd.read_parquet(serie_path)
+        actual, faltantes = alinear_serie(actual)
+        if faltantes:
+            print(f"  serie: la serie guardada no tiene {faltantes}; esos "
+                  f"meses quedan como '{SERIE_SIN_DATO}' en esas dimensiones. "
+                  f"Para recuperarlos: python backfill_serie.py --reset")
         actual = actual[~actual["anio_mes"].isin(meses_nuevos)]
         serie = pd.concat([actual, nuevos], ignore_index=True)
     else:

@@ -194,13 +194,15 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     La clave de caché es el mtime: si el pipeline reescribe la serie, se
     invalida sola (mismo patrón que cargar_datos_local).
 
-    Los meses que también están en el parquet de DETALLE se recalculan desde
-    el detalle con el costo ya ajustado por acuerdos McCain, para que la
-    evolución de CM/CM% coincida con el resto del tablero. Los meses viejos
-    (solo-serie, ej. 2025) quedan tal cual los dejó el backfill."""
+    Los meses que también están en el parquet de DETALLE se recalculan SIEMPRE
+    desde el detalle: así el costo queda ajustado por acuerdos McCain (para que
+    la evolución de CM/CM% coincida con el resto del tablero) y, además, esos
+    meses traen todas las dimensiones del grano actual aunque la serie guardada
+    en disco sea vieja. Los meses solo-serie (ej. 2025) quedan tal cual los dejó
+    el backfill; si les falta alguna dimensión se rellena con SERIE_SIN_DATO
+    (ver dp.alinear_serie) y se recuperan rehaciendo el backfill."""
     serie = pd.read_parquet(dp.SERIE_PATH)
-    if dp.cargar_acuerdos().empty:
-        return serie
+    serie, _faltantes = dp.alinear_serie(serie)
     det = cargar_datos_local(mtime_parquet, mtime_acuerdos)
     nuevos = dp.agregar_serie(det)
     if nuevos.empty:
@@ -472,6 +474,10 @@ FILTROS = [
     ("Marca / Línea", "marca_linea"),
     ("Cliente", "nombreCliente"),
 ]
+
+# Columna -> etiqueta visible. Lo usa la Evolución mensual para avisar qué
+# filtro activo no puede aplicar (la serie histórica no tiene ese campo).
+ETIQ_FILTRO = {col: etiqueta for etiqueta, col in FILTROS}
 
 with st.container(border=True):
     # Fila 1: período + última actualización
@@ -1056,14 +1062,17 @@ def render_drill(df_base, niveles, key, root_id=None):
 # La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
 # (los supervisores no ven CM). Se arma la lista de tabs según el rol.
 _labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
-                "Altas y Bajas", "Vendedores", "Alertas", "Metas"]
+                "Clientes", "Altas y Bajas", "Vendedores", "Alertas", "Metas"]
 if mostrar_cm:
     _labels_tabs.append("Acuerdos McCain")
 
+# OJO: `tab_altas` es la solapa Altas y Bajas (antes se llamaba
+# `tab_clientes`, herencia del RFM viejo). `tab_cli` es la solapa Clientes
+# nueva. Son dos cosas distintas.
 _tabs = st.tabs(_labels_tabs)
-(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_clientes,
- tab_vend, tab_alertas, tab_metas) = _tabs[:8]
-tab_acuerdos = _tabs[8] if mostrar_cm else None
+(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_cli, tab_altas,
+ tab_vend, tab_alertas, tab_metas) = _tabs[:9]
+tab_acuerdos = _tabs[9] if mostrar_cm else None
 
 
 # --- TAB RESUMEN ----------------------------------------------------------
@@ -1197,9 +1206,13 @@ with tab_resumen:
     st.divider()
 
     # --- Evolución mensual (canal / subcanal / vendedor) --------------------
-    # Usa la serie mensual histórica (data/serie_mensual.parquet),
-    # INDEPENDIENTE del filtro de período: muestra todos los meses 2025–2026
-    # para comparar.
+    # Usa la serie mensual histórica (data/serie_mensual.parquet). Respeta los
+    # filtros globales de arriba: todas las dimensiones que existan en el grano
+    # de la serie (canal, subcanal, vendedor, región, marca/línea) más el
+    # período, que acá funciona como CORTE: la serie arranca en 2025 y termina
+    # en el mes elegido, para ver de dónde viene el mes que se está mirando.
+    # El único filtro que no aplica es Cliente (no está en el grano de la
+    # serie); cuando está activo se avisa abajo del gráfico.
     st.subheader("Evolución mensual")
 
     if not os.path.exists(dp.SERIE_PATH):
@@ -1249,124 +1262,163 @@ with tab_resumen:
                 "Vendedor": "dsVendedor",
             }[nivel]
 
-            # Respeta los filtros globales de canal/subcanal/vendedor si están
-            # activos (las sumas crudas se re-agregan bien sea cual sea el
-            # nivel elegido para abrir el gráfico).
-            s = serie.copy()
-            if seleccion.get("dsCanalMkt"):
-                s = s[s["dsCanalMkt"].astype(str).str.strip()
-                      .isin(seleccion["dsCanalMkt"])]
-            if seleccion.get("dsSubcanalMKT"):
-                s = s[s["dsSubcanalMKT"].astype(str).str.strip()
-                      .isin(seleccion["dsSubcanalMKT"])]
-            if seleccion.get("dsVendedor"):
-                s = s[s["dsVendedor"].astype(str).str.strip()
-                      .isin(seleccion["dsVendedor"])]
-
-            # Re-agrega al nivel elegido (las sumas crudas se re-agregan bien).
-            g = (
-                s.groupby(["anio_mes", dim], dropna=False)
-                .agg(
-                    kilos=("kilos", "sum"),
-                    subtotalNeto=("subtotalNeto", "sum"),
-                    cm=("cm", "sum"),
-                )
-                .reset_index()
+            # --- Filtros globales -------------------------------------------
+            # Genérico a propósito: dp.filtrar_serie aplica TODO filtro activo
+            # cuya columna exista en la serie (las sumas crudas se re-agregan
+            # bien sea cual sea el nivel elegido para abrir el gráfico) y
+            # devuelve las que no pudo aplicar, para avisarlas. Si mañana se
+            # suma un filtro nuevo a la barra de arriba y a dp.SERIE_GRANO, el
+            # gráfico lo hereda sin tocar nada acá.
+            # La lógica vive en el pipeline para poder testearla sin levantar
+            # Streamlit (ver smoke_evolucion.py).
+            s, _cols_sin_aplicar = dp.filtrar_serie(
+                serie, seleccion, hasta_mes=mes_sel
             )
+            sin_aplicar = [ETIQ_FILTRO.get(c, c) for c in _cols_sin_aplicar]
 
-            # --- Pesos constantes: deflactar $ con el IPC del INDEC ---------
-            base_mes = None
-            nota_moneda = "Pesos corrientes (nominales, de cada mes)."
-            if moneda.startswith("Constante"):
-                _ipc_mtime = (os.path.getmtime(dp.IPC_PATH)
-                              if os.path.exists(dp.IPC_PATH) else None)
-                ipc = cargar_ipc(_ipc_mtime)
-                factores, base_mes = dp.factores_constantes(ipc)
-                if not factores:
-                    st.warning(
-                        "No hay IPC disponible todavía (corré el pipeline o "
-                        "esperá a que INDEC responda). Mostrando pesos corrientes."
+            # Meses viejos sin apertura por las dimensiones nuevas: solo
+            # molestan cuando se filtra justo por esa dimensión (ver
+            # dp.alinear_serie). Se avisa abajo del gráfico.
+            _dims_sin_dato = sorted({
+                ETIQ_FILTRO.get(c, c) for c in dp.SERIE_GRANO[1:]
+                if c in s.columns and seleccion.get(c)
+                and (serie[c].astype(str) == dp.SERIE_SIN_DATO).any()
+            })
+
+            if s.empty:
+                st.info(
+                    "No hay datos en la serie histórica para los filtros "
+                    "seleccionados."
+                )
+            else:
+                # Re-agrega al nivel elegido (las sumas crudas se re-agregan bien).
+                g = (
+                    s.groupby(["anio_mes", dim], dropna=False)
+                    .agg(
+                        kilos=("kilos", "sum"),
+                        subtotalNeto=("subtotalNeto", "sum"),
+                        cm=("cm", "sum"),
                     )
-                else:
-                    # Factor por mes; meses sin IPC (ej. mes en curso) usan el
-                    # último factor disponible (≈1 respecto del mes base).
-                    ult = min(factores.values())  # el del mes más reciente
-                    fac = g["anio_mes"].map(factores).fillna(ult)
-                    g["subtotalNeto"] = g["subtotalNeto"] * fac
-                    g["cm"] = g["cm"] * fac
-                    nota_moneda = (
-                        f"Pesos constantes de {base_mes} (deflactado con IPC "
-                        f"Nivel General INDEC). Kilos y % no se ven afectados."
+                    .reset_index()
+                )
+
+                # --- Pesos constantes: deflactar $ con el IPC del INDEC ---------
+                base_mes = None
+                nota_moneda = "Pesos corrientes (nominales, de cada mes)."
+                if moneda.startswith("Constante"):
+                    _ipc_mtime = (os.path.getmtime(dp.IPC_PATH)
+                                  if os.path.exists(dp.IPC_PATH) else None)
+                    ipc = cargar_ipc(_ipc_mtime)
+                    factores, base_mes = dp.factores_constantes(ipc)
+                    if not factores:
+                        st.warning(
+                            "No hay IPC disponible todavía (corré el pipeline o "
+                            "esperá a que INDEC responda). Mostrando pesos corrientes."
+                        )
+                    else:
+                        # Factor por mes; meses sin IPC (ej. mes en curso) usan el
+                        # último factor disponible (≈1 respecto del mes base).
+                        ult = min(factores.values())  # el del mes más reciente
+                        fac = g["anio_mes"].map(factores).fillna(ult)
+                        g["subtotalNeto"] = g["subtotalNeto"] * fac
+                        g["cm"] = g["cm"] * fac
+                        nota_moneda = (
+                            f"Pesos constantes de {base_mes} (deflactado con IPC "
+                            f"Nivel General INDEC). Kilos y % no se ven afectados."
+                        )
+
+                # Métricas derivadas (porcentaje y $/kg se calculan acá, no se guardan).
+                den_fc = g["subtotalNeto"].replace(0, pd.NA)
+                den_kg = g["kilos"].replace(0, pd.NA)
+                g["cm_pct"] = (g["cm"] / den_fc * 100).fillna(0)
+                g["precio_kg"] = (g["subtotalNeto"] / den_kg).fillna(0)
+
+                col_val, _fmt = METRICAS_EVOL[nombre_metrica]
+                g = g.sort_values(["anio_mes", dim])
+
+                # --- Total por mes (suma de todos los canales/subcanales) --------
+                # Las métricas aditivas se suman; los % y $/kg se recalculan sobre
+                # los totales para que el "Total" sea correcto (no un promedio).
+                tot = (
+                    g.groupby("anio_mes", as_index=False)
+                    .agg(kilos=("kilos", "sum"),
+                         subtotalNeto=("subtotalNeto", "sum"),
+                         cm=("cm", "sum"))
+                )
+                tot_den_fc = tot["subtotalNeto"].replace(0, pd.NA)
+                tot_den_kg = tot["kilos"].replace(0, pd.NA)
+                tot["cm_pct"] = (tot["cm"] / tot_den_fc * 100).fillna(0)
+                tot["precio_kg"] = (tot["subtotalNeto"] / tot_den_kg).fillna(0)
+                tot = tot.sort_values("anio_mes")
+
+                fig = px.line(
+                    g, x="anio_mes", y=col_val, color=dim, markers=True,
+                )
+                # La línea de "Total" solo suma valor cuando se abre por Canal
+                # (pocas categorías). En Subcanal/Vendedor hay demasiadas líneas
+                # y el total se pisa con ellas, así que se omite.
+                if nivel == "Canal":
+                    fig.add_scatter(
+                        x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
+                        name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
+                        marker=dict(size=6),
+                    )
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(title=nivel, orientation="h", y=-0.2),
+                    xaxis_title="Mes",
+                    yaxis_title=nombre_metrica,
+                    height=440,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Pie del gráfico: moneda, alcance y — sobre todo — qué filtro
+                # activo NO se está aplicando. Un gráfico que ignora un filtro
+                # en silencio es peor que uno que no filtra.
+                _pie = (
+                    f"{nota_moneda}  ·  Serie histórica hasta "
+                    f"{etiqueta_mes(mes_sel)} (el período de arriba corta la "
+                    "serie; el mes en curso puede estar incompleto)."
+                )
+                if n_filtros - len(sin_aplicar) > 0:
+                    _pie += "  ·  Con los filtros de arriba aplicados."
+                st.caption(_pie)
+                if sin_aplicar:
+                    st.caption(
+                        ":orange[⚠ No aplica a este gráfico: "
+                        + ", ".join(sin_aplicar)
+                        + ". La serie histórica está agregada por mes y no "
+                        "guarda ese detalle; el resto del tablero sí lo "
+                        "respeta.]"
+                    )
+                if _dims_sin_dato:
+                    st.caption(
+                        ":orange[⚠ Los meses anteriores a la última "
+                        "reconstrucción de la serie no tienen apertura por "
+                        + ", ".join(_dims_sin_dato)
+                        + ", así que quedan fuera del gráfico. Para "
+                        "recuperarlos: `python backfill_serie.py --reset`.]"
                     )
 
-            # Métricas derivadas (porcentaje y $/kg se calculan acá, no se guardan).
-            den_fc = g["subtotalNeto"].replace(0, pd.NA)
-            den_kg = g["kilos"].replace(0, pd.NA)
-            g["cm_pct"] = (g["cm"] / den_fc * 100).fillna(0)
-            g["precio_kg"] = (g["subtotalNeto"] / den_kg).fillna(0)
-
-            col_val, _fmt = METRICAS_EVOL[nombre_metrica]
-            g = g.sort_values(["anio_mes", dim])
-
-            # --- Total por mes (suma de todos los canales/subcanales) --------
-            # Las métricas aditivas se suman; los % y $/kg se recalculan sobre
-            # los totales para que el "Total" sea correcto (no un promedio).
-            tot = (
-                g.groupby("anio_mes", as_index=False)
-                .agg(kilos=("kilos", "sum"),
-                     subtotalNeto=("subtotalNeto", "sum"),
-                     cm=("cm", "sum"))
-            )
-            tot_den_fc = tot["subtotalNeto"].replace(0, pd.NA)
-            tot_den_kg = tot["kilos"].replace(0, pd.NA)
-            tot["cm_pct"] = (tot["cm"] / tot_den_fc * 100).fillna(0)
-            tot["precio_kg"] = (tot["subtotalNeto"] / tot_den_kg).fillna(0)
-            tot = tot.sort_values("anio_mes")
-
-            fig = px.line(
-                g, x="anio_mes", y=col_val, color=dim, markers=True,
-            )
-            # La línea de "Total" solo suma valor cuando se abre por Canal
-            # (pocas categorías). En Subcanal/Vendedor hay demasiadas líneas
-            # y el total se pisa con ellas, así que se omite.
-            if nivel == "Canal":
-                fig.add_scatter(
-                    x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
-                    name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
-                    marker=dict(size=6),
-                )
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(title=nivel, orientation="h", y=-0.2),
-                xaxis_title="Mes",
-                yaxis_title=nombre_metrica,
-                height=440,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(
-                f"{nota_moneda}  ·  Serie completa (no depende del filtro de "
-                "período de arriba). El mes en curso puede estar incompleto."
-            )
-
-            # Tabla pivote opcional (meses en columnas) para ver los números.
-            with st.expander("Ver tabla de valores"):
-                piv = g.pivot_table(
-                    index=dim, columns="anio_mes", values=col_val,
-                    aggfunc="sum",
-                )
-                st.dataframe(
-                    piv.style.format(_fmt), use_container_width=True
-                )
-                hojas_resumen["Evolución mensual"] = piv.reset_index()
-                # Las columnas de la pivote son meses ("2026-01"): el formato
-                # no se puede deducir del nombre, lo define la métrica elegida.
-                fmt_evol = {
-                    fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
-                }.get(_fmt, XL_DEC1)
-                formatos_resumen["Evolución mensual"] = fmt_evol
+                # Tabla pivote opcional (meses en columnas) para ver los números.
+                with st.expander("Ver tabla de valores"):
+                    piv = g.pivot_table(
+                        index=dim, columns="anio_mes", values=col_val,
+                        aggfunc="sum",
+                    )
+                    st.dataframe(
+                        piv.style.format(_fmt), use_container_width=True
+                    )
+                    hojas_resumen["Evolución mensual"] = piv.reset_index()
+                    # Las columnas de la pivote son meses ("2026-01"): el formato
+                    # no se puede deducir del nombre, lo define la métrica elegida.
+                    fmt_evol = {
+                        fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
+                    }.get(_fmt, XL_DEC1)
+                    formatos_resumen["Evolución mensual"] = fmt_evol
 
     st.divider()
     boton_excel("resumen", hojas_resumen, key="xlsx_resumen",
@@ -1672,13 +1724,126 @@ with tab_prod:
     boton_excel("productos", hojas_prod, key="xlsx_prod")
 
 
+# --- TAB CLIENTES ---------------------------------------------------------
+# Tabla BRUTA a nivel cliente: una fila por cliente con operaciones en el mes
+# elegido, con los filtros de la barra de arriba ya aplicados, ordenable por
+# cualquier columna y descargable en Excel. Es la vista de gestión de cartera
+# que faltaba (pedido de Tomás, ago-2026): desde acá se arman los reportes
+# por vendedor y por cliente sin tocar el Excel a mano.
+#
+# No tiene filtros propios A PROPÓSITO: todo se maneja con los selectores de
+# arriba, que ya son globales y en cascada.
+with tab_cli:
+    st.subheader("Detalle por cliente")
+
+    # agregar_cobertura suma 'Surtido' y 'Cob. SKUs %': de los productos que
+    # el cliente compró en los últimos 3 meses, cuántos compró en el período.
+    # La cobertura de CLIENTES no se calcula (por_cliente saca la columna
+    # 'clientes'): a nivel cliente sería siempre 100 % y no dice nada.
+    _g_cli = dp.agregar_cobertura(dp.por_cliente(df), "idCliente", df_universo)
+
+    if _g_cli.empty:
+        st.info("No hay clientes con operaciones en el período seleccionado.")
+    else:
+        _busca = st.text_input(
+            "Buscar cliente", value="", key="busca_cli",
+            placeholder="Parte del nombre del cliente…",
+            help="Solo filtra esta tabla. Para filtrar todo el tablero usá "
+                 "los selectores de arriba.",
+        ).strip()
+        _f_cli = _g_cli
+        if _busca:
+            _f_cli = _f_cli[
+                _f_cli["nombreCliente"].astype(str)
+                .str.contains(_busca, case=False, na=False, regex=False)
+            ]
+
+        if _f_cli.empty:
+            st.info(f"Ningún cliente coincide con «{_busca}».")
+        else:
+            # El ID va primero: hay 50-80 clientes por mes que COMPARTEN
+            # nombre con otro (sucursales o cuentas distintas del ERP, ej.
+            # "AJ GROUP SRL" tiene 4 idCliente). Sin el ID, en el Excel se
+            # leen como filas duplicadas o como un error de la tabla, y no
+            # hay forma de cruzarlas contra el ERP.
+            _cols_cli = [
+                "idCliente", "nombreCliente", "region", "dsCanalMkt",
+                "dsSubcanalMKT",
+                "dsVendedor", "kilos", "subtotalNeto", "precio_kg",
+                "cm", "cm_pct", "skus", "universo_skus", "cob_skus",
+                "compras", "ultima_compra",
+            ]
+            # Supervisores no ven Contribución ni CM %, igual que en el resto
+            # del tablero.
+            if not mostrar_cm:
+                _cols_cli = [c for c in _cols_cli if c not in ("cm", "cm_pct")]
+            _cols_cli = [c for c in _cols_cli if c in _f_cli.columns]
+
+            _ren_cli = {
+                **COLS_DIM,
+                "idCliente": "ID", "nombreCliente": "Cliente",
+                "region": "Región",
+                "dsCanalMkt": "Canal", "dsSubcanalMKT": "Subcanal",
+                "dsVendedor": "Vendedor", "compras": "Compras",
+                "ultima_compra": "Última compra",
+            }
+            _fmt_cli = {
+                **FMT_DIM,
+                # El ID es un identificador, no una cantidad: sin separador
+                # de miles (1.234 no es un cliente, 1234 sí).
+                "ID": lambda x: f"{int(x)}" if pd.notna(x) else "—",
+                "Compras": lambda x: f"{x:,.0f}".replace(",", "."),
+                "SKUs": lambda x: f"{x:,.0f}".replace(",", "."),
+                "Surtido": lambda x: f"{x:,.0f}".replace(",", "."),
+                "Última compra": lambda x: (
+                    f"{x:%d/%m/%Y}" if pd.notna(x) else "—"
+                ),
+            }
+
+            t_cli = _f_cli[_cols_cli].rename(columns=_ren_cli)
+            st.dataframe(
+                t_cli.style.format(_fmt_cli),
+                use_container_width=True, hide_index=True, height=520,
+            )
+
+            # Totales de lo que se está viendo (con el buscador aplicado).
+            _tot = [
+                f"**{len(t_cli):,}** clientes".replace(",", "."),
+                fmt_kg(_f_cli["kilos"].sum()),
+                fmt_money(_f_cli["subtotalNeto"].sum()),
+            ]
+            if mostrar_cm and "cm" in _f_cli.columns:
+                _cm_t = _f_cli["cm"].sum()
+                _fc_t = _f_cli["subtotalNeto"].sum()
+                _tot.append(
+                    f"{fmt_money(_cm_t)} de contribución"
+                    + (f" ({_cm_t / _fc_t * 100:.1f} %)" if _fc_t else "")
+                )
+            st.caption("Totales de la tabla:  " + "  ·  ".join(_tot))
+
+            st.caption(
+                "Una fila por cliente. Región, canal, subcanal y vendedor son "
+                "los DOMINANTES del mes (los de mayor facturación); "
+                "el ID distingue a los clientes que comparten nombre. "
+                "«(+1)» avisa que el cliente además operó con otro vendedor. "
+                "Compras = comprobantes del mes, no renglones. "
+                f"Cob. SKUs % = del surtido que compró en {ETQ_UNIVERSO}, "
+                "cuánto volvió a comprar en el período."
+            )
+
+            st.divider()
+            # El Excel baja EXACTAMENTE lo que se está viendo (filtros de
+            # arriba + buscador), que es el reporte que se le pasa al vendedor.
+            boton_excel("clientes", {"Clientes": t_cli}, key="xlsx_cli_detalle")
+
+
 # --- TAB ALTAS Y BAJAS ----------------------------------------------------
 # NOTA: el bloque de RFM (segmentos + top clientes por facturación/frecuencia)
 # quedó COMENTADO a pedido, para que la solapa muestre solo altas y bajas.
 # No se borró nada: las funciones dp.rfm() y dp.resumen_segmentos() siguen
 # vivas en data_pipeline.py, así que para reactivarlo alcanza con descomentar
 # el bloque de abajo (y volver a poner "Clientes (RFM)" en _labels_tabs).
-with tab_clientes:
+with tab_altas:
     hojas_cli = {}  # tablas para el Excel descargable de la solapa
 
     # ----- INICIO BLOQUE RFM COMENTADO --------------------------------------
