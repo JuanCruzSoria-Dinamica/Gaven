@@ -101,6 +101,30 @@ CLIENTES_EXCLUIR = [194, 762, 1043, 1046, 1050, 1054]
 # comercial midan lo mismo.
 ARTICULOS_EXCLUIR = [0, 1000]
 
+# Nombres de vendedor que Chess trae como códigos genéricos de operación y que
+# en realidad son de una persona que ADEMÁS tiene su propio código. Sin esto, el
+# panel muestra a la misma persona partida en dos líneas y ninguna de las dos
+# refleja lo que vende de verdad.
+#
+#   RETAIL VENTAS (código 36) -> SANABRIA, GONZALO (código 37)
+#   FOOD CABA     (código 75) -> CASTILLON AGUSTIN DAMIAN (código 35)
+#
+# Se renombra SOLO 'dsVendedor'. 'idVendedor' queda como viene de Chess, así el
+# dato crudo sigue siendo rastreable hasta el código de origen.
+#
+# OJO con Food Caba: al pasar a llamarse Castillón hereda sus días de
+# facturación declarados (ver DIAS_FACTURACION), así que esas ventas dejan de
+# proyectarse contra días hábiles. Es el criterio correcto si la operación de
+# CABA factura los mismos días; si cambia, se corrige en DIAS_FACTURACION.
+#
+# La clave se compara normalizada (mayúsculas, sin espacios de más), así que no
+# hace falta escribirla exacto como viene del API.
+MAPA_VENDEDORES = {
+    "RETAIL VENTAS": "SANABRIA, GONZALO",
+    "FOOD CABA": "CASTILLON AGUSTIN DAMIAN",
+}
+
+
 MAPA_REGION = {
     "CIUDAD AUTONOMA BUENOS AIRES": "CABA",
     "BELLA VISTA": "SAN MIGUEL", "MUÑIZ": "SAN MIGUEL", "SAN MIGUEL": "SAN MIGUEL",
@@ -364,6 +388,31 @@ def traer_ventas_meses(base_url, headers, ventanas):
 # 2) Preparación / limpieza
 # ---------------------------------------------------------------------------
 
+def normalizar_vendedor(df, col="dsVendedor"):
+    """Reemplaza los nombres genéricos de vendedor por el nombre real
+    (MAPA_VENDEDORES). Devuelve el df modificado (copia).
+
+    Se aplica en DOS lados a propósito:
+      - en preparar(), sobre el detalle que baja del API, de donde salen el
+        panel, la serie y la cartera;
+      - al leer de disco la serie y la cartera (alinear_serie /
+        alinear_cartera), porque los meses que ya estaban guardados traen el
+        nombre viejo y quedarían como una línea fantasma en el gráfico.
+    Así el cambio se ve completo sin tener que rehacer el backfill.
+    """
+    if df is None or len(df) == 0 or col not in df.columns:
+        return df
+    tabla = {_norm_nombre(k): v for k, v in MAPA_VENDEDORES.items()}
+    normalizado = df[col].astype(str).str.upper().str.replace(
+        r"\s+", " ", regex=True).str.strip()
+    nuevo = normalizado.map(tabla)
+    if not nuevo.notna().any():
+        return df
+    df = df.copy()
+    df[col] = nuevo.fillna(df[col])
+    return df
+
+
 def preparar(df_ventas):
     cols = [c for c in COLUMNAS_IMPORTANTES if c in df_ventas.columns]
     df_ventas = df_ventas[cols].copy()
@@ -376,6 +425,9 @@ def preparar(df_ventas):
     df_ventas["fechaComprobate"] = pd.to_datetime(df_ventas["fechaComprobate"], errors="coerce")
 
     df_ventas["region"] = df_ventas["dsLocalidad"].map(MAPA_REGION).fillna("A DEFINIR")
+
+    # Códigos genéricos de Chess -> nombre real del vendedor.
+    df_ventas = normalizar_vendedor(df_ventas)
 
     df_ventas = df_ventas[
         (df_ventas["anulado"].astype(str).str.upper().str.strip() == "NO")
@@ -1399,6 +1451,9 @@ def alinear_serie(serie):
         serie = serie.copy()
         for c in faltantes:
             serie[c] = SERIE_SIN_DATO
+    # Los meses guardados antes de un renombre traen el nombre viejo: se
+    # traducen al leer para que no aparezca una línea fantasma en el gráfico.
+    serie = normalizar_vendedor(serie)
     return serie, faltantes
 
 
@@ -1521,7 +1576,156 @@ def upsert_serie(df_detalle, serie_path=SERIE_PATH):
     os.replace(tmp, serie_path)
     print(f"  serie: meses actualizados {sorted(meses_nuevos)} · "
           f"{len(serie)} filas totales en {serie_path}")
+
+    # La serie tiene DOS archivos: las sumas (serie_mensual.parquet) y las
+    # combinaciones cliente-SKU que hacen falta para contar sin duplicar
+    # (serie_cartera.parquet, ver la sección 3bis-a). Se actualizan juntos a
+    # propósito: así el cron y backfill_serie.py mantienen los dos sin tener
+    # que agregar una llamada nueva en cada lugar.
+    upsert_cartera(df_detalle)
     return serie
+
+
+# ---------------------------------------------------------------------------
+# 3bis-a) Serie de CARTERA (clientes activos y surtido, mes a mes)
+# ---------------------------------------------------------------------------
+# La serie mensual guarda SUMAS porque las sumas se re-agregan bien: sumar los
+# subcanales da el canal. Los CONTEOS ÚNICOS no. Un cliente que le compra a dos
+# vendedores está en las dos filas, y sumarlas lo cuenta dos veces; lo mismo un
+# SKU que se vende en dos canales. Por eso la columna 'clientes' de la serie
+# sirve para mirar una fila, pero no para armar un total.
+#
+# Solución: no guardar el número, guardar las COMBINACIONES. Esta tabla tiene
+# una fila por (mes × canal × subcanal × vendedor × región × marca) × cliente ×
+# artículo, sin métricas. El conteo se hace al leer, DESPUÉS de filtrar, así el
+# número es exacto sea cual sea el filtro y el nivel de apertura.
+#
+# Pesa poco porque son combinaciones únicas, no líneas de comprobante:
+# ~13.000 filas por mes, ~65 KB en parquet (medido sobre 2026).
+#
+# De acá salen las tres métricas de cartera del evolutivo:
+#   clientes        -> cuántos clientes distintos compraron
+#   skus            -> cuántos productos distintos se vendieron
+#   sku_por_cliente -> cuántos productos distintos compra, en promedio, cada
+#                      cliente (pares cliente-SKU / clientes). Es el promedio
+#                      real, no un promedio de promedios.
+
+CARTERA_PATH = os.path.join(DATA_DIR, "serie_cartera.parquet")
+CARTERA_GRANO = SERIE_GRANO + ["idCliente", "idArticulo"]
+
+
+def agregar_cartera(df_ventas):
+    """Combinaciones únicas mes × grano × cliente × artículo (sin métricas).
+
+    Mismo tratamiento de dimensiones que agregar_serie() (deriva 'region' y
+    'marca_linea' si faltan, normaliza los textos) para que las dos tablas
+    filtren igual con el mismo dict de selección.
+    """
+    if df_ventas is None or df_ventas.empty:
+        return pd.DataFrame(columns=CARTERA_GRANO)
+
+    d = df_ventas.copy()
+    d["anio_mes"] = d["fechaComprobate"].dt.to_period("M").astype(str)
+
+    if "marca_linea" not in d.columns:
+        d = agregar_marca_linea(d)
+    if "region" not in d.columns:
+        d["region"] = (d["dsLocalidad"].map(MAPA_REGION).fillna("A DEFINIR")
+                       if "dsLocalidad" in d.columns else "A DEFINIR")
+    for c in SERIE_GRANO[1:]:
+        d[c] = d[c].astype(str).str.strip().replace({"": SERIE_SIN_DATO})
+    for c in ("idCliente", "idArticulo"):
+        d[c] = d[c].astype(str).str.strip()
+
+    # Sin cliente o sin artículo no hay nada que contar (y ensuciaría el
+    # denominador de SKUs por cliente).
+    d = d[(d["idCliente"] != "") & (d["idCliente"].str.lower() != "nan")
+          & (d["idArticulo"] != "") & (d["idArticulo"].str.lower() != "nan")]
+    if d.empty:
+        return pd.DataFrame(columns=CARTERA_GRANO)
+
+    return (
+        d[CARTERA_GRANO].drop_duplicates()
+        .sort_values(CARTERA_GRANO).reset_index(drop=True)
+    )
+
+
+def alinear_cartera(cartera):
+    """Rellena con SERIE_SIN_DATO las dimensiones que una tabla vieja no tenga
+    (mismo criterio que alinear_serie). Devuelve (cartera, faltantes)."""
+    if cartera is None or cartera.empty:
+        return cartera, []
+    faltantes = [c for c in SERIE_GRANO if c not in cartera.columns]
+    if faltantes:
+        cartera = cartera.copy()
+        for c in faltantes:
+            cartera[c] = SERIE_SIN_DATO
+    cartera = normalizar_vendedor(cartera)
+    return cartera, faltantes
+
+
+def metricas_cartera(cartera, dim=None):
+    """Conteos por mes (y por `dim`, si se pasa) sobre la cartera YA filtrada.
+
+    Devuelve anio_mes [, dim], clientes, skus, sku_por_cliente.
+
+    Los pares cliente-SKU se cuentan con nunique y no con el largo del grupo:
+    al agrupar por mes solo (o por canal), un mismo par puede venir en varias
+    filas del grano (ej. un cliente atendido por dos vendedores), y contarlas
+    sumaría de más. Por eso también hay que llamar a esta función para el
+    total en vez de sumar los parciales.
+    """
+    cols = ["anio_mes"] + ([dim] if dim else [])
+    vacio = pd.DataFrame(columns=cols + ["clientes", "skus", "sku_por_cliente"])
+    if cartera is None or cartera.empty:
+        return vacio
+    if any(c not in cartera.columns for c in cols):
+        return vacio
+
+    d = cartera[cols + ["idCliente", "idArticulo"]].copy()
+    d["_par"] = (d["idCliente"].astype(str) + "\x1f"
+                 + d["idArticulo"].astype(str))
+    g = (
+        d.groupby(cols, dropna=False)
+        .agg(clientes=("idCliente", "nunique"),
+             skus=("idArticulo", "nunique"),
+             pares=("_par", "nunique"))
+        .reset_index()
+    )
+    g["sku_por_cliente"] = (
+        g["pares"] / g["clientes"].replace(0, pd.NA)
+    ).astype(float).fillna(0.0)
+    return g.drop(columns=["pares"]).sort_values(cols).reset_index(drop=True)
+
+
+def upsert_cartera(df_detalle, cartera_path=CARTERA_PATH):
+    """Inserta/actualiza en la tabla de cartera los meses de `df_detalle`.
+
+    Mismo mecanismo que upsert_serie (borrar el mes y reescribirlo, atómico e
+    idempotente). La llama upsert_serie, así el cron y el backfill la mantienen
+    sin tener que acordarse de nada.
+    """
+    nuevos = agregar_cartera(df_detalle)
+    if nuevos.empty:
+        return None
+
+    meses_nuevos = set(nuevos["anio_mes"].unique())
+    if os.path.exists(cartera_path):
+        actual = pd.read_parquet(cartera_path)
+        actual, _falt = alinear_cartera(actual)
+        actual = actual[~actual["anio_mes"].isin(meses_nuevos)]
+        cartera = pd.concat([actual, nuevos], ignore_index=True)
+    else:
+        cartera = nuevos
+
+    cartera = cartera.sort_values(CARTERA_GRANO).reset_index(drop=True)
+    os.makedirs(os.path.dirname(cartera_path) or ".", exist_ok=True)
+    tmp = cartera_path + ".tmp"
+    cartera.to_parquet(tmp, index=False)
+    os.replace(tmp, cartera_path)
+    print(f"  cartera: meses actualizados {sorted(meses_nuevos)} · "
+          f"{len(cartera)} filas totales en {cartera_path}")
+    return cartera
 
 
 # ---------------------------------------------------------------------------
@@ -2205,6 +2409,63 @@ def factor_proyeccion_ponderado(df, desde, corte, hasta, feriados=None,
         return 1.0, False
     factor = proyectado / base
     return factor, factor > 1.0
+
+
+# Columnas de la serie que se proyectan: son las que se ACUMULAN a lo largo
+# del mes. Los porcentajes y los $/kg no están acá porque no se guardan: se
+# derivan de estas sumas al leer, así que quedan proyectados por construcción
+# (y casi iguales al real, que es lo correcto — una tasa no sube porque pasen
+# días). Los conteos de cartera (clientes, SKUs) tampoco se proyectan: un
+# cliente que compró tres veces sigue siendo un cliente, así que escalarlos por
+# regla de tres da un número imposible.
+SERIE_COLS_PROYECTABLES = ["kilos", "subtotalNeto", "costo", "cm"]
+
+
+def proyectar_serie_mes(serie_mes, desde, corte, hasta, feriados=None):
+    """Lleva a fin de mes las filas de la serie del mes EN CURSO.
+
+    Cada fila de la serie tiene un solo canal y un solo vendedor, así que le
+    toca un factor propio (factor_proyeccion): Food Service se proyecta contra
+    los días de facturación declarados de cada vendedor y el resto contra días
+    hábiles. Es el mismo criterio que usa el seguimiento de metas, así que los
+    dos números del tablero cierran entre sí.
+
+    Devuelve (serie_proyectada, proyecto). `proyecto` es False cuando no hay
+    nada que escalar (mes cerrado, o sin días transcurridos): en ese caso la
+    serie vuelve igual y el panel no tiene que anunciar una proyección que no
+    hizo.
+    """
+    if serie_mes is None or len(serie_mes) == 0:
+        return serie_mes, False
+
+    s = serie_mes.copy()
+    canal = (s["dsCanalMkt"] if "dsCanalMkt" in s.columns
+             else pd.Series([""] * len(s), index=s.index))
+    vend = (s["dsVendedor"] if "dsVendedor" in s.columns
+            else pd.Series([""] * len(s), index=s.index))
+
+    # Cachea por (canal, vendedor): factor_proyeccion recorre el mes día por
+    # día y las filas del grano repiten mucho la misma combinación.
+    cache = {}
+
+    def _factor(c, v):
+        clave = (str(c), str(v))
+        if clave not in cache:
+            cache[clave] = factor_proyeccion(clave[0], clave[1], desde, corte,
+                                             hasta, feriados=feriados)
+        return cache[clave]
+
+    fac = pd.Series(
+        [_factor(c, v) for c, v in zip(canal, vend)], index=s.index,
+        dtype=float,
+    )
+    if not (fac > 1.0).any():
+        return s, False
+
+    for col in SERIE_COLS_PROYECTABLES:
+        if col in s.columns:
+            s[col] = pd.to_numeric(s[col], errors="coerce").fillna(0.0) * fac
+    return s, True
 
 
 def vendedores_sin_dias_facturacion(df_ventas):

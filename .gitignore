@@ -58,3 +58,5 @@ data/backups/
 # OJO: data/proveedor_objetivo_lookup.csv SÍ queda en git a propósito.
 # Ese no es estado: es una tabla de configuración que editás vos y de la que
 # depende la clasificación por marca/línea. Tiene que viajar con el código.
+data/serie_cartera.parquet
+snap_fix.json

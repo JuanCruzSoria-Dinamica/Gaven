@@ -310,8 +310,8 @@ red de contención, el backup deja de ser opcional.
 
 ### 1. Sembrar los archivos la primera vez
 
-Un clon nuevo trae `data/` casi vacío. El pipeline regenera solo las ventas, la serie, el IPC
-y el metadata. Pero **los objetivos y los acuerdos no los puede regenerar nadie**: hay que
+Un clon nuevo trae `data/` casi vacío. El pipeline regenera solo las ventas, las dos series
+(`serie_mensual.parquet` y `serie_cartera.parquet`), el IPC y el metadata. Pero **los objetivos y los acuerdos no los puede regenerar nadie**: hay que
 copiarlos a mano una única vez, desde tu PC:
 
 ```bash
@@ -338,7 +338,7 @@ Pegá:
 set -euo pipefail
 DEST=/root/backups
 mkdir -p "$DEST"
-tar czf "$DEST/data-$(date +\%Y\%m\%d-\%H\%M).tgz" -C /root/Gaven data
+tar czf "$DEST/data-$(date +%Y%m%d-%H%M).tgz" -C /root/Gaven data
 # Conserva los últimos 30 respaldos y borra los más viejos
 ls -1t "$DEST"/data-*.tgz | tail -n +31 | xargs -r rm --
 ```

@@ -143,6 +143,22 @@ def fmt_kg(x):
         return x
 
 
+def fmt_cant(x):
+    """Conteo entero con punto de miles (clientes, SKUs, comprobantes)."""
+    try:
+        return f"{round(x):,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return x
+
+
+def fmt_dec1(x):
+    """Un decimal, coma decimal (ej. SKUs por cliente: 6,1)."""
+    try:
+        return f"{x:,.1f}".replace(",", "@").replace(".", ",").replace("@", ".")
+    except (TypeError, ValueError):
+        return x
+
+
 # ---------------------------------------------------------------------------
 # Lectura de datos locales (se cachea la LECTURA del archivo, no el API).
 # La clave de caché incluye el mtime: si el pipeline reescribe el parquet,
@@ -168,11 +184,66 @@ def _mtime_metas():
         return 0
 
 
+def _achicar_texto(df):
+    """Pasa las columnas de texto repetitivas a 'category' para ocupar menos RAM.
+
+    Una columna de texto guarda la cadena completa en cada fila. 'dsEmpresa'
+    tiene 3 valores distintos repetidos 195.000 veces y ocupa 4 MB. Como
+    'category' se guarda el listado de valores UNA vez y después solo un número
+    por fila que apunta a ese listado. Medido en el servidor: 95 MB -> 38 MB.
+
+    Solo se convierten las columnas donde conviene (pocos valores distintos en
+    relación a la cantidad de filas). Si una columna es casi toda distinta,
+    'category' ocuparía MÁS, así que se deja como está.
+
+    Esto es seguro a partir de pandas 3: hasta pandas 2, groupby() sobre
+    columnas categóricas devolvía el producto cartesiano de todas las
+    categorías aunque no existieran esas combinaciones, y varias cuentas del
+    tablero se hubieran ido a las nubes. En pandas 3 el valor por defecto de
+    'observed' pasó a True y ese problema desapareció. Por las dudas, la
+    conversión NO se aplica si la versión de pandas es anterior a la 3.
+
+    Si algún día esto diera problemas, se apaga sin tocar el código creando la
+    variable de entorno GAVEN_SIN_CATEGORIAS=1 y reiniciando el servicio.
+    """
+    if os.environ.get("GAVEN_SIN_CATEGORIAS"):
+        return df
+    try:
+        if int(pd.__version__.split(".")[0]) < 3:
+            return df
+    except (ValueError, IndexError):
+        return df
+
+    filas = len(df)
+    if not filas:
+        return df
+
+    for col in df.columns:
+        if str(df[col].dtype) not in ("object", "str", "string"):
+            continue
+        try:
+            distintos = df[col].nunique(dropna=False)
+        except TypeError:
+            continue  # columna con objetos raros: no se toca
+        # Solo si los valores distintos son menos de la mitad de las filas.
+        if distintos and distintos < filas * 0.5:
+            try:
+                df[col] = df[col].astype("category")
+            except (TypeError, ValueError):
+                pass
+    return df
+
+
 # max_entries: tope de versiones vivas en caché. Sin esto, cada vez que el
 # pipeline reescribe el parquet cambia el mtime -> nueva entrada, y la vieja
 # NUNCA se libera. Eso es lo que hacía que la app se cayera sola después de un
 # rato en el servidor (se queda sin RAM y Streamlit Cloud mata el proceso).
-@st.cache_data(show_spinner="Leyendo datos...", max_entries=2)
+#
+# Está en 1 a propósito: todas las llamadas de la app usan los MISMOS
+# argumentos, así que nunca hace falta más de una versión viva. Con 2 quedaba
+# una copia vieja de ~95 MB ocupando lugar al pedo después de cada corrida del
+# pipeline.
+@st.cache_data(show_spinner="Leyendo datos...", max_entries=1)
 def cargar_datos_local(mtime, mtime_acuerdos=0):
     df = pd.read_parquet(PARQUET_PATH)
     # 'marca_linea' es una columna DERIVADA del lookup por código
@@ -185,7 +256,7 @@ def cargar_datos_local(mtime, mtime_acuerdos=0):
     # así subir un Excel nuevo corrige CM y CM% al instante, sin re-correr
     # el pipeline. Agrega la columna 'ajuste_mccain' (auditoría).
     df = dp.aplicar_acuerdos(df)
-    return df
+    return _achicar_texto(df)
 
 
 @st.cache_data(show_spinner="Leyendo serie histórica...", max_entries=2)
@@ -213,6 +284,32 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
         .sort_values(["anio_mes"] + dp.SERIE_GRANO[1:])
         .reset_index(drop=True)
     )
+
+
+@st.cache_data(show_spinner="Leyendo cartera histórica...", max_entries=2)
+def cargar_cartera(mtime, mtime_parquet=0):
+    """Lee la tabla de cartera (data/serie_cartera.parquet): una fila por
+    mes × grano × cliente × artículo. De acá salen los clientes activos, los
+    SKUs distintos y los SKUs por cliente del evolutivo.
+
+    Mismo patrón que cargar_serie(): los meses que también están en el parquet
+    de DETALLE se recalculan SIEMPRE desde el detalle, así el mes en curso está
+    al día sin esperar al pipeline. Los meses viejos (2025) salen del archivo;
+    si todavía no se generó, esos meses quedan sin las métricas de cartera y el
+    gráfico lo avisa en vez de dibujar un cero.
+    """
+    cart = pd.DataFrame(columns=dp.CARTERA_GRANO)
+    if os.path.exists(dp.CARTERA_PATH):
+        cart = pd.read_parquet(dp.CARTERA_PATH)
+        cart, _falt = dp.alinear_cartera(cart)
+    det = cargar_datos_local(mtime_parquet, _mtime_acuerdos())
+    nuevos = dp.agregar_cartera(det)
+    if nuevos.empty:
+        return cart
+    if cart is None or cart.empty:
+        return nuevos
+    cart = cart[~cart["anio_mes"].isin(set(nuevos["anio_mes"]))]
+    return pd.concat([cart, nuevos], ignore_index=True)
 
 
 # max_entries chico a propósito: la clave combina nivel × canales elegidos ×
@@ -1232,6 +1329,10 @@ with tab_resumen:
         if serie.empty:
             st.info("La serie histórica está vacía.")
         else:
+            # Cada métrica: etiqueta -> (columna, formato). Las tres últimas
+            # (cartera) NO salen de la serie de sumas sino de la tabla de
+            # combinaciones cliente-SKU (dp.CARTERA_PATH): son conteos únicos y
+            # sumarlos entre vendedores o subcanales los duplicaría.
             METRICAS_EVOL = {
                 "Facturación neta": ("subtotalNeto", fmt_money),
                 "Kilos": ("kilos", fmt_kg),
@@ -1241,6 +1342,14 @@ with tab_resumen:
                 METRICAS_EVOL["Contribución marginal (MB $)"] = ("cm", fmt_money)
                 METRICAS_EVOL["CM % (margen)"] = ("cm_pct", fmt_pct)
             METRICAS_EVOL["Precio medio $/kg"] = ("precio_kg", fmt_money)
+            METRICAS_EVOL["Clientes activos"] = ("clientes", fmt_cant)
+            METRICAS_EVOL["SKUs distintos vendidos"] = ("skus", fmt_cant)
+            METRICAS_EVOL["SKUs por cliente (promedio)"] = (
+                "sku_por_cliente", fmt_dec1)
+
+            # Columnas que se cuentan (no se suman): otra fuente, sin
+            # deflactar y sin proyección.
+            COLS_CARTERA = {"clientes", "skus", "sku_por_cliente"}
 
             c1, c2, c3 = st.columns([1.5, 0.9, 1.2])
             nombre_metrica = c1.selectbox(
@@ -1261,6 +1370,8 @@ with tab_resumen:
                 "Subcanal": "dsSubcanalMKT",
                 "Vendedor": "dsVendedor",
             }[nivel]
+            col_val, _fmt = METRICAS_EVOL[nombre_metrica]
+            es_cartera = col_val in COLS_CARTERA
 
             # --- Filtros globales -------------------------------------------
             # Genérico a propósito: dp.filtrar_serie aplica TODO filtro activo
@@ -1275,6 +1386,26 @@ with tab_resumen:
                 serie, seleccion, hasta_mes=mes_sel
             )
             sin_aplicar = [ETIQ_FILTRO.get(c, c) for c in _cols_sin_aplicar]
+
+            # --- Mes en curso: se muestra PROYECTADO a fin de mes ------------
+            # El último punto del gráfico venía siendo el mes a medio hacer, y
+            # al lado de meses completos parece siempre una caída. Se proyecta
+            # con el mismo criterio del seguimiento de metas (días de venta por
+            # vendedor, ver dp.proyectar_serie_mes), así los dos números del
+            # tablero cierran entre sí.
+            # Solo aplica a lo que se ACUMULA (plata, kilos, CM). Los conteos
+            # de cartera van en real: un cliente que compró tres veces sigue
+            # siendo un cliente, no se puede proyectar por regla de tres.
+            proy_evol = False
+            if es_mes_actual and not s.empty:
+                _en_curso = s["anio_mes"].astype(str) == str(mes_sel)
+                if _en_curso.any():
+                    _s_proy, proy_evol = dp.proyectar_serie_mes(
+                        s[_en_curso], _ini_mes, _corte_res, _fin_mes)
+                    if proy_evol:
+                        s = pd.concat([s[~_en_curso], _s_proy],
+                                      ignore_index=True)
+            mostrar_proy = proy_evol and not es_cartera
 
             # Meses viejos sin apertura por las dimensiones nuevas: solo
             # molestan cuando se filtra justo por esa dimensión (ver
@@ -1333,7 +1464,6 @@ with tab_resumen:
                 g["cm_pct"] = (g["cm"] / den_fc * 100).fillna(0)
                 g["precio_kg"] = (g["subtotalNeto"] / den_kg).fillna(0)
 
-                col_val, _fmt = METRICAS_EVOL[nombre_metrica]
                 g = g.sort_values(["anio_mes", dim])
 
                 # --- Total por mes (suma de todos los canales/subcanales) --------
@@ -1351,74 +1481,153 @@ with tab_resumen:
                 tot["precio_kg"] = (tot["subtotalNeto"] / tot_den_kg).fillna(0)
                 tot = tot.sort_values("anio_mes")
 
-                fig = px.line(
-                    g, x="anio_mes", y=col_val, color=dim, markers=True,
-                )
-                # La línea de "Total" solo suma valor cuando se abre por Canal
-                # (pocas categorías). En Subcanal/Vendedor hay demasiadas líneas
-                # y el total se pisa con ellas, así que se omite.
-                if nivel == "Canal":
-                    fig.add_scatter(
-                        x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
-                        name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
-                        marker=dict(size=6),
+                # --- Cartera: clientes activos, SKUs y SKUs por cliente ---------
+                # Se reemplazan g y tot por los conteos, que salen de la tabla
+                # de combinaciones y se cuentan DESPUÉS de filtrar. El total se
+                # vuelve a contar (no se suma): un cliente que le compra a dos
+                # vendedores es uno solo.
+                meses_sin_cartera = []
+                if es_cartera:
+                    cartera = cargar_cartera(
+                        os.path.getmtime(dp.CARTERA_PATH)
+                        if os.path.exists(dp.CARTERA_PATH) else 0,
+                        os.path.getmtime(PARQUET_PATH),
                     )
-                fig.update_layout(
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    legend=dict(title=nivel, orientation="h", y=-0.2),
-                    xaxis_title="Mes",
-                    yaxis_title=nombre_metrica,
-                    height=440,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Pie del gráfico: moneda, alcance y — sobre todo — qué filtro
-                # activo NO se está aplicando. Un gráfico que ignora un filtro
-                # en silencio es peor que uno que no filtra.
-                _pie = (
-                    f"{nota_moneda}  ·  Serie histórica hasta "
-                    f"{etiqueta_mes(mes_sel)} (el período de arriba corta la "
-                    "serie; el mes en curso puede estar incompleto)."
-                )
-                if n_filtros - len(sin_aplicar) > 0:
-                    _pie += "  ·  Con los filtros de arriba aplicados."
-                st.caption(_pie)
-                if sin_aplicar:
-                    st.caption(
-                        ":orange[⚠ No aplica a este gráfico: "
-                        + ", ".join(sin_aplicar)
-                        + ". La serie histórica está agregada por mes y no "
-                        "guarda ese detalle; el resto del tablero sí lo "
-                        "respeta.]"
+                    cart_f, _ = dp.filtrar_serie(
+                        cartera, seleccion, hasta_mes=mes_sel
                     )
-                if _dims_sin_dato:
-                    st.caption(
-                        ":orange[⚠ Los meses anteriores a la última "
-                        "reconstrucción de la serie no tienen apertura por "
-                        + ", ".join(_dims_sin_dato)
-                        + ", así que quedan fuera del gráfico. Para "
-                        "recuperarlos: `python backfill_serie.py --reset`.]"
+                    g = dp.metricas_cartera(cart_f, dim)
+                    tot = dp.metricas_cartera(cart_f)
+                    meses_sin_cartera = sorted(
+                        set(s["anio_mes"].astype(str))
+                        - set(g["anio_mes"].astype(str))
                     )
 
-                # Tabla pivote opcional (meses en columnas) para ver los números.
-                with st.expander("Ver tabla de valores"):
-                    piv = g.pivot_table(
-                        index=dim, columns="anio_mes", values=col_val,
-                        aggfunc="sum",
+                if g.empty:
+                    st.info(
+                        "No hay datos de clientes y SKUs para estos filtros. "
+                        "Si el gráfico funciona con las otras métricas, falta "
+                        "generar la tabla de cartera: `python backfill_serie.py`."
                     )
-                    st.dataframe(
-                        piv.style.format(_fmt), use_container_width=True
+                else:
+                    # Etiqueta del eje X: el mes en curso se marca como
+                    # proyectado solo cuando de verdad se proyectó esa métrica.
+                    _meses_x = sorted(g["anio_mes"].astype(str).unique())
+                    _tick = {m: m for m in _meses_x}
+                    if mostrar_proy and str(mes_sel) in _tick:
+                        _tick[str(mes_sel)] = f"{mes_sel} (proy.)"
+
+                    fig = px.line(
+                        g, x="anio_mes", y=col_val, color=dim, markers=True,
                     )
-                    hojas_resumen["Evolución mensual"] = piv.reset_index()
-                    # Las columnas de la pivote son meses ("2026-01"): el formato
-                    # no se puede deducir del nombre, lo define la métrica elegida.
-                    fmt_evol = {
-                        fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
-                    }.get(_fmt, XL_DEC1)
-                    formatos_resumen["Evolución mensual"] = fmt_evol
+                    # La línea de "Total" solo suma valor cuando se abre por Canal
+                    # (pocas categorías). En Subcanal/Vendedor hay demasiadas líneas
+                    # y el total se pisa con ellas, así que se omite.
+                    if nivel == "Canal":
+                        fig.add_scatter(
+                            x=tot["anio_mes"], y=tot[col_val], mode="lines+markers",
+                            name="Total", line=dict(color="#e5e7eb", width=3, dash="dash"),
+                            marker=dict(size=6),
+                        )
+                    fig.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        legend=dict(title=nivel, orientation="h", y=-0.2),
+                        xaxis_title="Mes",
+                        yaxis_title=nombre_metrica,
+                        height=440,
+                    )
+                    fig.update_xaxes(
+                        type="category", categoryorder="array",
+                        categoryarray=_meses_x,
+                        tickmode="array", tickvals=_meses_x,
+                        ticktext=[_tick[m] for m in _meses_x],
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Pie del gráfico: moneda, alcance y — sobre todo — qué filtro
+                    # activo NO se está aplicando. Un gráfico que ignora un filtro
+                    # en silencio es peor que uno que no filtra.
+                    _pie = (
+                        f"{nota_moneda}  ·  Serie histórica hasta "
+                        f"{etiqueta_mes(mes_sel)}"
+                    )
+                    if mostrar_proy:
+                        _pie += (
+                            " (el mes en curso se muestra PROYECTADO a fin de "
+                            "mes, con los días de venta de cada vendedor; el "
+                            "resto son meses cerrados)."
+                        )
+                    elif es_cartera and es_mes_actual:
+                        _pie += (
+                            " (el mes en curso va con el número REAL a hoy, sin "
+                            "proyectar: los clientes y los SKUs se repiten entre "
+                            "días, no se acumulan, así que todavía va a subir)."
+                        )
+                    else:
+                        _pie += (" (el período de arriba corta la serie; el mes "
+                                 "en curso puede estar incompleto).")
+                    if n_filtros - len(sin_aplicar) > 0:
+                        _pie += "  ·  Con los filtros de arriba aplicados."
+                    st.caption(_pie)
+                    if es_cartera:
+                        st.caption(
+                            "Clientes activos = clientes distintos que "
+                            "compraron en el mes. SKUs = productos distintos "
+                            "vendidos. SKUs por cliente = surtido promedio de "
+                            "cada cliente (mide desarrollo de cartera, no "
+                            "volumen). Los tres se cuentan sobre la selección, "
+                            "así que no se pueden sumar entre líneas: la línea "
+                            "de Total vuelve a contar sin duplicar."
+                        )
+                    if sin_aplicar:
+                        st.caption(
+                            ":orange[⚠ No aplica a este gráfico: "
+                            + ", ".join(sin_aplicar)
+                            + ". La serie histórica está agregada por mes y no "
+                            "guarda ese detalle; el resto del tablero sí lo "
+                            "respeta.]"
+                        )
+                    if meses_sin_cartera:
+                        st.caption(
+                            ":orange[⚠ Sin datos de clientes/SKUs para "
+                            + ", ".join(meses_sin_cartera)
+                            + ": esos meses son anteriores al detalle y la "
+                            "tabla de cartera todavía no los tiene. Para "
+                            "traerlos: `python backfill_serie.py --reset`.]"
+                        )
+                    if _dims_sin_dato:
+                        st.caption(
+                            ":orange[⚠ Los meses anteriores a la última "
+                            "reconstrucción de la serie no tienen apertura por "
+                            + ", ".join(_dims_sin_dato)
+                            + ", así que quedan fuera del gráfico. Para "
+                            "recuperarlos: `python backfill_serie.py --reset`.]"
+                        )
+
+                    # Tabla pivote opcional (meses en columnas) para ver los números.
+                    with st.expander("Ver tabla de valores"):
+                        piv = g.pivot_table(
+                            index=dim, columns="anio_mes", values=col_val,
+                            aggfunc="sum",
+                        )
+                        # La columna del mes en curso se renombra igual que el
+                        # eje: quien baje el Excel tiene que saber cuál es
+                        # proyectado y cuál cerrado.
+                        piv = piv.rename(columns=_tick)
+                        st.dataframe(
+                            piv.style.format(_fmt), use_container_width=True
+                        )
+                        hojas_resumen["Evolución mensual"] = piv.reset_index()
+                        # Las columnas de la pivote son meses ("2026-01"): el formato
+                        # no se puede deducir del nombre, lo define la métrica elegida.
+                        fmt_evol = {
+                            fmt_money: XL_MONEY, fmt_kg: XL_KG, fmt_pct: XL_PCT,
+                            fmt_cant: XL_INT, fmt_dec1: XL_DEC1,
+                        }.get(_fmt, XL_DEC1)
+                        formatos_resumen["Evolución mensual"] = fmt_evol
 
     st.divider()
     boton_excel("resumen", hojas_resumen, key="xlsx_resumen",
