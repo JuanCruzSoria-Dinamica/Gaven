@@ -64,6 +64,11 @@ SERIE_DESDE = dt.date(2025, 1, 1)
 # (solapa "Acuerdos McCain") y se consolidan acá. El costo del parquet de
 # ventas queda SIEMPRE crudo (tal como viene de Chess); el ajuste se aplica
 # al leer, con aplicar_acuerdos().
+#
+# Es UNA de las dos capas de descuento sobre el costo. La otra es la
+# bonificación por CANAL (ver BONIF_CANAL_REGLAS, sección 3bis-c): una regla
+# fija de McCain para todos los clientes de un canal. Las dos se restan de la
+# misma base bruta, así que se suman sin pisarse.
 ACUERDOS_PATH = os.path.join(DATA_DIR, "acuerdos_mccain.parquet")
 
 # IPC Nivel General Nacional (INDEC). Se usa para expresar la facturación en
@@ -487,12 +492,26 @@ def recalcular_costo(df):
     _frac_cargo = (df["unimedcargo"] / _um_total).fillna(1.0)
     df["bultos_cargo"] = df["cantidadesTotal"] * _frac_cargo
     df["Categoria"] = np.where(df["pesoTotal"] != 0, "Pesable", "No Pesable")
-    df["costo_unitario"] = np.where(
+    df["costo_unitario"] = costo_bruto(df)
+    return df
+
+
+def costo_bruto(df):
+    """Costo de Chess SIN ajustes comerciales, línea por línea.
+
+    Es la fórmula del Excel comercial y el punto de partida de todo: lo que
+    se guarda en el parquet. Los ajustes (acuerdos McCain, bonificación por
+    canal) se restan después, al leer.
+
+    Vive en su propia función para que los ajustes que necesitan la BASE
+    bruta la calculen con la misma cuenta y no con una copia que se pueda
+    desincronizar. Necesita las columnas que deja recalcular_costo().
+    """
+    return np.where(
         df["Categoria"] == "No Pesable",
         df["preciocomprant"] * df["bultos_cargo"],
         df["preciocomprant"] * df["kilos_cargo"],
     )
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -1885,6 +1904,98 @@ def aplicar_acuerdos(df_ventas, acuerdos=None):
     df["ajuste_mccain"] = df["desc_kg"] * df["kilos_cargo"]
     df["costo_unitario"] = df["costo_unitario"] - df["ajuste_mccain"]
     return df.drop(columns=["_anio", "_mes", "desc_kg"])
+
+
+# ---------------------------------------------------------------------------
+# 3bis-c) Bonificación McCain POR CANAL (regla fija, no por cliente)
+# ---------------------------------------------------------------------------
+# Distinta de los acuerdos de arriba: no llega en un Excel por cliente, es una
+# regla comercial de McCain que vale para TODOS los clientes de un canal y un
+# puñado de SKUs. Vigente (sep-2026): 10% sobre el precio de compra de tres
+# SKUs para el canal GRANJAS.
+#
+# Por qué no se carga en Chess: ahí el precio de compra es por ARTÍCULO, no por
+# canal. Cargado en Chess, el descuento le bajaría el costo también a FOOD
+# SERVICE, MAYORISTAS y RETAIL, que venden los mismos SKUs sin la bonificación,
+# y les inflaría la contribución. Por eso se aplica acá, al leer, igual que los
+# acuerdos.
+#
+# Es ADICIONAL, no sustituto: la bonificación que ya tenga cada cliente (15%,
+# 12%, 9%, la que sea) ya viene metida en el precio de compra de Chess, y el
+# acuerdo del Excel se resta aparte. Este 10% va ENCIMA de todo eso.
+#
+# Base del cálculo: el costo BRUTO de Chess (precio de compra × lo cobrado), no
+# el costo ya neto de acuerdos. Así el descuento es siempre "10% del precio de
+# compra", como lo definió McCain, y el número no depende del orden en que se
+# apliquen los dos ajustes. Para GRANJAS hoy da igual (no tiene acuerdos
+# cargados), pero deja la regla sin ambigüedad si mañana los tiene.
+#
+# Se usa kilos_cargo / bultos_cargo (solo lo COBRADO), mismo criterio que el
+# resto del tablero: la mercadería bonificada no lleva costo, así que tampoco
+# le corresponde descuento. Las notas de crédito vienen con cantidades
+# negativas, así que el ajuste se revierte solo en las devoluciones.
+#
+# PARA CAMBIARLA: se edita esta lista y se reinicia el servicio. Agregar un SKU
+# es sumar el código a "articulos"; cortar la vigencia es poner "hasta". Si en
+# algún momento esto cambia seguido o hay varias reglas por canal, conviene
+# moverlo a un parquet con su propia carga, como los acuerdos.
+
+BONIF_CANAL_REGLAS = [
+    {
+        "nombre": "McCain 10% GRANJAS",
+        "canal": "GRANJAS",
+        "articulos": (81109, 81064, 81895),
+        "pct": 0.10,
+        "desde": None,   # 'YYYY-MM' inclusive. None = todo el histórico.
+        "hasta": None,   # 'YYYY-MM' inclusive. None = sin fecha de corte.
+    },
+]
+
+
+def aplicar_bonificacion_canal(df_ventas, reglas=None):
+    """Resta del costo las bonificaciones que McCain da por CANAL + SKU.
+
+    Para cada regla marca las líneas que cumplen canal + artículo (+ vigencia,
+    si la tiene) y calcula ajuste = pct × costo bruto de la línea, que se RESTA
+    de costo_unitario. Sin regla que aplique -> ajuste 0 (costo intacto).
+
+    Agrega la columna 'ajuste_bonif_canal' para auditar. CM y CM% no se tocan
+    acá: toda la app los deriva de costo_unitario, así que salen bien solos.
+
+    Es independiente de aplicar_acuerdos() y se puede llamar antes o después:
+    los dos ajustes se calculan sobre la base bruta y se restan, no se pisan.
+    """
+    if reglas is None:
+        reglas = BONIF_CANAL_REGLAS
+    df = df_ventas.copy()
+    if "kilos_cargo" not in df.columns or "Categoria" not in df.columns:
+        # Parquet viejo o df crudo: re-derivar las columnas de cargo.
+        df = recalcular_costo(df)
+    df["ajuste_bonif_canal"] = 0.0
+    if df.empty or not reglas:
+        return df
+
+    base = pd.Series(costo_bruto(df), index=df.index)
+    canal = df["dsCanalMkt"].astype(str).str.upper().str.strip()
+    articulo = pd.to_numeric(df["idArticulo"], errors="coerce")
+    mes = df["fechaComprobate"].dt.to_period("M").astype(str)
+
+    for regla in reglas:
+        cumple = (
+            canal.eq(str(regla["canal"]).upper().strip())
+            & articulo.isin([int(a) for a in regla["articulos"]])
+        )
+        if regla.get("desde"):
+            cumple &= mes >= str(regla["desde"])
+        if regla.get("hasta"):
+            cumple &= mes <= str(regla["hasta"])
+        if cumple.any():
+            df.loc[cumple, "ajuste_bonif_canal"] += (
+                float(regla["pct"]) * base[cumple]
+            )
+
+    df["costo_unitario"] = df["costo_unitario"] - df["ajuste_bonif_canal"]
+    return df
 
 
 # ---------------------------------------------------------------------------

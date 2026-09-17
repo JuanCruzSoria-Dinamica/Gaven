@@ -256,6 +256,11 @@ def cargar_datos_local(mtime, mtime_acuerdos=0):
     # así subir un Excel nuevo corrige CM y CM% al instante, sin re-correr
     # el pipeline. Agrega la columna 'ajuste_mccain' (auditoría).
     df = dp.aplicar_acuerdos(df)
+    # Bonificación de McCain por canal + SKU (ver dp.BONIF_CANAL_REGLAS): un
+    # descuento que Chess no puede cargar porque impactaría en todos los
+    # canales. Se resta del costo acá, encima de lo que ya descontaron los
+    # acuerdos. Agrega la columna 'ajuste_bonif_canal' (auditoría).
+    df = dp.aplicar_bonificacion_canal(df)
     return _achicar_texto(df)
 
 
@@ -2328,10 +2333,10 @@ with tab_vend:
 # Seis preguntas fijas por canal, siempre las mismas, para leer la reunión de
 # mesa chica sin tener que armar el Excel a mano.
 #
-# Antes esta solapa mostraba además los avisos por umbral de dp.alertas()
-# (margen negativo, concentración del top 10, Pareto de SKUs). Se sacaron a
-# pedido: la mesa chica se lee con las tarjetas y los avisos sueltos arriba
-# distraían. La función sigue en data_pipeline.py por si se reactivan.
+# Abajo de las tarjetas van los avisos por umbral de dp.alertas() (margen
+# negativo, concentración del top 10, canal de menor margen, Pareto de SKUs).
+# Estuvieron sacados entre ago y sep 2026 porque arriba tapaban la lectura de
+# mesa chica; se repusieron al final de la solapa, que era el problema real.
 #
 # Usa el parquet COMPLETO y no `df`, porque las lecturas de "caído" necesitan
 # ver también el mes anterior. Los filtros de dimensión de arriba sí se
@@ -2407,8 +2412,42 @@ with tab_alertas:
         "lecturas_por_canal",
         {"Lecturas por canal": (_ins.drop(columns="nivel")
                                 if not _ins.empty else None)},
-        key="xlsx_alertas",
+        key="xlsx_lecturas",
     )
+
+    # --- Avisos automáticos por umbral -------------------------------------
+    # Los cuatro avisos de dp.alertas() que se habían sacado en agosto 2026.
+    # Vuelven ABAJO de las tarjetas, no arriba: el motivo original de sacarlos
+    # fue que peleaban por la atención con la lectura de mesa chica, no el
+    # contenido. Acá se leen después, como cierre de la solapa.
+    #
+    # Usan `df` (período elegido + filtros globales de arriba), NO `_df_ins`:
+    # ese arrastra el año entero porque las tarjetas necesitan el mes
+    # anterior para comparar, y los umbrales tienen que hablar del período
+    # que el usuario está mirando.
+    st.divider()
+    st.subheader("Avisos automáticos")
+    st.caption(
+        "Umbrales fijos sobre el período y los filtros seleccionados."
+    )
+
+    _avisos = dp.alertas(df)
+    if not _avisos:
+        st.success("Sin avisos para el período seleccionado.")
+    else:
+        for _a in _avisos:
+            if _a["nivel"] == "riesgo":
+                st.error(_a["texto"])
+            else:
+                st.info(_a["texto"])
+
+        st.divider()
+        boton_excel(
+            "avisos",
+            {"Avisos": pd.DataFrame(_avisos).rename(
+                columns={"nivel": "Nivel", "texto": "Aviso"})},
+            key="xlsx_alertas",
+        )
 
 
 # --- TAB METAS ------------------------------------------------------------
@@ -3483,6 +3522,62 @@ if tab_acuerdos is not None:
                 help="Importe restado del costo de Chess por acuerdos "
                      "McCain. Es la mejora directa de la contribución.",
             )
+
+        # --- Bonificación por canal (regla fija, sin Excel) --------------
+        # Es el otro descuento de McCain: no viene por cliente en un Excel,
+        # es una regla para todo un canal y unos pocos SKUs. Vive en el
+        # código (dp.BONIF_CANAL_REGLAS) y se audita acá para que se vea
+        # cuánto está moviendo y sobre qué se aplicó.
+        st.divider()
+        st.subheader("Bonificación McCain por canal")
+        _reglas = dp.BONIF_CANAL_REGLAS
+        if not _reglas:
+            st.info("No hay reglas de bonificación por canal configuradas.")
+        else:
+            for _r in _reglas:
+                _vig = ""
+                if _r.get("desde"):
+                    _vig += f" · desde {_r['desde']}"
+                if _r.get("hasta"):
+                    _vig += f" · hasta {_r['hasta']}"
+                st.caption(
+                    f"**{_r['nombre']}** — {_r['pct'] * 100:,.0f}% sobre el "
+                    f"precio de compra, canal {_r['canal']}, SKUs "
+                    + ", ".join(str(_a) for _a in _r["articulos"]) + _vig
+                )
+            st.caption(
+                "Chess no puede cargarlo (el precio de compra es por "
+                "artículo, no por canal: se lo bajaría también a los demás "
+                "canales). Se aplica acá, encima de las bonificaciones que "
+                "cada cliente ya tiene. Para cambiar SKUs, porcentaje o "
+                "vigencia se edita BONIF_CANAL_REGLAS en data_pipeline.py."
+            )
+            _bon = df_anio[df_anio["ajuste_bonif_canal"] != 0].copy()
+            if _bon.empty:
+                st.info(
+                    "La regla no alcanzó ninguna venta de los meses cargados."
+                )
+            else:
+                _bon["Mes"] = _bon["fechaComprobate"].dt.to_period("M").astype(str)
+                _tb = (
+                    _bon.groupby("Mes")
+                    .agg(**{
+                        "Líneas alcanzadas": ("ajuste_bonif_canal", "size"),
+                        "Kilos": ("kilos", "sum"),
+                        "Descuento aplicado $": ("ajuste_bonif_canal", "sum"),
+                    })
+                    .reset_index()
+                )
+                _tb["Kilos"] = _tb["Kilos"].map(fmt_kg)
+                _tb["Descuento aplicado $"] = _tb["Descuento aplicado $"].map(fmt_money)
+                c3, c4 = st.columns([2, 1])
+                c3.dataframe(_tb, use_container_width=True, hide_index=True)
+                c4.metric(
+                    "Descuento total aplicado (todo el año)",
+                    fmt_money(df_anio["ajuste_bonif_canal"].sum()),
+                    help="Importe restado del costo de Chess por la "
+                         "bonificación por canal. Va encima de los acuerdos.",
+                )
 
         st.divider()
 
