@@ -248,6 +248,34 @@ def agregar_marca_linea(df):
     return df
 
 
+def agregar_sku(df):
+    """Agrega la columna 'sku' = "<código> · <descripción>" para el filtro SKU
+    del panel. La descripción es la VIGENTE (la de la venta más reciente de ese
+    código): Chess a veces renombra artículos y, si se filtrara por dsArticulo,
+    un mismo código quedaría partido en dos opciones y se perderían las ventas
+    con el nombre viejo. Con el código adelante el filtro es exacto y se puede
+    buscar tipeando el código o parte del nombre.
+    """
+    if df is None:
+        return df
+    df = df.copy()
+    if df.empty or "idArticulo" not in df.columns:
+        df["sku"] = pd.Series(dtype="object")
+        return df
+    cod = pd.to_numeric(df["idArticulo"], errors="coerce")
+    nombre = df["dsArticulo"].astype(str).str.strip() if "dsArticulo" in df.columns \
+        else pd.Series([""] * len(df), index=df.index)
+    if "fechaComprobate" in df.columns:
+        orden = df["fechaComprobate"].sort_values(kind="stable").index
+    else:
+        orden = df.index
+    vigente = (pd.DataFrame({"cod": cod.loc[orden], "nombre": nombre.loc[orden]})
+               .dropna(subset=["cod"]).groupby("cod")["nombre"].last())
+    etiquetas = {c: f"{int(c)} · {n}" for c, n in vigente.items()}
+    df["sku"] = cod.map(etiquetas)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # 1) Conexión al API
 # ---------------------------------------------------------------------------

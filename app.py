@@ -261,6 +261,9 @@ def cargar_datos_local(mtime, mtime_acuerdos=0):
     # canales. Se resta del costo acá, encima de lo que ya descontaron los
     # acuerdos. Agrega la columna 'ajuste_bonif_canal' (auditoría).
     df = dp.aplicar_bonificacion_canal(df)
+    # 'sku' = "<código> · <descripción vigente>" para el filtro SKU de la barra
+    # de arriba (ver dp.agregar_sku). Pasa a 'category' en _achicar_texto.
+    df = dp.agregar_sku(df)
     return _achicar_texto(df)
 
 
@@ -574,6 +577,7 @@ FILTROS = [
     ("Región", "region"),
     ("Vendedor", "dsVendedor"),
     ("Marca / Línea", "marca_linea"),
+    ("SKU", "sku"),
     ("Cliente", "nombreCliente"),
 ]
 
