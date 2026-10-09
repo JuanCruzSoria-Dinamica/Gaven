@@ -244,7 +244,7 @@ def _achicar_texto(df):
 # una copia vieja de ~95 MB ocupando lugar al pedo después de cada corrida del
 # pipeline.
 @st.cache_data(show_spinner="Leyendo datos...", max_entries=1)
-def cargar_datos_local(mtime, mtime_acuerdos=0):
+def cargar_datos_local(mtime, mtime_acuerdos=0, mtime_familias=0):
     df = pd.read_parquet(PARQUET_PATH)
     # 'marca_linea' es una columna DERIVADA del lookup por código
     # (data/proveedor_objetivo_lookup.csv). Se recalcula siempre al leer para
@@ -264,6 +264,11 @@ def cargar_datos_local(mtime, mtime_acuerdos=0):
     # 'sku' = "<código> · <descripción vigente>" para el filtro SKU de la barra
     # de arriba (ver dp.agregar_sku). Pasa a 'category' en _achicar_texto.
     df = dp.agregar_sku(df)
+    # 'familia' y 'tipo_producto' por código de artículo (data/familias_lookup.csv,
+    # lo genera build_lookup_familias.py desde la lista comercial). El mtime del
+    # lookup entra en la clave de caché (mtime_familias) para que regenerarlo se
+    # vea sin reiniciar el servicio.
+    df = dp.agregar_familia_tipo(df)
     return _achicar_texto(df)
 
 
@@ -282,7 +287,7 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     (ver dp.alinear_serie) y se recuperan rehaciendo el backfill."""
     serie = pd.read_parquet(dp.SERIE_PATH)
     serie, _faltantes = dp.alinear_serie(serie)
-    det = cargar_datos_local(mtime_parquet, mtime_acuerdos)
+    det = cargar_datos_local(mtime_parquet, mtime_acuerdos, dp.mtime_lookup_familias())
     nuevos = dp.agregar_serie(det)
     if nuevos.empty:
         return serie
@@ -310,7 +315,7 @@ def cargar_cartera(mtime, mtime_parquet=0):
     if os.path.exists(dp.CARTERA_PATH):
         cart = pd.read_parquet(dp.CARTERA_PATH)
         cart, _falt = dp.alinear_cartera(cart)
-    det = cargar_datos_local(mtime_parquet, _mtime_acuerdos())
+    det = cargar_datos_local(mtime_parquet, _mtime_acuerdos(), dp.mtime_lookup_familias())
     nuevos = dp.agregar_cartera(det)
     if nuevos.empty:
         return cart
@@ -336,7 +341,7 @@ def cargar_evolutivo(nivel, canales, mtime, mtime_acuerdos=0, mtime_metas=0,
     `canales` llega como tupla porque la clave de caché tiene que ser
     hasheable.
     """
-    df = cargar_datos_local(mtime, mtime_acuerdos)
+    df = cargar_datos_local(mtime, mtime_acuerdos, dp.mtime_lookup_familias())
     return dp.evolutivo_metas(
         df, dp.cargar_metas(),
         nivel=nivel,
@@ -546,7 +551,8 @@ if not os.path.exists(PARQUET_PATH):
     )
     st.stop()
 
-df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos())
+df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos(),
+                        dp.mtime_lookup_familias())
 
 # Copia del detalle COMPLETO (todo el parquet) antes de recortarlo por
 # período. De acá salen el universo de la cobertura (ver más abajo) y las
@@ -571,19 +577,43 @@ def opciones(serie):
 
 # Cada filtro es una tupla: (etiqueta, columna). Solo se muestran los que
 # realmente tienen datos en el período.
-FILTROS = [
+# Fila 2 (dimensiones comerciales): se combinan entre sí con "Y" y en cascada.
+FILTROS_DIM = [
     ("Canal", "dsCanalMkt"),
     ("Subcanal", "dsSubcanalMKT"),
     ("Región", "region"),
     ("Vendedor", "dsVendedor"),
-    ("Marca / Línea", "marca_linea"),
-    ("SKU", "sku"),
     ("Cliente", "nombreCliente"),
 ]
+# Fila 3 (productos). Marca / Línea se comporta como las de arriba (afina).
+# Familia, Tipo y SKU NO filtran cada uno por su lado: se resuelven juntos con
+# dp.resolver_productos (gana lo más específico de cada rama y las ramas se
+# suman), y el resultado entra a `seleccion` como un único filtro por 'sku'.
+FILTRO_MARCA = ("Marca / Línea", "marca_linea")
+FILTROS_PROD = [
+    ("Familia", "familia"),
+    ("Tipo de producto", "tipo_producto"),
+    ("SKU", "sku"),
+]
+FILTROS = FILTROS_DIM + [FILTRO_MARCA] + FILTROS_PROD
+_COLS_PROD = [c for _, c in FILTROS_PROD]
 
 # Columna -> etiqueta visible. Lo usa la Evolución mensual para avisar qué
 # filtro activo no puede aplicar (la serie histórica no tiene ese campo).
 ETIQ_FILTRO = {col: etiqueta for etiqueta, col in FILTROS}
+ETIQ_FILTRO["sku"] = "Producto (familia / tipo / SKU)"
+
+
+def _limpiar_filtros():
+    for _, c in FILTROS:
+        st.session_state[f"filtro_{c}"] = []
+
+
+def _resumen_valores(vals, maximo=3):
+    vals = list(vals)
+    if len(vals) <= maximo:
+        return ", ".join(vals)
+    return ", ".join(vals[:maximo]) + f" y {len(vals) - maximo} más"
 
 with st.container(border=True):
     # Fila 1: período + última actualización
@@ -628,52 +658,116 @@ with st.container(border=True):
         & (fecha.dt.year == dp.ANIO)
     ].copy()
 
-    # Fila 2: un selector por dimensión (solo las que tienen datos).
-    # Filtros EN CASCADA: las opciones de cada selector se calculan sobre el
-    # df ya filtrado por los OTROS selectores. Así, si filtrás por "food
-    # service", el selector de Vendedor solo ofrece los que vendieron eso.
+    # Catálogo de productos (todo el parquet, no solo el mes): la selección de
+    # familia / tipo se traduce a SKUs con esto, y así el universo de la
+    # cobertura (3 meses) y las solapas multi-mes incluyen también los SKUs de
+    # la familia que no se vendieron justo en el mes elegido.
+    _catalogo = (df_anio[["sku", "familia", "tipo_producto"]]
+                 .dropna(subset=["sku"]).astype(str).drop_duplicates("sku"))
+
+    def _skus_de(sel):
+        return dp.resolver_productos(
+            _catalogo, sel.get("familia"), sel.get("tipo_producto"),
+            sel.get("sku"))
+
     seleccion = {}
+    sel_widgets = {}
     if not df_periodo.empty:
-        disponibles = [
-            (et, col) for et, col in FILTROS
-            if col in df_periodo.columns and opciones(df_periodo[col])
-        ]
-        if disponibles:
-            # Selecciones de la corrida anterior (Streamlit re-ejecuta en cada
-            # interacción): sirven de base para armar las opciones cruzadas.
-            sel_prev = {
-                col: st.session_state.get(f"filtro_{col}", [])
-                for _, col in disponibles
-            }
+        # Selecciones de la corrida anterior (Streamlit re-ejecuta en cada
+        # interacción): sirven de base para armar las opciones cruzadas.
+        sel_prev = {
+            col: st.session_state.get(f"filtro_{col}", [])
+            for _, col in FILTROS
+        }
+        _skus_prev = _skus_de(sel_prev)
 
-            def _df_filtrado_excepto(col_excluida):
-                """df del período filtrado por todos los selectores menos uno."""
-                d = df_periodo
-                for c, vals in sel_prev.items():
-                    if c == col_excluida or not vals:
-                        continue
-                    d = d[d[c].astype(str).str.strip().isin(vals)]
-                return d
+        def _df_filtrado_excepto(col_excluida):
+            """df del período filtrado por todos los selectores menos uno.
+            Filtros EN CASCADA: si filtrás por "food service", el selector de
+            Vendedor solo ofrece los que vendieron eso. Los tres filtros de
+            producto (familia/tipo/SKU) NO se recortan entre sí: se suman (ver
+            dp.resolver_productos), así se puede elegir "Jamón cocido" y
+            "Quesos" a la vez."""
+            d = df_periodo
+            for c, vals in sel_prev.items():
+                if c == col_excluida or c in _COLS_PROD or not vals:
+                    continue
+                d = d[d[c].astype(str).str.strip().isin(vals)]
+            if col_excluida not in _COLS_PROD and _skus_prev is not None:
+                d = d[d["sku"].astype(str).isin(_skus_prev)]
+            return d
 
-            cols = st.columns(len(disponibles))
-            for i, (etiqueta, col) in enumerate(disponibles):
-                opts = opciones(_df_filtrado_excepto(col)[col])
-                key = f"filtro_{col}"
-                # Si algún valor elegido ya no es válido (porque otro filtro lo
-                # excluyó), lo sacamos del estado para evitar el error de
-                # Streamlit "default value not in options".
-                if key in st.session_state:
-                    st.session_state[key] = [
-                        v for v in st.session_state[key] if v in opts
-                    ]
-                seleccion[col] = cols[i].multiselect(
-                    etiqueta, opts, key=key, placeholder="Todos",
-                )
+        def _selector(contenedor, etiqueta, col, ayuda=None):
+            if col not in df_periodo.columns:
+                return
+            opts = opciones(_df_filtrado_excepto(col)[col])
+            key = f"filtro_{col}"
+            # Si algún valor elegido ya no es válido (porque otro filtro lo
+            # excluyó), lo sacamos del estado para evitar el error de
+            # Streamlit "default value not in options".
+            if key in st.session_state:
+                st.session_state[key] = [
+                    v for v in st.session_state[key] if v in opts
+                ]
+            sel_widgets[col] = contenedor.multiselect(
+                etiqueta, opts, key=key, placeholder="Todos", help=ayuda,
+                format_func=(lambda v: v.replace(" · ", " › "))
+                if col == "tipo_producto" else str,
+            )
 
+        # Fila 2: dimensiones comerciales
+        cols_dim = st.columns(len(FILTROS_DIM))
+        for i, (etiqueta, col) in enumerate(FILTROS_DIM):
+            _selector(cols_dim[i], etiqueta, col)
+
+        # Fila 3: productos
+        c_marca, c_fam, c_tipo, c_sku = st.columns([2, 2, 3, 4])
+        _selector(c_marca, *FILTRO_MARCA)
+        _selector(c_fam, "Familia", "familia",
+                  "Elegí una o varias familias. Si además elegís un tipo o un "
+                  "SKU de esa familia, se toma solo eso (lo más específico). "
+                  "Lo que elijas de familias distintas se suma.")
+        _selector(c_tipo, "Tipo de producto", "tipo_producto",
+                  "Familia › Tipo. Se puede combinar con familias y SKUs: "
+                  "ej. Fiambres › Jamón cocido + familia Quesos.")
+        _selector(c_sku, "SKU", "sku",
+                  "Buscá por código o nombre. Se suma a lo elegido en "
+                  "Familia / Tipo, o lo afina si es de una familia ya elegida.")
+
+        for etiqueta, col in FILTROS_DIM + [FILTRO_MARCA]:
+            if col in sel_widgets:
+                seleccion[col] = sel_widgets[col]
+        _skus_sel = _skus_de(sel_widgets)
+        if _skus_sel is not None:
+            # Puede quedar vacío (ej. familia sin ventas): se respeta y abajo
+            # avisa "No hay datos que cumplan con los filtros".
+            seleccion["sku"] = sorted(_skus_sel) or ["(ningún SKU)"]
+
+# Cantidad de filtros activos (Familia + Tipo + SKU cuentan como UNO: entran a
+# `seleccion` como un único filtro por 'sku').
 n_filtros = sum(1 for v in seleccion.values() if v)
-chip = f"  ·  {n_filtros} filtro(s) activo(s)" if n_filtros else "  ·  sin filtros"
-st.caption(f"Período: {desde:%d/%m/%Y} → {hasta:%d/%m/%Y}{chip}")
-st.divider()
+
+# --- Resumen de lo elegido ----------------------------------------------------
+# Antes decía solo "N filtro(s) activo(s)": no se veía QUÉ estaba elegido
+# (los chips del multiselect se cortan). Ahora se lista cada filtro.
+_partes_res = []
+for etiqueta, col in FILTROS_DIM + [FILTRO_MARCA]:
+    if seleccion.get(col):
+        _partes_res.append(f"**{etiqueta}:** {_resumen_valores(seleccion[col])}")
+_desc_prod = ""
+if not df_periodo.empty and any(sel_widgets.get(c) for c in _COLS_PROD):
+    _desc_prod = dp.describir_productos(
+        _catalogo, sel_widgets.get("familia"), sel_widgets.get("tipo_producto"),
+        sel_widgets.get("sku"))
+    _partes_res.append(f"**Productos:** {_desc_prod}")
+c_res, c_limp = st.columns([10, 1.4])
+c_res.caption(
+    f"Período: {desde:%d/%m/%Y} → {hasta:%d/%m/%Y}  ·  "
+    + ("  ·  ".join(_partes_res) if _partes_res else "sin filtros")
+)
+if _partes_res:
+    c_limp.button("Limpiar filtros", on_click=_limpiar_filtros,
+                  use_container_width=True)
 
 if df_periodo.empty:
     st.warning("No hay datos para el período seleccionado.")
@@ -688,6 +782,41 @@ for col, valores in seleccion.items():
 if df.empty:
     st.warning("No hay datos que cumplan con los filtros seleccionados.")
     st.stop()
+
+# Detalle de los SKUs que quedaron adentro del filtro de productos: es la
+# respuesta a "¿qué estoy mirando?" cuando se elige por familia o tipo.
+if _desc_prod:
+    _inc = (df.groupby(["sku", "familia", "tipo_producto"], observed=True)
+            .agg(kilos=("kilos", "sum"), neto=("subtotalNeto", "sum"),
+                 clientes=("idCliente", "nunique"))
+            .reset_index().sort_values("neto", ascending=False))
+    _orig = dp.origen_familias()
+    _cod_inc = pd.to_numeric(_inc["sku"].astype(str).str.split(" · ").str[0],
+                             errors="coerce")
+    _inc["clasif"] = _cod_inc.map(_orig).fillna("sin asignar")
+    _n_sel = len(seleccion.get("sku", []))
+    with st.expander(
+        f"Ver los {len(_inc)} SKUs con venta en el período "
+        f"(de {_n_sel} incluidos en la selección)"
+    ):
+        st.dataframe(
+            _inc.assign(tipo_producto=_inc["tipo_producto"].astype(str)
+                        .str.split(" · ").str[-1])
+            .rename(columns={"sku": "SKU", "familia": "Familia",
+                             "tipo_producto": "Tipo", "kilos": "Kilos",
+                             "neto": "Venta neta", "clientes": "Clientes",
+                             "clasif": "Clasificación"}),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Kilos": st.column_config.NumberColumn(format="%.0f"),
+                "Venta neta": st.column_config.NumberColumn(format="$ %.0f"),
+            },
+        )
+        if (_inc["clasif"] == "sugerido").any():
+            st.caption(
+                "Clasificación «sugerido»: la familia se asignó por parecido "
+                "de nombre y todavía no está en la lista comercial "
+                "(ver familias_revisar.xlsx).")
 
 # --- Universo (denominador de la cobertura) --------------------------------
 # Ventana MÓVIL de dp.VENTANA_UNIVERSO_MESES meses que TERMINA en el período
@@ -1168,7 +1297,8 @@ def render_drill(df_base, niveles, key, root_id=None):
 # La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
 # (los supervisores no ven CM). Se arma la lista de tabs según el rol.
 _labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
-                "Clientes", "Altas y Bajas", "Vendedores", "Alertas", "Metas"]
+                "Consulta", "Clientes", "Altas y Bajas", "Vendedores",
+                "Alertas", "Metas"]
 if mostrar_cm:
     _labels_tabs.append("Acuerdos McCain")
 
@@ -1176,9 +1306,9 @@ if mostrar_cm:
 # `tab_clientes`, herencia del RFM viejo). `tab_cli` es la solapa Clientes
 # nueva. Son dos cosas distintas.
 _tabs = st.tabs(_labels_tabs)
-(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_cli, tab_altas,
- tab_vend, tab_alertas, tab_metas) = _tabs[:9]
-tab_acuerdos = _tabs[9] if mostrar_cm else None
+(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_consulta, tab_cli,
+ tab_altas, tab_vend, tab_alertas, tab_metas) = _tabs[:10]
+tab_acuerdos = _tabs[10] if mostrar_cm else None
 
 
 # --- TAB RESUMEN ----------------------------------------------------------
@@ -1940,6 +2070,176 @@ with tab_prod:
 
     st.divider()
     boton_excel("productos", hojas_prod, key="xlsx_prod")
+
+
+# --- TAB CONSULTA (preguntas comerciales sobre un grupo de productos) -------
+# Pensada para preguntas del tipo "¿cuánto se vende de jamón y queso en Pilar
+# para armar una promo?". Toma lo elegido arriba (Familia / Tipo / SKU y las
+# dimensiones) y lo mira en una ventana de VARIOS meses que termina en el
+# período elegido: un solo mes es poco para dimensionar una promo.
+#
+# Usa df_anio (el parquet completo) por la misma razón que Altas y bajas:
+# reusar, NO volver a llamar a cargar_datos_local() (ver nota ahí).
+_VENTANAS_CONSULTA = {"Mes elegido": 1, "Últimos 3 meses": 3,
+                      "Últimos 6 meses": 6, "Últimos 12 meses": 12}
+_ABRIR_CONSULTA = {"Región": "region", "Localidad": "dsLocalidad",
+                   "Canal": "dsCanalMkt", "Subcanal": "dsSubcanalMKT",
+                   "Vendedor": "dsVendedor"}
+
+with tab_consulta:
+    if seleccion.get("sku") is None:
+        st.info(
+            "Elegí arriba qué productos querés mirar: una **Familia**, un "
+            "**Tipo de producto** o **SKUs** sueltos (se pueden combinar, ej. "
+            "Fiambres › Jamón cocido + Quesos). Si además filtrás Región, "
+            "Canal o Vendedor, la consulta se limita a esa zona."
+        )
+    else:
+        st.subheader(f"Consulta · {_desc_prod}")
+        q1, q2, q3 = st.columns([3, 2, 2])
+        _vent_lbl = q1.radio(
+            "Ventana", list(_VENTANAS_CONSULTA), index=1, horizontal=True,
+            key="cons_ventana",
+            help="Meses que terminan en el período elegido arriba.")
+        _abrir_lbl = q2.selectbox("Abrir por", list(_ABRIR_CONSULTA),
+                                  key="cons_abrir")
+        _met_lbl = q3.selectbox("Medir en", ["Kilos", "Venta neta"],
+                                key="cons_metrica")
+        _met_col = "kilos" if _met_lbl == "Kilos" else "subtotalNeto"
+        _fmt_met = fmt_kg if _met_lbl == "Kilos" else fmt_money
+        _dim_q = _ABRIR_CONSULTA[_abrir_lbl]
+
+        _q_desde = dp.inicio_universo(desde, _VENTANAS_CONSULTA[_vent_lbl])
+        _fq = df_anio["fechaComprobate"]
+        _dq_dim = df_anio[(_fq >= pd.Timestamp(_q_desde))
+                          & (_fq < pd.Timestamp(hasta) + pd.Timedelta(days=1))]
+        for _c_q, _v_q in seleccion.items():
+            if _c_q != "sku" and _v_q:
+                _dq_dim = _dq_dim[_dq_dim[_c_q].astype(str).str.strip().isin(_v_q)]
+        _skus_q = set(seleccion["sku"])
+        _dq = _dq_dim[_dq_dim["sku"].astype(str).isin(_skus_q)]
+
+        if _dq.empty:
+            st.info("No hay ventas de esos productos en la ventana elegida.")
+        else:
+            _q_ini_real = _dq_dim["fechaComprobate"].min().date()
+            _n_meses_q = ((hasta.year * 12 + hasta.month)
+                          - (_q_ini_real.year * 12 + _q_ini_real.month) + 1)
+            st.caption(
+                f"Del {_q_ini_real:%d/%m/%Y} al {hasta:%d/%m/%Y} "
+                f"({_n_meses_q} mes{'es' if _n_meses_q != 1 else ''} con datos)"
+                + (" · el mes en curso está incompleto" if es_mes_actual else ""))
+
+            _compran, _no_compran = dp.consulta_clientes(_dq_dim, _skus_q)
+            _kg, _neto = _dq["kilos"].sum(), _dq["subtotalNeto"].sum()
+            _activos = _dq_dim["idCliente"].nunique()
+            _share_kg = _kg / _dq_dim["kilos"].sum() if _dq_dim["kilos"].sum() else 0
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Kilos", fmt_kg(_kg),
+                      help=f"Promedio por mes: {fmt_kg(_kg / max(_n_meses_q, 1))}")
+            k2.metric("Venta neta", fmt_money(_neto))
+            k3.metric("Precio medio / kg", fmt_money(_neto / _kg) if _kg else "—")
+            k4.metric("Clientes que compran",
+                      f"{fmt_cant(len(_compran))} de {fmt_cant(_activos)}",
+                      help="Sobre los clientes activos de la ventana con los "
+                           "mismos filtros de canal / región / vendedor.")
+            k5.metric("Peso en la venta (kg)", fmt_pct(_share_kg * 100),
+                      help="Kilos de estos productos sobre los kilos totales "
+                           "de la misma zona / canal en la ventana.")
+
+            # --- Apertura: dimensión × tipo de producto --------------------
+            st.markdown(f"**Por {_abrir_lbl.lower()} y tipo de producto**")
+            _dq_t = _dq.assign(
+                _dim=_dq[_dim_q].astype(str),
+                _tipo=_dq["tipo_producto"].astype(str).str.replace(" · ", " › "))
+            _piv = _dq_t.pivot_table(index="_dim", columns="_tipo",
+                                     values=_met_col, aggfunc="sum",
+                                     fill_value=0, observed=True)
+            _base = (_dq_t.groupby("_dim", observed=True)
+                     .agg(kilos=("kilos", "sum"),
+                          subtotalNeto=("subtotalNeto", "sum"),
+                          compradores=("idCliente", "nunique")))
+            _act_dim = (_dq_dim.assign(_dim=_dq_dim[_dim_q].astype(str))
+                        .groupby("_dim", observed=True)["idCliente"].nunique()
+                        .rename("activos"))
+            _ap = _base.join(_act_dim, how="left")
+            _ap["penetracion"] = _ap["compradores"] / _ap["activos"] * 100
+            _ap = _ap.join(_piv).sort_values(_met_col, ascending=False)
+            _ap = _ap.reset_index().rename(columns={
+                "_dim": _abrir_lbl, "kilos": "Kilos", "subtotalNeto": "Venta neta",
+                "compradores": "Clientes que compran",
+                "activos": "Clientes activos", "penetracion": "Penetración %"})
+            _cfg_num = st.column_config.NumberColumn(
+                format="%.0f" if _met_lbl == "Kilos" else "$ %.0f")
+            st.dataframe(
+                _ap, hide_index=True, use_container_width=True,
+                column_config={
+                    "Kilos": st.column_config.NumberColumn(format="%.0f"),
+                    "Venta neta": st.column_config.NumberColumn(format="$ %.0f"),
+                    "Penetración %": st.column_config.NumberColumn(format="%.1f %%"),
+                    **{c: _cfg_num for c in _piv.columns},
+                },
+            )
+            st.caption(
+                f"Las columnas por tipo están en {_met_lbl.lower()}. "
+                "Penetración = clientes que compran estos productos sobre los "
+                f"clientes activos de esa {_abrir_lbl.lower()}: donde es baja "
+                "hay más margen para una promo.")
+
+            # --- Evolución mensual ----------------------------------------
+            st.markdown("**Evolución mensual**")
+            _ev_q = (_dq_t.assign(mes=_dq_t["fechaComprobate"].dt.strftime("%Y-%m"))
+                     .groupby(["mes", "_tipo"], observed=True)[_met_col].sum()
+                     .reset_index())
+            _fig_q = px.bar(_ev_q, x="mes", y=_met_col, color="_tipo")
+            _fig_q.update_layout(
+                barmode="stack", template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(title="", orientation="h", y=-0.25),
+                xaxis_title=None, yaxis_title=_met_lbl, height=360,
+                xaxis=dict(type="category"),
+            )
+            st.plotly_chart(_fig_q, use_container_width=True)
+
+            # --- Clientes ---------------------------------------------------
+            _ren_cli = {"nombreCliente": "Cliente", "dsLocalidad": "Localidad",
+                        "region": "Región", "dsCanalMkt": "Canal",
+                        "dsVendedor": "Vendedor", "kilos": "Kilos",
+                        "subtotalNeto": "Venta neta", "meses": "Meses con compra",
+                        "skus": "SKUs distintos", "ultima": "Última compra"}
+            _t_comp = _compran.drop(columns=["idCliente"]).rename(columns=_ren_cli)
+            _t_no = (_no_compran.drop(columns=["idCliente"])
+                     .rename(columns={**_ren_cli,
+                                      "subtotalNeto": "Venta total (otros productos)"}))
+            for _t in (_t_comp, _t_no):
+                if "Última compra" in _t:
+                    _t["Última compra"] = pd.to_datetime(_t["Última compra"]).dt.date
+            ct1, ct2 = st.tabs([f"Compran ({len(_t_comp)})",
+                                f"No compran ({len(_t_no)})"])
+            _cfg_cli = {
+                "Kilos": st.column_config.NumberColumn(format="%.0f"),
+                "Venta neta": st.column_config.NumberColumn(format="$ %.0f"),
+                "Venta total (otros productos)":
+                    st.column_config.NumberColumn(format="$ %.0f"),
+            }
+            with ct1:
+                st.dataframe(_t_comp, hide_index=True, use_container_width=True,
+                             column_config=_cfg_cli)
+            with ct2:
+                st.caption("Clientes activos de la ventana (mismos filtros de "
+                           "canal / región / vendedor) que no compraron estos "
+                           "productos, ordenados por lo que compran de lo demás.")
+                st.dataframe(_t_no, hide_index=True, use_container_width=True,
+                             column_config=_cfg_cli)
+
+            boton_excel("consulta_productos", {
+                f"Por {_abrir_lbl}": _ap,
+                "Evolución": _ev_q.rename(columns={"mes": "Mes", "_tipo": "Tipo",
+                                                   _met_col: _met_lbl}),
+                "Compran": _t_comp,
+                "No compran": _t_no,
+            }, key="xlsx_consulta")
 
 
 # --- TAB CLIENTES ---------------------------------------------------------

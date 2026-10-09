@@ -248,6 +248,166 @@ def agregar_marca_linea(df):
     return df
 
 
+# --- Familia / Tipo de producto ---------------------------------------------
+# Chess no trae una agrupación de producto útil (Categoria = Pesable / No
+# pesable). La clasificación comercial vive en data/familias_tipo_producto.xlsx
+# y build_lookup_familias.py la traduce a CÓDIGO de artículo en
+# data/familias_lookup.csv. Columna 'origen': "lista" (está en el Excel) o
+# "sugerido" (familia propuesta por parecido de nombre, pendiente de revisar).
+LOOKUP_FAMILIAS_PATH = os.path.join(DATA_DIR, "familias_lookup.csv")
+
+
+def mtime_lookup_familias():
+    """mtime del lookup de familias (0 si no existe). Va en la clave de caché
+    de la app para que regenerar el CSV se vea sin reiniciar el servicio."""
+    try:
+        return os.path.getmtime(LOOKUP_FAMILIAS_PATH)
+    except OSError:
+        return 0
+
+
+def agregar_familia_tipo(df, path=LOOKUP_FAMILIAS_PATH):
+    """Agrega 'familia' y 'tipo_producto' por lookup de idArticulo. Los códigos
+    que no están en el lookup quedan en SIN_ASIGNAR (no se cae a ningún otro
+    dato: es mejor verlos sin clasificar que mal clasificados).
+
+    'tipo_producto' se guarda como "<Familia> · <Tipo>" para que el filtro de
+    la barra no mezcle tipos homónimos de familias distintas (hay "Cerdo" en
+    Fiambres, Carnes y Salchichas; "Pollo" en Medallones y Prefritos).
+    """
+    if df is None:
+        return df
+    df = df.copy()
+    if df.empty or "idArticulo" not in df.columns:
+        df["familia"] = pd.Series(dtype="object")
+        df["tipo_producto"] = pd.Series(dtype="object")
+        return df
+    fam, tipo = {}, {}
+    if os.path.exists(path):
+        tab = pd.read_csv(path)
+        for cod, f, t in zip(tab["idArticulo"], tab["familia"], tab["tipo"]):
+            if pd.isna(cod) or pd.isna(f) or not str(f).strip():
+                continue
+            f = str(f).strip()
+            t = str(t).strip() if pd.notna(t) and str(t).strip() else f
+            fam[int(cod)] = f
+            tipo[int(cod)] = f"{f} · {t}"
+    cod = pd.to_numeric(df["idArticulo"], errors="coerce")
+    df["familia"] = cod.map(fam).fillna(SIN_ASIGNAR)
+    df["tipo_producto"] = cod.map(tipo).fillna(f"{SIN_ASIGNAR} · {SIN_ASIGNAR}")
+    return df
+
+
+def resolver_productos(catalogo, familias=(), tipos=(), skus=()):
+    """Traduce lo elegido en los filtros de producto (Familia, Tipo, SKU) al
+    conjunto de SKUs que hay que mirar. Devuelve None si no hay nada elegido
+    (= no filtrar por producto).
+
+    Regla: en cada rama gana lo MÁS ESPECÍFICO y las ramas distintas se SUMAN.
+      - Familia sola              -> toda la familia.
+      - Familia + un tipo de ella -> solo ese tipo (el tipo afina la familia).
+      - Tipo + un SKU de ese tipo -> solo ese SKU.
+      - Cosas de familias distintas se suman: Fiambres·Jamón cocido + Quesos
+        = todos los jamones cocidos y todos los quesos (la pregunta de "cuánto
+        se vende de jamón y queso" sale con dos clics).
+
+    `catalogo`: DataFrame con columnas 'sku', 'familia', 'tipo_producto'
+    (una fila por SKU alcanza; se deduplica igual).
+    """
+    familias, tipos, skus = set(familias or ()), set(tipos or ()), set(skus or ())
+    if not (familias or tipos or skus):
+        return None
+    cat = (catalogo[["sku", "familia", "tipo_producto"]].dropna(subset=["sku"])
+           .astype(str).drop_duplicates("sku"))
+    elegidos = set(skus)
+    de_skus = cat[cat["sku"].isin(skus)]
+    tipos_cubiertos = set(de_skus["tipo_producto"])
+    fam_cubiertas = set(de_skus["familia"])
+    for t in tipos - tipos_cubiertos:
+        elegidos |= set(cat.loc[cat["tipo_producto"] == t, "sku"])
+    fam_cubiertas |= set(cat.loc[cat["tipo_producto"].isin(tipos), "familia"])
+    for f in familias - fam_cubiertas:
+        elegidos |= set(cat.loc[cat["familia"] == f, "sku"])
+    return elegidos
+
+
+def describir_productos(catalogo, familias=(), tipos=(), skus=()):
+    """Texto corto de lo elegido en los filtros de producto, aplicando la misma
+    regla que resolver_productos. Ej.:
+    'Fiambres › Jamón cocido · Quesos (toda la familia) · 2 SKUs sueltos'."""
+    familias, tipos, skus = set(familias or ()), set(tipos or ()), set(skus or ())
+    cat = (catalogo[["sku", "familia", "tipo_producto"]].dropna(subset=["sku"])
+           .astype(str).drop_duplicates("sku"))
+    de_skus = cat[cat["sku"].isin(skus)]
+    partes = []
+    tipos_con_sku = set(de_skus["tipo_producto"])
+    fam_afinadas = set(de_skus["familia"]) | set(
+        cat.loc[cat["tipo_producto"].isin(tipos), "familia"])
+    for f in sorted(familias - fam_afinadas):
+        partes.append(f"{f} (toda la familia)")
+    for t in sorted(tipos - tipos_con_sku):
+        partes.append(t.replace(" · ", " › "))
+    if skus:
+        partes.append(f"{len(skus)} SKU suelto" if len(skus) == 1
+                      else f"{len(skus)} SKUs sueltos")
+    return " · ".join(partes)
+
+
+def consulta_clientes(df_dim, skus):
+    """Para la solapa Consulta: separa la cartera ACTIVA de la ventana en
+    clientes que compraron los productos elegidos y clientes que NO.
+
+    `df_dim`: ventas de la ventana con los filtros de dimensión (canal,
+    región, vendedor...) pero SIN el filtro de producto: es el universo de
+    clientes activos. `skus`: conjunto de etiquetas 'sku' elegidas.
+
+    Devuelve (compran, no_compran), un DataFrame por cliente cada uno:
+      compran:    kilos / venta / meses con compra / última compra DE LOS
+                  PRODUCTOS ELEGIDOS.
+      no_compran: venta total del cliente en la ventana (otros productos) y su
+                  última compra: son el público natural de una promo.
+    """
+    cols = ["idCliente", "nombreCliente", "dsLocalidad", "region",
+            "dsCanalMkt", "dsVendedor"]
+    if df_dim is None or df_dim.empty:
+        vacio = pd.DataFrame(columns=cols)
+        return vacio, vacio
+    d = df_dim.copy()
+    d["_mes"] = d["fechaComprobate"].dt.strftime("%Y-%m")
+    en_sel = d["sku"].astype(str).isin(set(skus or ()))
+    # Datos fijos del cliente: los de su compra más reciente.
+    ficha = (d.sort_values("fechaComprobate")
+             .groupby("idCliente", observed=True)[cols[1:]].last())
+    for c in cols[1:]:
+        ficha[c] = ficha[c].astype(str)
+
+    sel = d[en_sel]
+    compran = (sel.groupby("idCliente", observed=True)
+               .agg(kilos=("kilos", "sum"), subtotalNeto=("subtotalNeto", "sum"),
+                    meses=("_mes", "nunique"),
+                    skus=("idArticulo", "nunique"),
+                    ultima=("fechaComprobate", "max")))
+    compran = ficha.join(compran, how="inner").reset_index()
+    compran = compran.sort_values("kilos", ascending=False)
+
+    otros = (d[~d["idCliente"].isin(compran["idCliente"])]
+             .groupby("idCliente", observed=True)
+             .agg(subtotalNeto=("subtotalNeto", "sum"),
+                  ultima=("fechaComprobate", "max")))
+    no_compran = ficha.join(otros, how="inner").reset_index()
+    no_compran = no_compran.sort_values("subtotalNeto", ascending=False)
+    return compran, no_compran
+
+
+def origen_familias(path=LOOKUP_FAMILIAS_PATH):
+    """{idArticulo: 'lista' | 'sugerido'} del lookup de familias."""
+    if not os.path.exists(path):
+        return {}
+    tab = pd.read_csv(path)
+    return {int(c): str(o) for c, o in zip(tab["idArticulo"], tab["origen"])
+            if pd.notna(c)}
+
+
 def agregar_sku(df):
     """Agrega la columna 'sku' = "<código> · <descripción>" para el filtro SKU
     del panel. La descripción es la VIGENTE (la de la venta más reciente de ese
