@@ -36,9 +36,9 @@ def chk(cond, msg, detalle=""):
         fallas += 1
 
 
-LABELS = ["Resumen", "Proveedores", "Canales", "Productos (SKU)", "Consulta",
-          "Clientes",
-          "Altas y Bajas", "Vendedores", "Alertas", "Metas"]
+LABELS = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
+          "Clientes", "Altas y Bajas", "Vendedores",
+          "Comparación de productos", "Alertas", "Metas"]
 
 COLS_MIN = ["ID", "Cliente", "Región", "Canal", "Subcanal", "Vendedor", "Kilos",
             "Facturación", "$/kg", "SKUs", "Cob. SKUs %", "Compras",

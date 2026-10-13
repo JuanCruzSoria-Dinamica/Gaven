@@ -1297,8 +1297,8 @@ def render_drill(df_base, niveles, key, root_id=None):
 # La solapa "Acuerdos McCain" toca el COSTO, así que solo la ve el dueño
 # (los supervisores no ven CM). Se arma la lista de tabs según el rol.
 _labels_tabs = ["Resumen", "Proveedores", "Canales", "Productos (SKU)",
-                "Consulta", "Clientes", "Altas y Bajas", "Vendedores",
-                "Alertas", "Metas"]
+                "Clientes", "Altas y Bajas", "Vendedores",
+                "Comparación de productos", "Alertas", "Metas"]
 if mostrar_cm:
     _labels_tabs.append("Acuerdos McCain")
 
@@ -1306,8 +1306,8 @@ if mostrar_cm:
 # `tab_clientes`, herencia del RFM viejo). `tab_cli` es la solapa Clientes
 # nueva. Son dos cosas distintas.
 _tabs = st.tabs(_labels_tabs)
-(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_consulta, tab_cli,
- tab_altas, tab_vend, tab_alertas, tab_metas) = _tabs[:10]
+(tab_resumen, tab_lineas, tab_canales, tab_prod, tab_cli,
+ tab_altas, tab_vend, tab_consulta, tab_alertas, tab_metas) = _tabs[:10]
 tab_acuerdos = _tabs[10] if mostrar_cm else None
 
 
@@ -2095,7 +2095,7 @@ with tab_consulta:
             "Canal o Vendedor, la consulta se limita a esa zona."
         )
     else:
-        st.subheader(f"Consulta · {_desc_prod}")
+        st.subheader(f"Comparación de productos · {_desc_prod}")
         q1, q2, q3 = st.columns([3, 2, 2])
         _vent_lbl = q1.radio(
             "Ventana", list(_VENTANAS_CONSULTA), index=1, horizontal=True,
