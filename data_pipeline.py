@@ -2606,7 +2606,7 @@ CANAL_DIAS_FACTURACION = "FOOD SERVICE"
 
 DIAS_FACTURACION = {
     32: (0, 2, 4),     # AVETTA, NOELIA          lunes, miércoles, viernes
-    16: (0, 1, 3, 4),  # BALLESTEROS, LAURA      lunes, martes, jueves, viernes
+    16: (0, 1, 4),     # BALLESTEROS, LAURA      lunes, martes, viernes
     35: (0, 4),        # CASTILLON AGUSTIN       lunes, viernes
     75: (0, 4),        # FOOD CABA (= Castillón, ver MAPA_VENDEDORES) lunes, viernes
     13: (0, 3),        # COLOMBO, CARLOS         lunes, jueves
