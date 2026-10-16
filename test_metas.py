@@ -335,30 +335,37 @@ chk(dt.date(2026, 7, 10) not in dp.FERIADOS,
 chk(dp.contar_dias_facturacion(_D, _H, (0, 3)) == 8
     and dp.contar_dias_facturacion(_D, _H, (0, 3), feriados=()) == 9,
     "contar_dias_facturacion también descuenta feriados por default")
-chk(dp.dias_venta("FOOD SERVICE", "COLOMBO, CARLOS", _D, _H, _H)[1] == 8,
+chk(dp.dias_venta("FOOD SERVICE", 13, _D, _H, _H)[1] == 8,
     "y llega hasta dias_venta() sin que haya que pasar nada")
 
-chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "COLOMBO, CARLOS") == (0, 3),
-    "lee los días declarados del vendedor")
-chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "  colombo,  carlos ") == (0, 3),
-    "el nombre se compara normalizado (mayúsculas y espacios)")
-chk(dp.dias_facturacion_vendedor("GRANJAS", "MORENO GERMAN") is None,
-    "fuera de Food Service no aplica: MORENO vende también en GRANJAS")
-chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "FOOD CABA") is None,
-    "vendedor sin días declarados devuelve None (cae a días hábiles)")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", 13) == (0, 3),
+    "lee los días declarados del vendedor (por código: 13 = Colombo)")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "13") == (0, 3)
+    and dp.dias_facturacion_vendedor("FOOD SERVICE", 13.0) == (0, 3),
+    "el código se acepta como texto o float (como venga del parquet)")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "COLOMBO, CARLOS") is None,
+    "el nombre ya NO sirve como clave: los días van por código")
+chk(dp.dias_facturacion_vendedor("GRANJAS", 34) is None,
+    "fuera de Food Service no aplica: MORENO (34) vende también en GRANJAS")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", 999) is None
+    and dp.dias_facturacion_vendedor("FOOD SERVICE", None) is None,
+    "código sin días declarados (o sin código) devuelve None (días hábiles)")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", 32) == (0, 2, 4)
+    and dp.dias_facturacion_vendedor("FOOD SERVICE", 35) == (0, 4),
+    "Avetta (32) y Castillón (35) tienen días aunque Chess les cambie el nombre")
 
 # Colombo factura lunes y jueves: en agosto hay 9, pero el lunes 17 es feriado,
 # así que le quedan 8. Al 7 pasaron 2 (3 y 6).
-chk(dp.dias_venta("FOOD SERVICE", "COLOMBO, CARLOS", _D, _C, _H) == (2, 8),
+chk(dp.dias_venta("FOOD SERVICE", 13, _D, _C, _H) == (2, 8),
     "días de venta de un vendedor de Food: sus días de facturación")
-chk(dp.dias_venta("RETAIL", "AHMED, GISELA", _D, _C, _H) == (6, 25),
+chk(dp.dias_venta("RETAIL", 901, _D, _C, _H) == (6, 25),
     "un canal que factura todos los días sigue con días hábiles")
-chk(casi(dp.factor_proyeccion("FOOD SERVICE", "COLOMBO, CARLOS", _D, _C, _H),
+chk(casi(dp.factor_proyeccion("FOOD SERVICE", 13, _D, _C, _H),
          8 / 2, tol=0.001),
     "el factor de proyección es días totales ÷ transcurridos")
-chk(dp.factor_proyeccion("FOOD SERVICE", "COLOMBO, CARLOS", _D, _H, _H) == 1.0,
+chk(dp.factor_proyeccion("FOOD SERVICE", 13, _D, _H, _H) == 1.0,
     "mes cerrado: factor 1, la proyección es el kilaje real")
-chk(dp.etiqueta_dias_facturacion("AVETTA SANCHEZ, MARIA NOELIA")
+chk(dp.etiqueta_dias_facturacion(32)
     == "lunes, miércoles y viernes",
     "etiqueta legible de los días")
 
@@ -366,7 +373,8 @@ chk(dp.etiqueta_dias_facturacion("AVETTA SANCHEZ, MARIA NOELIA")
 vf = pd.DataFrame({
     "fechaComprobate": pd.to_datetime(["2026-08-03"] * 3),
     "dsCanalMkt": ["FOOD SERVICE", "FOOD SERVICE", "RETAIL"],
-    "dsVendedor": ["COLOMBO, CARLOS", "AVETTA SANCHEZ, MARIA NOELIA",
+    "idVendedor": [13, 32, 901],
+    "dsVendedor": ["COLOMBO, CARLOS", "AVETTA, NOELIA",
                    "AHMED, GISELA"],
     "marca_linea": ["MCCAIN FOOD", "MCCAIN FOOD", "MCCAIN RETAIL"],
     "kilos": [100.0, 100.0, 100.0],
@@ -405,15 +413,16 @@ chk(casi(s_viejo["proyeccion_kg"].sum(), 300 * 26 / 6, tol=0.01),
 # Vendedor sin días declarados: proyecta como antes, y queda listado.
 vsd = pd.DataFrame({
     "dsCanalMkt": ["FOOD SERVICE", "FOOD SERVICE", "RETAIL"],
-    "dsVendedor": ["FOOD CABA", "COLOMBO, CARLOS", "AHMED, GISELA"],
+    "idVendedor": [999, 13, 901],
+    "dsVendedor": ["VENDEDOR NUEVO", "COLOMBO, CARLOS", "AHMED, GISELA"],
     "marca_linea": ["MCCAIN FOOD"] * 3,
     "kilos": [100.0, 100.0, 100.0],
 })
-chk(dp.vendedores_sin_dias_facturacion(vsd) == ["FOOD CABA"],
+chk(dp.vendedores_sin_dias_facturacion(vsd) == ["VENDEDOR NUEVO (cód. 999)"],
     "lista los vendedores de Food sin días declarados (avisa, no bloquea)")
 s_sd = dp.seguimiento_metas(vsd, dp._metas_vacio(), "2026-08", nivel="vendedor",
                             desde=_D, corte=_C, hasta=_H)
-_caba = s_sd[s_sd["dsVendedor"] == "FOOD CABA"]["proyeccion_kg"].iloc[0]
+_caba = s_sd[s_sd["dsVendedor"] == "VENDEDOR NUEVO"]["proyeccion_kg"].iloc[0]
 chk(casi(_caba, 100 * (25 / 6), tol=0.01),
     "el vendedor sin días declarados cae a días hábiles (criterio viejo)")
 

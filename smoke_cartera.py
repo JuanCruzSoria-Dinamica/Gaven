@@ -144,12 +144,14 @@ chk(dp.metricas_cartera(dp.filtrar_serie(cc, {}, hasta_mes="2026-07")[0]).empty,
 
 # --- 5. Proyección del mes en curso ----------------------------------------
 print("\n[5] dp.proyectar_serie_mes")
-serie = dp.agregar_serie(det([
+_det5 = det([
     ("2026-08-03", "C1", "A1", "RETAIL", "V1", 100),
     ("2026-08-03", "C2", "A1", "FOOD SERVICE", "COLOMBO, CARLOS", 100),
-]))
+])
+_det5["idVendedor"] = [901, 13]  # 13 = Colombo (los días van por código)
+serie = dp.agregar_serie(_det5)
 ini, corte, fin = dt.date(2026, 8, 1), dt.date(2026, 8, 12), dt.date(2026, 8, 31)
-p, hubo = dp.proyectar_serie_mes(serie, ini, corte, fin)
+p, hubo = dp.proyectar_serie_mes(serie, ini, corte, fin, df_detalle=_det5)
 chk(hubo, "con el mes a medio andar, proyecta")
 for col in dp.SERIE_COLS_PROYECTABLES:
     chk((p[col] >= serie[col]).all(), f"'{col}' proyectado >= real")
@@ -162,14 +164,20 @@ _food = p[p["dsCanalMkt"] == "FOOD SERVICE"]
 _resto = p[p["dsCanalMkt"] == "RETAIL"]
 f_food = float(_food["kilos"].iloc[0]) / 100
 f_resto = float(_resto["kilos"].iloc[0]) / 100
-chk(abs(f_food - dp.factor_proyeccion("FOOD SERVICE", "COLOMBO, CARLOS",
+chk(abs(f_food - dp.factor_proyeccion("FOOD SERVICE", 13,
                                       ini, corte, fin)) < 1e-9,
     f"Food Service usa los días de facturación del vendedor (×{f_food:.2f})")
-chk(abs(f_resto - dp.factor_proyeccion("RETAIL", "V1", ini, corte, fin)) < 1e-9,
+chk(abs(f_resto - dp.factor_proyeccion("RETAIL", 901, ini, corte, fin)) < 1e-9,
     f"el resto de los canales usa días hábiles (×{f_resto:.2f})")
 chk(f_food != f_resto, "los dos factores son distintos (no hay factor único)")
 
-_, cerrado = dp.proyectar_serie_mes(serie, ini, fin, fin)
+# Sin el detalle la serie no sabe el código: todo proyecta con días hábiles.
+p_sin, _ = dp.proyectar_serie_mes(serie, ini, corte, fin)
+chk(abs(float(p_sin[p_sin["dsCanalMkt"] == "FOOD SERVICE"]["kilos"].iloc[0]) / 100
+        - f_resto) < 1e-9,
+    "sin df_detalle, Food cae a días hábiles (no adivina por nombre)")
+
+_, cerrado = dp.proyectar_serie_mes(serie, ini, fin, fin, df_detalle=_det5)
 chk(not cerrado, "un mes cerrado no se proyecta (devuelve proyecto=False)")
 
 # --- 6. Bordes --------------------------------------------------------------

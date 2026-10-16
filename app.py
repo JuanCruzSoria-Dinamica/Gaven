@@ -1539,8 +1539,11 @@ with tab_resumen:
             if es_mes_actual and not s.empty:
                 _en_curso = s["anio_mes"].astype(str) == str(mes_sel)
                 if _en_curso.any():
+                    # df_detalle: la serie no guarda el código de vendedor
+                    # y los días de facturación van por código.
                     _s_proy, proy_evol = dp.proyectar_serie_mes(
-                        s[_en_curso], _ini_mes, _corte_res, _fin_mes)
+                        s[_en_curso], _ini_mes, _corte_res, _fin_mes,
+                        df_detalle=df)
                     if proy_evol:
                         s = pd.concat([s[~_en_curso], _s_proy],
                                       ignore_index=True)

@@ -117,10 +117,10 @@ ARTICULOS_EXCLUIR = [0, 1000]
 # Se renombra SOLO 'dsVendedor'. 'idVendedor' queda como viene de Chess, así el
 # dato crudo sigue siendo rastreable hasta el código de origen.
 #
-# OJO con Food Caba: al pasar a llamarse Castillón hereda sus días de
-# facturación declarados (ver DIAS_FACTURACION), así que esas ventas dejan de
-# proyectarse contra días hábiles. Es el criterio correcto si la operación de
-# CABA factura los mismos días; si cambia, se corrige en DIAS_FACTURACION.
+# OJO con Food Caba: los días de facturación van por CÓDIGO (DIAS_FACTURACION),
+# así que el renombre no alcanza para que herede los de Castillón. Por eso el
+# código 75 está cargado en DIAS_FACTURACION con los mismos días que el 35. Si
+# la operación de CABA factura otros días, se corrige ahí.
 #
 # La clave se compara normalizada (mayúsculas, sin espacios de más), así que no
 # hace falta escribirla exacto como viene del API.
@@ -2594,19 +2594,31 @@ def dias_habiles(desde, hasta, con_sabado=True, feriados=None):
 # (se les va a proponer facturar en el momento). Refleja los días declarados
 # por Gaven en agosto 2026: si cambian, se cambian acá y nada más.
 #
+# La clave es el CÓDIGO de vendedor de Chess (idVendedor), NO el nombre. En
+# septiembre 2026 Chess cambió los nombres ("AVETTA SANCHEZ, MARIA NOELIA" ->
+# "AVETTA, NOELIA", "CASTILLON AGUSTIN DAMIAN" -> "CASTILLON AGUSTIN") y con la
+# tabla por nombre esos vendedores pasaron a proyectarse con días hábiles sin
+# que nadie lo notara. El código no cambia cuando cambia el nombre.
+#
+# El nombre del comentario es solo referencia para leer la tabla.
 # weekday(): lunes=0, martes=1, miércoles=2, jueves=3, viernes=4, sábado=5.
 CANAL_DIAS_FACTURACION = "FOOD SERVICE"
 
 DIAS_FACTURACION = {
-    "AVETTA SANCHEZ, MARIA NOELIA": (0, 2, 4),     # lunes, miércoles, viernes
-    "BALLESTEROS, LAURA":           (0, 1, 3, 4),  # lunes, martes, jueves, viernes
-    "CASTILLON AGUSTIN DAMIAN":     (0, 4),        # lunes, viernes
-    "COLOMBO, CARLOS":              (0, 3),        # lunes, jueves
-    "MORENO GERMAN":                (0, 1, 3),     # lunes, martes, jueves
+    32: (0, 2, 4),     # AVETTA, NOELIA          lunes, miércoles, viernes
+    16: (0, 1, 3, 4),  # BALLESTEROS, LAURA      lunes, martes, jueves, viernes
+    35: (0, 4),        # CASTILLON AGUSTIN       lunes, viernes
+    75: (0, 4),        # FOOD CABA (= Castillón, ver MAPA_VENDEDORES) lunes, viernes
+    13: (0, 3),        # COLOMBO, CARLOS         lunes, jueves
+    34: (0, 1, 3),     # MORENO GERMAN           lunes, martes, jueves
 }
 
 DIAS_SEMANA_NOMBRE = ("lunes", "martes", "miércoles", "jueves", "viernes",
                       "sábado", "domingo")
+
+# Código para las filas sin idVendedor válido: no está en DIAS_FACTURACION,
+# así que esas filas proyectan con días hábiles.
+ID_VENDEDOR_SIN_DATO = -1
 
 
 def _norm_nombre(s):
@@ -2614,21 +2626,50 @@ def _norm_nombre(s):
     return re.sub(r"\s+", " ", str(s).upper().strip())
 
 
-def dias_facturacion_vendedor(canal, vendedor):
-    """Días de la semana en que factura un vendedor.
+def _id_vendedor(x):
+    """Código de vendedor como int ('32', 32.0 y 32 dan 32). None si no hay
+    un código válido."""
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(str(x).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _col_id_vendedor(df):
+    """Columna idVendedor del df como int (ID_VENDEDOR_SIN_DATO si falta o no
+    es un número). Sirve para agrupar sin que pandas descarte los nulos."""
+    if df is None or "idVendedor" not in df.columns:
+        n = 0 if df is None else len(df)
+        idx = None if df is None else df.index
+        return pd.Series([ID_VENDEDOR_SIN_DATO] * n, index=idx, dtype="int64")
+    return (pd.to_numeric(df["idVendedor"], errors="coerce")
+            .fillna(ID_VENDEDOR_SIN_DATO).astype("int64"))
+
+
+def dias_facturacion_vendedor(canal, id_vendedor):
+    """Días de la semana en que factura un vendedor, buscado por su CÓDIGO.
 
     Devuelve None cuando no corresponde aplicar la lógica: o el canal no es
-    Food Service (el resto factura todos los días), o el vendedor todavía no
-    tiene los días declarados. En ambos casos la proyección se cae a
+    Food Service (el resto factura todos los días), o el código de vendedor
+    todavía no tiene los días declarados. En ambos casos la proyección se cae a
     dias_habiles(), que es el comportamiento de siempre.
 
-    Importante que dependa del canal y no solo del nombre: MORENO GERMAN tiene
-    ventas sueltas en GRANJAS y RETAIL, y ahí no factura en días fijos.
+    Importante que dependa del canal y no solo del vendedor: MORENO GERMAN
+    tiene ventas sueltas en GRANJAS y RETAIL, y ahí no factura en días fijos.
     """
     if _norm_nombre(canal) != _norm_nombre(CANAL_DIAS_FACTURACION):
         return None
-    tabla = {_norm_nombre(k): v for k, v in DIAS_FACTURACION.items()}
-    return tabla.get(_norm_nombre(vendedor))
+    cod = _id_vendedor(id_vendedor)
+    if cod is None:
+        return None
+    return DIAS_FACTURACION.get(cod)
 
 
 def contar_dias_facturacion(desde, hasta, dias_semana, feriados=None):
@@ -2648,13 +2689,13 @@ def contar_dias_facturacion(desde, hasta, dias_semana, feriados=None):
     return n
 
 
-def dias_venta(canal, vendedor, desde, corte, hasta, feriados=None):
+def dias_venta(canal, id_vendedor, desde, corte, hasta, feriados=None):
     """(días transcurridos, días totales) de venta de un vendedor en el mes.
 
     Food Service cuenta días de facturación del vendedor; el resto de los
     canales, días hábiles de lunes a sábado.
     """
-    dias = dias_facturacion_vendedor(canal, vendedor)
+    dias = dias_facturacion_vendedor(canal, id_vendedor)
     if dias is None:
         return (dias_habiles(desde, corte, feriados=feriados),
                 max(dias_habiles(desde, hasta, feriados=feriados), 1))
@@ -2662,10 +2703,10 @@ def dias_venta(canal, vendedor, desde, corte, hasta, feriados=None):
             max(contar_dias_facturacion(desde, hasta, dias, feriados=feriados), 1))
 
 
-def factor_proyeccion(canal, vendedor, desde, corte, hasta, feriados=None):
+def factor_proyeccion(canal, id_vendedor, desde, corte, hasta, feriados=None):
     """Cuánto hay que escalar el avance de un vendedor para proyectarlo a fin
     de mes. 1.0 si el mes ya cerró o si todavía no hay días transcurridos."""
-    pas, tot = dias_venta(canal, vendedor, desde, corte, hasta,
+    pas, tot = dias_venta(canal, id_vendedor, desde, corte, hasta,
                           feriados=feriados)
     if pas > 0 and tot > 0 and pas < tot:
         return tot / pas
@@ -2687,14 +2728,14 @@ def factor_proyeccion_ponderado(df, desde, corte, hasta, feriados=None,
     """
     if df is None or len(df) == 0:
         return 1.0, False
-    if any(c not in df.columns for c in ("dsCanalMkt", "dsVendedor", col_peso)):
+    if any(c not in df.columns for c in ("dsCanalMkt", col_peso)):
         return 1.0, False
 
-    g = df[["dsCanalMkt", "dsVendedor", col_peso]].copy()
+    g = df[["dsCanalMkt", col_peso]].copy()
     g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
-    g["dsVendedor"] = g["dsVendedor"].astype(str).str.strip()
+    g["idVendedor"] = _col_id_vendedor(df)
     g[col_peso] = pd.to_numeric(g[col_peso], errors="coerce").fillna(0.0)
-    g = g.groupby(["dsCanalMkt", "dsVendedor"], as_index=False)[col_peso].sum()
+    g = g.groupby(["dsCanalMkt", "idVendedor"], as_index=False)[col_peso].sum()
     g = g[g[col_peso] > 0]
     if g.empty:
         return 1.0, False
@@ -2720,14 +2761,22 @@ def factor_proyeccion_ponderado(df, desde, corte, hasta, feriados=None,
 SERIE_COLS_PROYECTABLES = ["kilos", "subtotalNeto", "costo", "cm"]
 
 
-def proyectar_serie_mes(serie_mes, desde, corte, hasta, feriados=None):
+def proyectar_serie_mes(serie_mes, desde, corte, hasta, feriados=None,
+                        df_detalle=None):
     """Lleva a fin de mes las filas de la serie del mes EN CURSO.
 
     Cada fila de la serie tiene un solo canal y un solo vendedor, así que le
-    toca un factor propio (factor_proyeccion): Food Service se proyecta contra
-    los días de facturación declarados de cada vendedor y el resto contra días
-    hábiles. Es el mismo criterio que usa el seguimiento de metas, así que los
-    dos números del tablero cierran entre sí.
+    toca un factor propio: Food Service se proyecta contra los días de
+    facturación declarados de cada vendedor y el resto contra días hábiles. Es
+    el mismo criterio que usa el seguimiento de metas, así que los dos números
+    del tablero cierran entre sí.
+
+    La serie guarda el NOMBRE del vendedor pero no su código, y los días de
+    facturación van por código. `df_detalle` (el detalle de ventas del mes, que
+    sí trae idVendedor) se usa para resolverlo: el factor de cada (canal,
+    nombre) es el de factor_proyeccion_ponderado() sobre las ventas de ese
+    nombre en el detalle, o sea calculado por código. Sin `df_detalle`, o si un
+    nombre no aparece en el detalle, esa fila proyecta con días hábiles.
 
     Devuelve (serie_proyectada, proyecto). `proyecto` es False cuando no hay
     nada que escalar (mes cerrado, o sin días transcurridos): en ese caso la
@@ -2743,15 +2792,31 @@ def proyectar_serie_mes(serie_mes, desde, corte, hasta, feriados=None):
     vend = (s["dsVendedor"] if "dsVendedor" in s.columns
             else pd.Series([""] * len(s), index=s.index))
 
+    # Factor por (canal, nombre) calculado sobre el detalle, por código.
+    por_nombre = {}
+    if (df_detalle is not None and len(df_detalle) > 0
+            and all(c in df_detalle.columns
+                    for c in ("dsCanalMkt", "dsVendedor", "kilos"))):
+        det = df_detalle.copy()
+        det["_c"] = det["dsCanalMkt"].astype(str).str.strip()
+        det["_v"] = det["dsVendedor"].astype(str).str.strip()
+        for (c, v), sub in det.groupby(["_c", "_v"]):
+            f, _ = factor_proyeccion_ponderado(sub, desde, corte, hasta,
+                                               feriados=feriados)
+            por_nombre[(c, v)] = f
+
     # Cachea por (canal, vendedor): factor_proyeccion recorre el mes día por
     # día y las filas del grano repiten mucho la misma combinación.
     cache = {}
 
     def _factor(c, v):
-        clave = (str(c), str(v))
+        clave = (str(c).strip(), str(v).strip())
         if clave not in cache:
-            cache[clave] = factor_proyeccion(clave[0], clave[1], desde, corte,
-                                             hasta, feriados=feriados)
+            if clave in por_nombre:
+                cache[clave] = por_nombre[clave]
+            else:
+                cache[clave] = factor_proyeccion(clave[0], None, desde, corte,
+                                                 hasta, feriados=feriados)
         return cache[clave]
 
     fac = pd.Series(
@@ -2780,19 +2845,25 @@ def vendedores_sin_dias_facturacion(df_ventas):
         return []
     d = df_ventas
     canal = d["dsCanalMkt"].astype(str).map(_norm_nombre)
-    food = d[canal == _norm_nombre(CANAL_DIAS_FACTURACION)]
+    food = d[canal == _norm_nombre(CANAL_DIAS_FACTURACION)].copy()
     if food.empty:
         return []
-    faltan = {
-        str(v).strip() for v in food["dsVendedor"].dropna().unique()
-        if dias_facturacion_vendedor(CANAL_DIAS_FACTURACION, v) is None
-    }
-    return sorted(faltan - {"", "nan", "None"})
+    food["_id"] = _col_id_vendedor(food)
+    faltan = set()
+    for (cod, nombre), _ in food.groupby(["_id", "dsVendedor"]):
+        if dias_facturacion_vendedor(CANAL_DIAS_FACTURACION, cod) is not None:
+            continue
+        nombre = str(nombre).strip()
+        if nombre in ("", "nan", "None"):
+            continue
+        faltan.add(nombre if cod == ID_VENDEDOR_SIN_DATO
+                   else f"{nombre} (cód. {cod})")
+    return sorted(faltan)
 
 
-def etiqueta_dias_facturacion(vendedor, canal=CANAL_DIAS_FACTURACION):
+def etiqueta_dias_facturacion(id_vendedor, canal=CANAL_DIAS_FACTURACION):
     """'lunes, miércoles y viernes' — para mostrar en el tablero."""
-    dias = dias_facturacion_vendedor(canal, vendedor)
+    dias = dias_facturacion_vendedor(canal, id_vendedor)
     if not dias:
         return ""
     nombres = [DIAS_SEMANA_NOMBRE[d] for d in sorted(dias)]
@@ -2903,19 +2974,21 @@ def _proyeccion_por_nivel(df_mes, nivel, desde, corte, hasta, feriados=None):
     g = d[grano + ["kilos"]].copy()
     for c in grano:
         g[c] = g[c].astype(str).str.strip()
-    g = g.groupby(grano, as_index=False)["kilos"].sum()
+    # Los días de facturación van por CÓDIGO de vendedor, no por nombre.
+    g["idVendedor"] = _col_id_vendedor(d)
+    g = g.groupby(grano + ["idVendedor"], as_index=False)["kilos"].sum()
     if g.empty:
         return vacio
 
-    # Un factor por (canal, vendedor): son pocos pares, se calculan una vez.
-    pares = g[["dsCanalMkt", "dsVendedor"]].drop_duplicates()
+    # Un factor por (canal, código): son pocos pares, se calculan una vez.
+    pares = g[["dsCanalMkt", "idVendedor"]].drop_duplicates()
     factores = {
         (c, v): factor_proyeccion(c, v, desde, corte, hasta, feriados=feriados)
         for c, v in pares.itertuples(index=False, name=None)
     }
     g["proyeccion_kg"] = [
         k * factores[(c, v)]
-        for k, c, v in zip(g["kilos"], g["dsCanalMkt"], g["dsVendedor"])
+        for k, c, v in zip(g["kilos"], g["dsCanalMkt"], g["idVendedor"])
     ]
     return g.groupby(llaves, as_index=False)["proyeccion_kg"].sum()
 
@@ -2938,26 +3011,26 @@ def dias_venta_resumen(df_mes, desde, corte, hasta, canales=None,
 
     if df_mes is None or len(df_mes) == 0:
         return pas_def, tot_def, False
-    if any(c not in df_mes.columns for c in ("dsCanalMkt", "dsVendedor", "kilos")):
+    if any(c not in df_mes.columns for c in ("dsCanalMkt", "kilos")):
         return pas_def, tot_def, False
 
-    g = df_mes[["dsCanalMkt", "dsVendedor", "kilos"]].copy()
+    g = df_mes[["dsCanalMkt", "kilos"]].copy()
     g["dsCanalMkt"] = g["dsCanalMkt"].astype(str).str.strip()
-    g["dsVendedor"] = g["dsVendedor"].astype(str).str.strip()
+    g["idVendedor"] = _col_id_vendedor(df_mes)
     if canales:
         cs = {str(c).strip() for c in canales}
         g = g[g["dsCanalMkt"].isin(cs)]
-    g = g.groupby(["dsCanalMkt", "dsVendedor"], as_index=False)["kilos"].sum()
+    g = g.groupby(["dsCanalMkt", "idVendedor"], as_index=False)["kilos"].sum()
     g = g[g["kilos"] > 0]
     if g.empty:
         return pas_def, tot_def, False
 
     mixto = any(
         dias_facturacion_vendedor(c, v) is not None
-        for c, v in g[["dsCanalMkt", "dsVendedor"]].itertuples(index=False, name=None)
+        for c, v in g[["dsCanalMkt", "idVendedor"]].itertuples(index=False, name=None)
     )
     dias = [dias_venta(c, v, desde, corte, hasta, feriados=feriados)
-            for c, v in g[["dsCanalMkt", "dsVendedor"]].itertuples(index=False, name=None)]
+            for c, v in g[["dsCanalMkt", "idVendedor"]].itertuples(index=False, name=None)]
     peso = g["kilos"].to_numpy(dtype="float64")
     total_peso = float(peso.sum())
     if total_peso <= 0:

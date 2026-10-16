@@ -117,18 +117,19 @@ chk(len(m) == 1 and int(m["clientes"].iloc[0]) == 2,
     "fusionados, C1 se cuenta UNA vez (2 clientes, no 3)",
     str(m.to_dict("records")))
 
-print("\n[5] Consecuencia: Food Caba hereda los días de Castillón")
-chk(dp.dias_facturacion_vendedor("FOOD SERVICE", "CASTILLON AGUSTIN DAMIAN")
-    is not None,
-    f"Castillón tiene días declarados: "
-    f"{dp.etiqueta_dias_facturacion('CASTILLON AGUSTIN DAMIAN')}")
-sin_dias = dp.vendedores_sin_dias_facturacion(
-    pd.DataFrame({"dsCanalMkt": ["FOOD SERVICE"], "dsVendedor": ["FOOD CABA"]}))
-chk(sin_dias == ["FOOD CABA"],
-    "sin normalizar, FOOD CABA figura como 'sin días declarados'")
-sin_dias2 = dp.vendedores_sin_dias_facturacion(dp.normalizar_vendedor(
-    pd.DataFrame({"dsCanalMkt": ["FOOD SERVICE"], "dsVendedor": ["FOOD CABA"]})))
-chk(sin_dias2 == [], "normalizado, ya no: proyecta con lunes y viernes")
+print("\n[5] Días de facturación de Castillón y Food Caba (van por código)")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", 35) == (0, 4),
+    f"Castillón (35) tiene días declarados: "
+    f"{dp.etiqueta_dias_facturacion(35)}")
+chk(dp.dias_facturacion_vendedor("FOOD SERVICE", 75)
+    == dp.dias_facturacion_vendedor("FOOD SERVICE", 35),
+    "Food Caba (75) tiene los mismos días que Castillón (35)")
+_fc = pd.DataFrame({"dsCanalMkt": ["FOOD SERVICE"] * 2,
+                    "idVendedor": [75, 35],
+                    "dsVendedor": ["FOOD CABA", "CASTILLON AGUSTIN"]})
+chk(dp.vendedores_sin_dias_facturacion(_fc) == []
+    and dp.vendedores_sin_dias_facturacion(dp.normalizar_vendedor(_fc)) == [],
+    "con o sin normalizar el nombre, ninguno figura 'sin días declarados'")
 
 print("\n[6] Bordes")
 chk(dp.normalizar_vendedor(pd.DataFrame()) is not None, "df vacío no rompe")
