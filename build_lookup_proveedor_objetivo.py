@@ -61,7 +61,7 @@ def proveedor_objetivo(prov, grupo, fam, linea, cod, tfood):
         return f"{prov} LACTEOS"
     if prov == "ERNESTO RODRIGUEZ E HIJOS SA":
         return f"{prov} {fam}".strip()
-    if prov == "ELCOR S.A" and cod in (11515, 20101):
+    if prov == "ELCOR S.A" and cod in (11515, 11615, 20101):
         return "ELCOR S.A FOOD"
     if prov == "ELCOR S.A":
         return "ELCOR S.A RETAIL"
