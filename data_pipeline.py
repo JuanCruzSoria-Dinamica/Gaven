@@ -46,7 +46,10 @@ import numpy as np
 # Rutas y constantes
 # ---------------------------------------------------------------------------
 
-ANIO = 2026  # solo se analizan datos de este año
+# Año que analiza el panel: el año en curso. Sale de la fecha (no fijo) para
+# que quede alineado con mart.ventas_mat de Supabase, que guarda desde el 1°
+# de noviembre del año anterior según la fecha de hoy.
+ANIO = dt.date.today().year
 
 DATA_DIR = "data"
 PARQUET_PATH = os.path.join(DATA_DIR, "ventas_actualizadas.parquet")
