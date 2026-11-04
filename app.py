@@ -23,6 +23,7 @@ import streamlit as st
 import plotly.express as px
 
 import data_pipeline as dp
+import fuente_datos as fd
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,116 @@ META_PATH = dp.META_PATH
 
 
 # ---------------------------------------------------------------------------
+# Fuente de datos: parquets de data/ (por defecto) o Supabase.
+# Se elige en .streamlit/secrets.toml -> [datos] fuente = "supabase", o con la
+# variable de entorno GAVEN_FUENTE (ver fuente_datos.py).
+# ---------------------------------------------------------------------------
+
+def _secrets_o_none():
+    try:
+        st.secrets.keys()  # dispara la lectura; falla si no hay secrets.toml
+        return st.secrets
+    except Exception:
+        return None
+
+
+FUENTE = fd.resolver_fuente(_secrets_o_none())
+SUPABASE = FUENTE == "supabase"
+DB_CONN = fd.resolver_conninfo(_secrets_o_none()) if SUPABASE else None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _estado_db():
+    """Fila de mart.ultima_actualizacion. Se consulta como mucho una vez por
+    minuto: de acá sale la "versión" de los datos para las cachés."""
+    return fd.leer_estado(DB_CONN)
+
+
+def _version_db():
+    """Cambia cada vez que la base termina de refrescar las vistas del panel
+    (o, si la vista todavía no informa el refresco, con cada carga)."""
+    est = _estado_db()
+    return str(est.get("vistas_al") or est.get("ultima_actualizacion") or "")
+
+
+def _mt(path):
+    """Clave de caché de un archivo de data/. En modo Supabase es la versión
+    de la base; en modo parquet, el mtime del archivo (0 si no existe)."""
+    if SUPABASE:
+        return _version_db()
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _mt_familias():
+    return _version_db() if SUPABASE else dp.mtime_lookup_familias()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _feriados_db(_version):
+    return fd.leer_feriados(DB_CONN)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _dias_facturacion_db(_version, _hoy):
+    return fd.leer_dias_facturacion(DB_CONN, _hoy)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _metas_db(_version):
+    return fd.leer_metas(DB_CONN)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _historial_metas_db(_version):
+    return fd.leer_historial_metas(DB_CONN)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _acuerdos_db(_version):
+    return fd.leer_acuerdos(DB_CONN)
+
+
+def _cargar_metas():
+    return _metas_db(_version_db()).copy() if SUPABASE else dp.cargar_metas()
+
+
+def _cargar_historial_metas():
+    return (_historial_metas_db(_version_db()).copy() if SUPABASE
+            else dp.cargar_historial_metas())
+
+
+def _cargar_acuerdos():
+    return _acuerdos_db(_version_db()).copy() if SUPABASE else dp.cargar_acuerdos()
+
+
+def _solo_lectura_supabase(que):
+    """Etapa 1 de la migración: en modo Supabase el panel solo LEE. Guardar
+    metas o acuerdos todavía va a los parquets, así que se bloquea para no
+    escribir en un lado y leer del otro."""
+    st.error(
+        f"Con la fuente Supabase todavía no se puede guardar {que}: "
+        "esta versión del panel es de solo lectura. Volvé a la fuente "
+        "parquet para cargar datos."
+    )
+    st.stop()
+
+
+def _upsert_metas(*args, **kwargs):
+    if SUPABASE:
+        _solo_lectura_supabase("metas")
+    return dp.upsert_metas(*args, **kwargs)
+
+
+def _upsert_acuerdos(*args, **kwargs):
+    if SUPABASE:
+        _solo_lectura_supabase("acuerdos")
+    return dp.upsert_acuerdos(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Helpers de formato
 # ---------------------------------------------------------------------------
 
@@ -168,20 +279,14 @@ def fmt_dec1(x):
 def _mtime_acuerdos():
     """mtime del almacén de acuerdos McCain (0 si aún no existe). Entra en la
     clave de caché: al subir un Excel nuevo, las cachés se invalidan solas."""
-    try:
-        return os.path.getmtime(dp.ACUERDOS_PATH)
-    except OSError:
-        return 0
+    return _mt(dp.ACUERDOS_PATH)
 
 
 def _mtime_metas():
     """mtime del parquet de metas (0 si aún no existe). Mismo criterio que
     _mtime_acuerdos(): al guardar objetivos nuevos, todo lo que se cachea a
     partir de las metas se invalida solo."""
-    try:
-        return os.path.getmtime(dp.METAS_PATH)
-    except OSError:
-        return 0
+    return _mt(dp.METAS_PATH)
 
 
 def _achicar_texto(df):
@@ -245,6 +350,12 @@ def _achicar_texto(df):
 # pipeline.
 @st.cache_data(show_spinner="Leyendo datos...", max_entries=1)
 def cargar_datos_local(mtime, mtime_acuerdos=0, mtime_familias=0):
+    if SUPABASE:
+        # La base ya trae marca/línea, familia, tipo y el costo final
+        # (acuerdos + bonificación por canal): solo falta la etiqueta 'sku'.
+        df = fd.leer_ventas(DB_CONN, dp.ANIO)
+        df = dp.agregar_sku(df)
+        return _achicar_texto(df)
     df = pd.read_parquet(PARQUET_PATH)
     # 'marca_linea' es una columna DERIVADA del lookup por código
     # (data/proveedor_objetivo_lookup.csv). Se recalcula siempre al leer para
@@ -285,9 +396,15 @@ def cargar_serie(mtime, mtime_parquet=0, mtime_acuerdos=0):
     en disco sea vieja. Los meses solo-serie (ej. 2025) quedan tal cual los dejó
     el backfill; si les falta alguna dimensión se rellena con SERIE_SIN_DATO
     (ver dp.alinear_serie) y se recuperan rehaciendo el backfill."""
+    if SUPABASE:
+        # En la base la serie ya sale del mismo detalle con costo final, para
+        # todos los meses: no hace falta recalcular los del año en curso.
+        serie, _faltantes = dp.alinear_serie(fd.leer_serie(DB_CONN))
+        return (serie.sort_values(["anio_mes"] + dp.SERIE_GRANO[1:])
+                .reset_index(drop=True))
     serie = pd.read_parquet(dp.SERIE_PATH)
     serie, _faltantes = dp.alinear_serie(serie)
-    det = cargar_datos_local(mtime_parquet, mtime_acuerdos, dp.mtime_lookup_familias())
+    det = cargar_datos_local(mtime_parquet, mtime_acuerdos, _mt_familias())
     nuevos = dp.agregar_serie(det)
     if nuevos.empty:
         return serie
@@ -311,11 +428,14 @@ def cargar_cartera(mtime, mtime_parquet=0):
     si todavía no se generó, esos meses quedan sin las métricas de cartera y el
     gráfico lo avisa en vez de dibujar un cero.
     """
+    if SUPABASE:
+        cart, _falt = dp.alinear_cartera(fd.leer_cartera(DB_CONN))
+        return cart
     cart = pd.DataFrame(columns=dp.CARTERA_GRANO)
     if os.path.exists(dp.CARTERA_PATH):
         cart = pd.read_parquet(dp.CARTERA_PATH)
         cart, _falt = dp.alinear_cartera(cart)
-    det = cargar_datos_local(mtime_parquet, _mtime_acuerdos(), dp.mtime_lookup_familias())
+    det = cargar_datos_local(mtime_parquet, _mtime_acuerdos(), _mt_familias())
     nuevos = dp.agregar_cartera(det)
     if nuevos.empty:
         return cart
@@ -341,9 +461,9 @@ def cargar_evolutivo(nivel, canales, mtime, mtime_acuerdos=0, mtime_metas=0,
     `canales` llega como tupla porque la clave de caché tiene que ser
     hasheable.
     """
-    df = cargar_datos_local(mtime, mtime_acuerdos, dp.mtime_lookup_familias())
+    df = cargar_datos_local(mtime, mtime_acuerdos, _mt_familias())
     return dp.evolutivo_metas(
-        df, dp.cargar_metas(),
+        df, _cargar_metas(),
         nivel=nivel,
         canales=list(canales) if canales else None,
         anio=dp.ANIO,
@@ -358,6 +478,8 @@ def cargar_ipc(_mtime=None):
     La clave de caché es el mtime del archivo: cuando el pipeline reescribe el
     IPC, la caché se invalida sola (igual que la serie). Así nunca queda
     'pegado' un IPC vacío."""
+    if SUPABASE:
+        return fd.leer_ipc(DB_CONN)
     ipc = dp.cargar_ipc()
     if ipc.empty:
         try:
@@ -368,6 +490,17 @@ def cargar_ipc(_mtime=None):
 
 
 def leer_metadata():
+    if SUPABASE:
+        est = _estado_db()
+        ult = est.get("ultima_actualizacion")
+        meta = {"ultima_actualizacion":
+                (pd.Timestamp(ult).strftime("%Y-%m-%d %H:%M:%S")
+                 if ult is not None and pd.notna(ult) else "—")}
+        if est.get("ultimo_estado") and est.get("ultimo_estado") != "ok":
+            meta["aviso"] = f"La última carga terminó con estado '{est['ultimo_estado']}'."
+        elif est.get("ultimo_error"):
+            meta["aviso"] = "La última carga avisó un problema al refrescar las vistas."
+        return meta
     try:
         with open(META_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -543,7 +676,7 @@ if _cu.button("Cerrar sesión", use_container_width=True):
     st.session_state.rol = None
     st.rerun()
 
-if not os.path.exists(PARQUET_PATH):
+if not SUPABASE and not os.path.exists(PARQUET_PATH):
     st.warning(
         "Todavía no hay datos cargados.\n\n"
         "Ejecutá primero el pipeline para generar el archivo:\n\n"
@@ -551,8 +684,13 @@ if not os.path.exists(PARQUET_PATH):
     )
     st.stop()
 
-df = cargar_datos_local(os.path.getmtime(PARQUET_PATH), _mtime_acuerdos(),
-                        dp.mtime_lookup_familias())
+if SUPABASE:
+    # Feriados y días de facturación salen de la base (reemplazan los valores
+    # fijos de data_pipeline.py para todas las proyecciones).
+    dp.FERIADOS = _feriados_db(_version_db())
+    dp.DIAS_FACTURACION = _dias_facturacion_db(_version_db(), dt.date.today())
+
+df = cargar_datos_local(_mt(PARQUET_PATH), _mtime_acuerdos(), _mt_familias())
 
 # Copia del detalle COMPLETO (todo el parquet) antes de recortarlo por
 # período. De acá salen el universo de la cobertura (ver más abajo) y las
@@ -644,11 +782,14 @@ with st.container(border=True):
 
     meta = leer_metadata()
     ultima = meta.get("ultima_actualizacion", "—")
+    _fuente_lbl = " · Fuente: Supabase" if SUPABASE else ""
     f1c.markdown(
         f"<div style='text-align:right;color:var(--tx2);font-size:.8rem;"
-        f"padding-top:1.9rem'>Última actualización: {ultima}</div>",
+        f"padding-top:1.9rem'>Última actualización: {ultima}{_fuente_lbl}</div>",
         unsafe_allow_html=True,
     )
+    if meta.get("aviso"):
+        f1c.warning(meta["aviso"])
 
     # df del período (base para construir las opciones de los selectores)
     fecha = df["fechaComprobate"]
@@ -1451,7 +1592,7 @@ with tab_resumen:
     # serie); cuando está activo se avisa abajo del gráfico.
     st.subheader("Evolución mensual")
 
-    if not os.path.exists(dp.SERIE_PATH):
+    if not SUPABASE and not os.path.exists(dp.SERIE_PATH):
         st.warning(
             "Todavía no existe la serie histórica.\n\n"
             "Generala UNA vez con el backfill:\n\n"
@@ -1460,8 +1601,8 @@ with tab_resumen:
         )
     else:
         serie = cargar_serie(
-            os.path.getmtime(dp.SERIE_PATH),
-            os.path.getmtime(PARQUET_PATH),
+            _mt(dp.SERIE_PATH),
+            _mt(PARQUET_PATH),
             _mtime_acuerdos(),
         )
 
@@ -1579,8 +1720,9 @@ with tab_resumen:
                 base_mes = None
                 nota_moneda = "Pesos corrientes (nominales, de cada mes)."
                 if moneda.startswith("Constante"):
-                    _ipc_mtime = (os.path.getmtime(dp.IPC_PATH)
-                                  if os.path.exists(dp.IPC_PATH) else None)
+                    _ipc_mtime = (_mt(dp.IPC_PATH)
+                                  if SUPABASE or os.path.exists(dp.IPC_PATH)
+                                  else None)
                     ipc = cargar_ipc(_ipc_mtime)
                     factores, base_mes = dp.factores_constantes(ipc)
                     if not factores:
@@ -1631,9 +1773,8 @@ with tab_resumen:
                 meses_sin_cartera = []
                 if es_cartera:
                     cartera = cargar_cartera(
-                        os.path.getmtime(dp.CARTERA_PATH)
-                        if os.path.exists(dp.CARTERA_PATH) else 0,
-                        os.path.getmtime(PARQUET_PATH),
+                        _mt(dp.CARTERA_PATH),
+                        _mt(PARQUET_PATH),
                     )
                     cart_f, _ = dp.filtrar_serie(
                         cartera, seleccion, hasta_mes=mes_sel
@@ -2869,8 +3010,8 @@ with tab_metas:
         & (_fecha_full < pd.Timestamp(_ult_p) + pd.Timedelta(days=1))
     ].copy()
 
-    _metas_all = dp.cargar_metas()
-    _hist_all = dp.cargar_historial_metas()
+    _metas_all = _cargar_metas()
+    _hist_all = _cargar_historial_metas()
     _cerrado = dias_pas >= dias_tot
 
     st.caption(
@@ -3173,7 +3314,7 @@ with tab_metas:
 
         _ev = cargar_evolutivo(
             _niv_evol, tuple(_canales_vista),
-            os.path.getmtime(PARQUET_PATH), _mtime_acuerdos(), _mtime_metas(),
+            _mt(PARQUET_PATH), _mtime_acuerdos(), _mtime_metas(),
             _hoy,
         )
         _ev_tot = dp.evolutivo_total(_ev)
@@ -3422,7 +3563,7 @@ with tab_metas:
                     "marca_linea": "", "dsVendedor": "",
                     "meta_kg": float(_nuevo_canal),
                 }])
-                dp.upsert_metas(_fila, anio_mes=mes_meta, canales=[canal_meta],
+                _upsert_metas(_fila, anio_mes=mes_meta, canales=[canal_meta],
                                 tipo="objetivo", nivel="canal")
                 st.session_state["_metas_ok"] = (
                     f"Objetivo de {canal_meta} para {etiqueta_mes(mes_meta)}: "
@@ -3532,7 +3673,7 @@ with tab_metas:
                 _nuevas["anio_mes"] = mes_meta
                 _nuevas["dsCanalMkt"] = canal_meta
                 _nuevas["dsVendedor"] = ""
-                _guardadas = dp.upsert_metas(
+                _guardadas = _upsert_metas(
                     _nuevas, anio_mes=mes_meta, canales=[canal_meta],
                     tipo="objetivo", nivel="proveedor")
                 _n = len(dp.filtrar_metas(
@@ -3649,7 +3790,7 @@ with tab_metas:
                 _nuevas_v["anio_mes"] = mes_meta
                 _nuevas_v["dsCanalMkt"] = canal_meta
                 _nuevas_v["marca_linea"] = ""
-                _guardadas_v = dp.upsert_metas(
+                _guardadas_v = _upsert_metas(
                     _nuevas_v, anio_mes=mes_meta, canales=[canal_meta],
                     tipo="objetivo", nivel="vendedor")
                 _nv = len(dp.filtrar_metas(
@@ -3764,7 +3905,7 @@ with tab_metas:
                 _np_["dsCanalMkt"] = canal_meta
                 _np_["marca_linea"] = ""
                 _np_["dsVendedor"] = ""
-                dp.upsert_metas(
+                _upsert_metas(
                     _np_, anio_mes=_meses_anio, canales=[canal_meta],
                     tipo="presupuesto", nivel="canal")
                 st.session_state["_metas_ok"] = (
@@ -3797,7 +3938,7 @@ if tab_acuerdos is not None:
         # esta altura `df` ya viene filtrado por el período/filtros globales
         # y la auditoría debe mostrar el año entero sin importar qué mes
         # esté seleccionado arriba.
-        _ac = dp.cargar_acuerdos()
+        _ac = _cargar_acuerdos()
         if _ac.empty:
             st.info("Todavía no hay acuerdos cargados.")
         else:
@@ -3924,7 +4065,7 @@ if tab_acuerdos is not None:
 
                 if st.button("Confirmar y aplicar al tablero",
                              type="primary", key="btn_acuerdos"):
-                    dp.upsert_acuerdos(_nuevos)
+                    _upsert_acuerdos(_nuevos)
                     st.cache_data.clear()  # recarga datos y serie ajustados
                     st.session_state["_acuerdos_ok"] = (
                         f"Listo: {_res['filas_validas']} acuerdos aplicados "
