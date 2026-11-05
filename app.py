@@ -199,12 +199,20 @@ def _acuerdos_db(_version):
     return fd.leer_acuerdos(DB_CONN)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _version_metas_db():
+    """Versión de las metas en la base: cambia con cada alta, cambio o baja.
+    Al guardar se limpia a mano (ver _upsert_metas) para que el panel muestre
+    lo recién guardado sin esperar el minuto del ttl."""
+    return fd.version_metas(DB_CONN)
+
+
 def _cargar_metas():
-    return _metas_db(_version_db()).copy() if SUPABASE else dp.cargar_metas()
+    return _metas_db(_version_metas_db()).copy() if SUPABASE else dp.cargar_metas()
 
 
 def _cargar_historial_metas():
-    return (_historial_metas_db(_version_db()).copy() if SUPABASE
+    return (_historial_metas_db(_version_metas_db()).copy() if SUPABASE
             else dp.cargar_historial_metas())
 
 
@@ -212,28 +220,53 @@ def _cargar_acuerdos():
     return _acuerdos_db(_version_db()).copy() if SUPABASE else dp.cargar_acuerdos()
 
 
-def _solo_lectura_supabase(que):
-    """Etapa 1 de la migración: en modo Supabase el panel solo LEE. Guardar
-    metas o acuerdos todavía va a los parquets, así que se bloquea para no
-    escribir en un lado y leer del otro."""
-    st.error(
-        f"Con la fuente Supabase todavía no se puede guardar {que}: "
-        "esta versión del panel es de solo lectura. Volvé a la fuente "
-        "parquet para cargar datos."
-    )
-    st.stop()
+def _upsert_metas(df_nuevas, anio_mes, canales=None, tipo="objetivo",
+                  nivel="proveedor"):
+    """Guarda metas en la fuente activa: core.meta (Supabase) o metas.parquet.
+    Mismo criterio en los dos: reemplaza (mes, tipo, nivel, canal)."""
+    if not SUPABASE:
+        return dp.upsert_metas(df_nuevas, anio_mes=anio_mes, canales=canales,
+                               tipo=tipo, nivel=nivel)
+    try:
+        res = fd.guardar_metas(DB_CONN, df_nuevas, anio_mes, canales=canales,
+                               tipo=tipo, nivel=nivel,
+                               cargado_por=st.session_state.get("rol"))
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+    except Exception as e:
+        st.error(f"No se pudo guardar en la base; no se cambió nada. Detalle: {e}")
+        st.stop()
+    _version_metas_db.clear()  # que todo lo que usa metas se recalcule ya
+    return res
 
 
-def _upsert_metas(*args, **kwargs):
-    if SUPABASE:
-        _solo_lectura_supabase("metas")
-    return dp.upsert_metas(*args, **kwargs)
-
-
-def _upsert_acuerdos(*args, **kwargs):
-    if SUPABASE:
-        _solo_lectura_supabase("acuerdos")
-    return dp.upsert_acuerdos(*args, **kwargs)
+def _upsert_acuerdos(df_nuevos, nombre_archivo=None, resumen=None):
+    """Guarda acuerdos en la fuente activa. En Supabase: core.acuerdo_costo +
+    mart.refrescar() (~1 minuto), porque el costo de las ventas sale de las
+    vistas materializadas. Devuelve el DataFrame de filas que la base no
+    aceptó (cliente o artículo inexistente); vacío en modo parquet."""
+    if not SUPABASE:
+        dp.upsert_acuerdos(df_nuevos)
+        return pd.DataFrame()
+    try:
+        res = fd.guardar_acuerdos(DB_CONN, df_nuevos,
+                                  nombre_archivo=nombre_archivo,
+                                  rol=st.session_state.get("rol"),
+                                  resumen=resumen)
+    except Exception as e:
+        st.error(f"No se pudieron guardar los acuerdos; no se cambió nada. Detalle: {e}")
+        st.stop()
+    try:
+        with st.spinner("Recalculando costos en la base (tarda alrededor de un minuto)..."):
+            fd.refrescar_vistas(DB_CONN)
+    except Exception as e:
+        st.session_state["_acuerdos_aviso"] = (
+            "Los acuerdos quedaron guardados, pero falló el recálculo de "
+            f"costos ({e}). El tablero los va a mostrar después de la próxima "
+            "carga de ventas, o al correr mart.refrescar()."
+        )
+    return res["descartados"]
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +318,9 @@ def _mtime_acuerdos():
 def _mtime_metas():
     """mtime del parquet de metas (0 si aún no existe). Mismo criterio que
     _mtime_acuerdos(): al guardar objetivos nuevos, todo lo que se cachea a
-    partir de las metas se invalida solo."""
-    return _mt(dp.METAS_PATH)
+    partir de las metas se invalida solo. En Supabase, la versión de las
+    metas en la base (cambia con cada guardado)."""
+    return _version_metas_db() if SUPABASE else _mt(dp.METAS_PATH)
 
 
 def _achicar_texto(df):
@@ -3932,6 +3966,17 @@ if tab_acuerdos is not None:
         _msg_ok = st.session_state.pop("_acuerdos_ok", None)
         if _msg_ok:
             st.success(_msg_ok)
+        _msg_aviso = st.session_state.pop("_acuerdos_aviso", None)
+        if _msg_aviso:
+            st.warning(_msg_aviso)
+        _desc_prev = st.session_state.pop("_acuerdos_descartados", None)
+        if _desc_prev is not None and not _desc_prev.empty:
+            st.warning(
+                f"{len(_desc_prev)} acuerdos no se guardaron porque el cliente "
+                "o el artículo no existe en la base (no se aplicarían a ninguna "
+                "venta). Revisá el código en el Excel:"
+            )
+            st.dataframe(_desc_prev, use_container_width=True, hide_index=True)
 
         # --- Estado actual (auditoría) ---------------------------------
         # OJO: acá se usa el dataset COMPLETO (df_full), no `df`, porque a
@@ -4065,8 +4110,11 @@ if tab_acuerdos is not None:
 
                 if st.button("Confirmar y aplicar al tablero",
                              type="primary", key="btn_acuerdos"):
-                    _upsert_acuerdos(_nuevos)
+                    _desc = _upsert_acuerdos(_nuevos, nombre_archivo=_subida.name,
+                                             resumen=_res)
                     st.cache_data.clear()  # recarga datos y serie ajustados
+                    if _desc is not None and not _desc.empty:
+                        st.session_state["_acuerdos_descartados"] = _desc
                     st.session_state["_acuerdos_ok"] = (
                         f"Listo: {_res['filas_validas']} acuerdos aplicados "
                         f"({', '.join(_res['meses'])}). CM y CM% ya están "

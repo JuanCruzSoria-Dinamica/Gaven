@@ -252,3 +252,161 @@ def leer_estado(conninfo):
     """Una fila de mart.ultima_actualizacion como dict."""
     df = _consulta(conninfo, "select * from mart.ultima_actualizacion")
     return {} if df.empty else df.iloc[0].to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Escritura: metas y acuerdos (usuario panel_app)
+# ---------------------------------------------------------------------------
+# Mismo criterio que dp.upsert_metas / dp.upsert_acuerdos, pero en la base y en
+# una sola transacción: si algo falla, no queda nada a medio guardar.
+
+def _mes_date(anio_mes):
+    """'2026-11' -> date(2026, 11, 1), como guarda la base el mes."""
+    s = str(anio_mes).strip()
+    return dt.date(int(s[:4]), int(s[5:7]), 1)
+
+
+def version_metas(conninfo):
+    """Cambia con cada alta, cambio o baja de una meta: el trigger de core.meta
+    deja una fila en el historial por cada una. Sirve de clave de caché."""
+    df = _consulta(conninfo, "select coalesce(max(id), 0) as v, count(*) as n "
+                             "from mart.metas_historial")
+    return f"{int(df['v'].iloc[0])}-{int(df['n'].iloc[0])}"
+
+
+def guardar_metas(conninfo, df_nuevas, anio_mes, canales=None, tipo="objetivo",
+                  nivel="proveedor", cargado_por=None):
+    """UPSERT POR (mes, tipo, nivel, canal) en core.meta, igual que
+    dp.upsert_metas: borra esas combinaciones y las reemplaza por `df_nuevas`.
+    Si `canales` viene dado, esos canales se reescriben aunque queden sin filas
+    (así borrar una meta en la grilla la borra).
+
+    Borrar e insertar en la misma transacción hace que el historial (lo llena
+    el trigger) quede con una "foto" completa de cada guardado, todas con la
+    misma hora: es lo que espera dp.metas_original_vs_vigente.
+
+    Los nombres de canal, marca/línea y vendedor se traducen a los ids de la
+    base. Si alguno no existe, no se guarda nada y se levanta ValueError.
+    Devuelve las metas vigentes completas (mismo formato que leer_metas)."""
+    import data_pipeline as dp  # import tardío: dp no depende de este módulo
+
+    meses = ([str(anio_mes)] if isinstance(anio_mes, str)
+             else [str(x) for x in anio_mes])
+    nuevas = dp.normalizar_metas(df_nuevas, tipo=tipo, nivel=nivel)
+    if canales is None:
+        canales = sorted(nuevas["dsCanalMkt"].unique()) if not nuevas.empty else []
+    canales = {str(c).strip() for c in canales}
+
+    with _conectar(conninfo) as con:
+        with con.cursor() as cur:
+            cur.execute("select nombre, id_canal from mart.dim_canal")
+            id_canal = {str(n).strip(): int(i) for n, i in cur.fetchall()}
+            cur.execute("select nombre, id from mart.dim_marca_linea")
+            id_marca = {str(n).strip(): int(i) for n, i in cur.fetchall()}
+            cur.execute("select nombre, id_persona from mart.dim_vendedor")
+            id_persona = {str(n).strip(): int(i) for n, i in cur.fetchall()}
+
+        filas, faltan = [], set()
+        for r in nuevas.itertuples(index=False):
+            c = id_canal.get(r.dsCanalMkt)
+            if c is None:
+                faltan.add(f"canal '{r.dsCanalMkt}'")
+                continue
+            m = p = None
+            if r.nivel == "proveedor":
+                m = id_marca.get(r.marca_linea)
+                if m is None:
+                    faltan.add(f"marca/línea '{r.marca_linea}'")
+                    continue
+            elif r.nivel == "vendedor":
+                p = id_persona.get(r.dsVendedor)
+                if p is None:
+                    faltan.add(f"vendedor '{r.dsVendedor}'")
+                    continue
+            filas.append((_mes_date(r.anio_mes), r.tipo, r.nivel, c, m, p,
+                          float(r.meta_kg), cargado_por))
+        if faltan:
+            raise ValueError("No se guardó nada: estos nombres no están en la "
+                             "base: " + ", ".join(sorted(faltan)))
+
+        ids_canales = [id_canal[c] for c in canales if c in id_canal]
+        with con.transaction(), con.cursor() as cur:
+            cur.execute(
+                "delete from core.meta where mes = any(%s::date[]) "
+                "and tipo = %s and nivel = %s and id_canal = any(%s::int[])",
+                ([_mes_date(m) for m in meses], tipo, nivel, ids_canales))
+            if filas:
+                cur.executemany(
+                    "insert into core.meta (mes, tipo, nivel, id_canal, "
+                    "id_marca_linea, id_persona, meta_kg, cargado_por) "
+                    "values (%s, %s, %s, %s, %s, %s, %s, %s)", filas)
+    return leer_metas(conninfo)
+
+
+def guardar_acuerdos(conninfo, df_nuevos, nombre_archivo=None, rol=None,
+                     resumen=None):
+    """UPSERT POR MES en core.acuerdo_costo, igual que dp.upsert_acuerdos: los
+    meses que trae el archivo reemplazan a los cargados. Registra la carga en
+    core.carga_archivo.
+
+    La base exige que el cliente y el artículo existan y que el artículo tenga
+    proveedor. Las filas que no cumplen se descartan (no se aplicarían a
+    ninguna venta) y se devuelven para mostrarlas.
+
+    No refresca las vistas: eso lo hace refrescar_vistas(), aparte, porque
+    tarda alrededor de un minuto.
+
+    Devuelve {"guardados": int, "descartados": DataFrame}."""
+    import json
+    from psycopg.types.json import Jsonb
+
+    d = df_nuevos.copy()
+    d["anio"] = pd.to_numeric(d["anio"], errors="coerce").astype("int64")
+    d["mes"] = pd.to_numeric(d["mes"], errors="coerce").astype("int64")
+    d["idCliente"] = pd.to_numeric(d["idCliente"], errors="coerce").astype("int64")
+    d["idArticulo"] = pd.to_numeric(d["idArticulo"], errors="coerce").astype("int64")
+    d["desc_kg"] = pd.to_numeric(d["desc_kg"], errors="coerce").astype(float)
+    d["mes_d"] = [dt.date(int(a), int(m), 1) for a, m in zip(d["anio"], d["mes"])]
+    meses = sorted(set(d["mes_d"]))
+
+    with _conectar(conninfo) as con:
+        with con.cursor() as cur:
+            cur.execute("select id_articulo, id_proveedor from mart.dim_articulo")
+            prov = {int(a): (int(p) if p is not None else None)
+                    for a, p in cur.fetchall()}
+            cur.execute("select id_cliente from mart.dim_cliente")
+            clientes = {int(c) for (c,) in cur.fetchall()}
+
+        d["prov_id"] = d["idArticulo"].map(prov)
+        ok = d["idCliente"].isin(clientes) & d["prov_id"].notna()
+        validos = d[ok]
+        descartados = d.loc[~ok, ["anio", "mes", "idCliente", "idArticulo",
+                                  "desc_kg"]].reset_index(drop=True)
+
+        info = json.loads(json.dumps(resumen or {}, default=str))
+        info["descartados_en_base"] = int(len(descartados))
+        with con.transaction(), con.cursor() as cur:
+            cur.execute(
+                "insert into core.carga_archivo (tipo, nombre_archivo, rol, "
+                "filas, resumen) values ('acuerdos', %s, %s, %s, %s) "
+                "returning id",
+                (nombre_archivo, rol, int(len(validos)), Jsonb(info)))
+            id_carga = cur.fetchone()[0]
+            cur.execute("delete from core.acuerdo_costo "
+                        "where mes = any(%s::date[])", (meses,))
+            if not validos.empty:
+                cur.executemany(
+                    "insert into core.acuerdo_costo (mes, id_cliente, "
+                    "id_articulo, id_proveedor, desc_kg, id_carga) "
+                    "values (%s, %s, %s, %s, %s, %s)",
+                    [(r.mes_d, int(r.idCliente), int(r.idArticulo),
+                      int(r.prov_id), float(r.desc_kg), id_carga)
+                     for r in validos.itertuples(index=False)])
+    return {"guardados": int(len(validos)), "descartados": descartados}
+
+
+def refrescar_vistas(conninfo):
+    """Recalcula las vistas materializadas (mart.refrescar(), ~1 minuto). Hace
+    falta después de guardar acuerdos: el costo de mart.ventas_mat los usa."""
+    with _conectar(conninfo) as con:
+        con.execute("select mart.refrescar()")
