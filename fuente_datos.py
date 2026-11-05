@@ -34,10 +34,12 @@ import pandas as pd
 FUENTES = ("parquet", "supabase")
 
 # Columnas que se piden a mart.ventas_mat: las mismas que tenía el parquet de
-# detalle, más las que la base ya trae calculadas. Las que el panel no usa
-# (letra, serie, id_linea, id) quedan afuera para no gastar memoria.
+# detalle, más las que la base ya trae calculadas. letra y serie entran para
+# que dp.comprobante_id() separe las facturas A y B con el mismo número (igual
+# que mart.serie_mensual). Las que el panel no usa (id_linea, id) quedan afuera
+# para no gastar memoria.
 COLS_VENTAS = [
-    "dsEmpresa", "dsDocumento", "nrodoc", "fechaComprobate",
+    "dsEmpresa", "dsDocumento", "letra", "serie", "nrodoc", "fechaComprobate",
     "idCliente", "nombreCliente", "dsLocalidad", "dsProvincia", "region",
     "idVendedor", "dsVendedor",
     "idCanalMkt", "dsCanalMkt", "idSubcanalMkt", "dsSubcanalMKT",
@@ -137,7 +139,7 @@ def leer_ventas(conninfo, anio):
     sql = (f"select {cols} from mart.ventas_mat "
            f"where \"fechaComprobate\" >= date '{int(anio)}-01-01' "
            f"and \"fechaComprobate\" < date '{int(anio) + 1}-01-01'")
-    texto = ["dsEmpresa", "dsDocumento", "nombreCliente", "dsLocalidad",
+    texto = ["dsEmpresa", "dsDocumento", "letra", "serie", "nombreCliente", "dsLocalidad",
              "dsProvincia", "region", "dsVendedor", "dsCanalMkt",
              "dsSubcanalMKT", "dsArticulo", "proveedor", "marca_linea",
              "familia", "tipo_producto", "Categoria"]

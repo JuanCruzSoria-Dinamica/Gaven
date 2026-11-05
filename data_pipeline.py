@@ -711,12 +711,21 @@ def costo_bruto(df):
 
 def comprobante_id(df_ventas):
     """Identificador único de comprobante (empresa + tipo doc + nº doc).
-    Sirve para contar comprobantes y calcular el ticket promedio."""
-    return (
+    Sirve para contar comprobantes y calcular el ticket promedio.
+
+    Si el detalle trae 'letra' y 'serie' (lectura desde Supabase), se suman a
+    la clave: así una factura A y una B con el mismo número cuentan como dos,
+    igual que en mart.serie_mensual. El parquet no tiene esas columnas y sigue
+    con la clave de siempre."""
+    cid = (
         df_ventas["dsEmpresa"].astype(str) + "|"
         + df_ventas["dsDocumento"].astype(str) + "|"
         + df_ventas["nrodoc"].astype(str)
     )
+    if "letra" in df_ventas.columns and "serie" in df_ventas.columns:
+        cid = (cid + "|" + df_ventas["letra"].astype(str)
+               + "|" + df_ventas["serie"].astype(str))
+    return cid
 
 
 def metricas_generales(df_ventas):
