@@ -24,6 +24,7 @@ Uso:
     python alertas_cm.py            # revisa y manda si hay casos nuevos
     python alertas_cm.py --prueba   # imprime lo que mandaría, no manda ni guarda estado
     python alertas_cm.py --forzar   # manda aunque no haya casos nuevos
+    python alertas_cm.py --umbral 0.20  # prueba real del mail con otro umbral (no guarda estado)
 """
 import argparse
 import json
@@ -156,10 +157,15 @@ def main():
     ap.add_argument("--prueba", action="store_true", help="no manda ni guarda estado")
     ap.add_argument("--forzar", action="store_true", help="manda aunque no haya casos nuevos")
     ap.add_argument("--mes", help="YYYY-MM (default: mes en curso)")
+    ap.add_argument("--umbral", type=float,
+                    help="umbral de prueba (ej. 0.25); manda pero no guarda estado")
     args = ap.parse_args()
 
     secrets, cfg = cargar_config()
     umbral = float(cfg.get("umbral_cm", 0.10))
+    if args.umbral is not None:
+        umbral = args.umbral
+        args.forzar = True
     venta_minima = float(cfg.get("venta_minima", 1_000_000))
     ahora = datetime.now(TZ)
     mes = args.mes or ahora.strftime("%Y-%m")
@@ -174,7 +180,7 @@ def main():
 
     print(f"{ahora:%Y-%m-%d %H:%M} mes={mes} casos={len(casos)} nuevos={len(nuevos)}")
     if not casos:
-        if not args.prueba:
+        if not args.prueba and args.umbral is None:
             guardar_estado(mes, set())  # si se recuperan, se puede volver a avisar
         return
     if not nuevos and not args.forzar:
@@ -185,8 +191,11 @@ def main():
         print(asunto)
         print(texto)
         return
+    if args.umbral is not None:
+        asunto = "[PRUEBA] " + asunto
     enviar(cfg, asunto, texto, html)
-    guardar_estado(mes, actuales)
+    if args.umbral is None:
+        guardar_estado(mes, actuales)
     print("Mail enviado a", ", ".join(cfg["destinatarios"]))
 
 
